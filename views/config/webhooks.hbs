@@ -1,0 +1,346 @@
+{{> ui/page-header title="Webhooks" icon="icon-[tabler--webhook]"
+badgeLabel=(when values.webhooksEnabled "enabled" "disabled")
+badgeVariant=(when values.webhooksEnabled "success" "warning")
+class="mb-1"}}
+
+<p class="mb-6">Receive email event notifications as HTTP POST requests. Choose a destination, select events,
+    and configure the data included in each webhook.</p>
+
+{{#if values.webhooksEnabled}}
+{{#if webhookErrorFlag}}
+{{#> ui/clear-alert alert="webhook-default" class="mb-6"}}
+
+    <p><strong>Webhook Error</strong></p>
+    <p>The last webhook attempt failed with:</p>
+    <hr class="my-2">
+    <p class="mb-0">
+        <code>
+
+{{#if webhookErrorFlag.statusCode}}HTTP response: {{ webhookErrorFlag.statusCode}}{{/if}}
+{{#if webhookErrorFlag.code}}[{{ webhookErrorFlag.code}}]{{/if}}
+<br>
+{{webhookErrorFlag.message}}
+
+        </code>
+    </p>
+{{/ui/clear-alert}}
+{{/if}}
+{{/if}}
+
+{{> ui/env-managed-alert}}
+
+<form method="post" id="settings-form" action="/admin/config/webhooks">
+    {{!-- no id: the layout already renders the #crumb element the script reads --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">Webhook Processing</h6>
+        </div>
+
+        <div class="px-6 py-4 ee-toggle-row flex items-start justify-between gap-4">
+            {{> ui/checkbox id="webhooks_enabled" name="webhooksEnabled" label="Enable Webhooks"
+            checked=values.webhooksEnabled error=errors.webhooksEnabled
+            hint="Turn on webhook notifications for email events."}}
+
+            <div class="text-end">
+                {{> ui/setting-ref name="webhooksEnabled" class="whitespace-nowrap"}}
+            </div>
+        </div>
+    </div>
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header flex flex-wrap items-center justify-between gap-3">
+            <h6 class="card-title text-primary">Default Webhook</h6>
+            {{!-- keeps the webhooks-status hook: the or-else-all rule on the
+                  URL input disables this button while the URL is empty --}}
+            {{> ui/btn label="Send test webhook" variant="info" style="soft" size="sm"
+            icon="icon-[tabler--cloud-upload]" id="test-payload-btn" class="webhooks-status"}}
+        </div>
+
+        <div class="card-body space-y-4">
+            <div>
+                {{> ui/setting-ref name="webhooks"}}
+                {{#> ui/form-field id="settingsWebhooks" label="Webhook URL" error=errors.webhooks}}
+                <input type="url" class="input or-else-all{{#if errors.webhooks}} is-invalid{{/if}}"
+                    data-target="webhooks-status" id="settingsWebhooks" name="webhooks"
+                    placeholder="https://example.com/webhooks/emailengine" value="{{values.webhooks}}" />
+                <span class="helper-text">The default destination for all webhook events. Individual accounts can
+                    override this with their own webhook URLs.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <p><strong>Event Types</strong><br>
+                <small>Choose which events go to the default webhook URL or account-specific URLs. Webhook routes use their own filters.</small>
+            </p>
+
+            <div>
+                {{> ui/setting-ref name="webhookEvents" suffix='="*"'}}
+                {{> ui/checkbox id="notifyAll" name="notifyAll" label="All events" class="or-else-all"
+                dataTarget="event-type" checked=values.notifyAll error=errors.notifyAll}}
+            </div>
+
+            <div class="space-y-2">
+                {{#each notificationTypes}}
+                <div>
+                    {{> ui/setting-ref name="webhookEvents" suffix=(concat '="' name '"')}}
+                    {{> ui/checkbox id=(concat "notify_" name) name=(concat "notify_" name) label=description
+                    labelTitle=name class="event-type" checked=checked error=error}}
+                </div>
+
+                {{#if isMessageNew}}
+
+                <div class="ps-6">
+                    {{> ui/setting-ref name="inboxNewOnly"}}
+                    {{> ui/checkbox id="inboxNewOnly" name="inboxNewOnly"
+                    label="Limit new-message notifications to the Inbox" checked=../values.inboxNewOnly
+                    error=../errors.inboxNewOnly}}
+                </div>
+
+                {{/if}}
+                {{/each}}
+            </div>
+        </div>
+    </div>
+
+    {{#> ui/details summary="Delivery Retries" summarySmall="(All webhooks)"
+    class="card bg-base-100 shadow-md mb-6" open=values.webhooksDeliveryAttempts}}
+
+    <p class="mb-4">How a failed webhook delivery is retried. The delay doubles with every attempt. Changes apply to events queued after saving.</p>
+
+    <div class="grid gap-4 md:grid-cols-2">
+        <div>
+            {{> ui/setting-ref name="webhooksDeliveryAttempts"}}
+            {{#> ui/form-field id="settingsWebhooksDeliveryAttempts" label="Delivery attempts" error=errors.webhooksDeliveryAttempts}}
+            <input type="number" min="1" max="100" class="input{{#if errors.webhooksDeliveryAttempts}} is-invalid{{/if}}"
+                id="settingsWebhooksDeliveryAttempts" name="webhooksDeliveryAttempts" value="{{values.webhooksDeliveryAttempts}}"
+                placeholder="{{defaultWebhookAttempts}}" data-lpignore="true" autocomplete="off" />
+            <span class="helper-text">Attempts per event, including the first. Empty uses {{defaultWebhookAttempts}}.</span>
+            {{/ui/form-field}}
+        </div>
+        <div>
+            {{> ui/setting-ref name="webhooksRetryDelay"}}
+            {{#> ui/form-field id="settingsWebhooksRetryDelay" label="First retry delay (seconds)" error=errors.webhooksRetryDelay}}
+            <input type="number" min="1" max="3600" class="input{{#if errors.webhooksRetryDelay}} is-invalid{{/if}}"
+                id="settingsWebhooksRetryDelay" name="webhooksRetryDelay" value="{{values.webhooksRetryDelay}}"
+                placeholder="{{defaultWebhookRetryDelay}}" data-lpignore="true" autocomplete="off" />
+            <span class="helper-text">Wait before the first retry. Empty uses {{defaultWebhookRetryDelay}} seconds.</span>
+            {{/ui/form-field}}
+        </div>
+    </div>
+
+    {{/ui/details}}
+
+    {{#> ui/details summary="Custom Headers" summarySmall="(Default webhook only)"
+    class="card bg-base-100 shadow-md mb-6" open=values.customHeaders}}
+
+    <p class="mb-4">Add authentication tokens or other headers to requests sent to the webhook URL above. An account that overrides the URL is sent its own account-level headers instead of these.</p>
+
+    <div>
+        {{> ui/setting-ref name="webhooksCustomHeaders"}}
+        {{#> ui/form-field id="customHeaders" label="HTTP Headers" error=errors.customHeaders}}
+        <textarea class="textarea w-full font-mono{{#if errors.customHeaders}} is-invalid{{/if}}" id="customHeaders"
+            name="customHeaders" rows="5" spellcheck="false" data-enable-grammarly="false"
+            placeholder="Authorization: Bearer your-secret-token&#10;X-Custom-Header: value">{{values.customHeaders}}</textarea>
+        <span class="helper-text">One header per line. Format: <code>Header-Name: value</code></span>
+        {{/ui/form-field}}
+    </div>
+
+    {{/ui/details}}
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">Email Headers
+                <small class="text-base-content/60 font-normal">(All webhooks)</small>
+            </h6>
+        </div>
+        <div class="card-body space-y-4">
+
+            <p>Include specific email headers in webhook payloads. Basic headers (From, To, Message-ID) are always
+                included.</p>
+
+            <div>
+                {{> ui/setting-ref name="notifyHeaders" suffix='="*"'}}
+                {{> ui/checkbox id="headers_all" name="headersAll" label="Include all headers" class="or-else-all"
+                dataTarget="header-list" checked=values.headersAll error=errors.headersAll}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="notifyHeaders"}}
+                {{#> ui/form-field id="settingsNotifyHeaders" label="Specific Headers" error=errors.notifyHeaders}}
+                <textarea class="textarea w-full header-list{{#if errors.notifyHeaders}} is-invalid{{/if}}"
+                    id="settingsNotifyHeaders" name="notifyHeaders" rows="3" data-enable-grammarly="false"
+                    spellcheck="false"
+                    placeholder="X-Priority&#10;Reply-To&#10;List-Unsubscribe">{{values.notifyHeaders}}</textarea>
+                <span class="helper-text">One header name per line.</span>
+                {{/ui/form-field}}
+            </div>
+        </div>
+    </div>
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">Email Content <small class="text-base-content/60 font-normal">(All
+                    webhooks)</small>
+            </h6>
+        </div>
+        <div class="card-body space-y-4">
+
+            <p>Include email body content in webhook payloads.</p>
+
+            <div>
+                {{> ui/setting-ref name="notifyText"}}
+                {{> ui/checkbox id="settingsNotifyText" name="notifyText" label="Include email text and HTML"
+                class="or-else-all" dataTarget="text-list" dataReverse=true checked=values.notifyText
+                error=errors.notifyText}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="notifyWebSafeHtml"}}
+                {{> ui/checkbox id="settingsNotifyWebSafeHtml" name="notifyWebSafeHtml"
+                label="Sanitize HTML for web display" class="text-list" checked=values.notifyWebSafeHtml
+                error=errors.notifyWebSafeHtml
+                hint="Remove unsafe HTML, convert plain text to HTML when needed, and collapse quoted thread history."}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="disableThreadCollapse"}}
+                {{> ui/checkbox id="settingsDisableThreadCollapse" name="disableThreadCollapse"
+                label="Keep quoted thread history expanded" class="text-list" checked=values.disableThreadCollapse
+                error=errors.disableThreadCollapse
+                hint="Do not fold quoted replies into a collapsed block in web-safe HTML, here and in API responses that ask for it."}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="notifyTextSize"}}
+                {{#> ui/form-field id="settingsNotifyTextSize" label="Content Size Limit" error=errors.notifyTextSize}}
+                <input type="text" class="input text-list{{#if errors.notifyTextSize}} is-invalid{{/if}}"
+                    id="settingsNotifyTextSize" min="0" name="notifyTextSize" value="{{values.notifyTextSize}}"
+                    placeholder="1MB" />
+                <span class="helper-text">Maximum size of each text or HTML body. Content above this limit is truncated.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="notifyCalendarEvents"}}
+                {{> ui/checkbox id="settingsnotifyCalendarEvents" name="notifyCalendarEvents"
+                label="Extract calendar invites" checked=values.notifyCalendarEvents
+                error=errors.notifyCalendarEvents
+                hint="Detects and includes calendar event data from ICS files in webhook payloads."}}
+            </div>
+
+        </div>
+    </div>
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">
+                Attachments
+                <small class="text-base-content/60 font-normal">(All webhooks)</small>
+            </h6>
+        </div>
+        <div class="card-body space-y-4">
+            <p>Include file attachments in webhook payloads.</p>
+
+            <div>
+                {{> ui/setting-ref name="notifyAttachments"}}
+                {{> ui/checkbox id="settingsNotifyAttachments" name="notifyAttachments"
+                label="Include attachments (base64-encoded)" class="or-else-all" dataTarget="attachment-list"
+                dataReverse=true checked=values.notifyAttachments error=errors.notifyAttachments}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="notifyAttachmentSize"}}
+                {{#> ui/form-field id="settingsNotifyAttachmentSize" label="Attachment Size Limit"
+                error=errors.notifyAttachmentSize}}
+                <input type="text" class="input attachment-list{{#if errors.notifyAttachmentSize}} is-invalid{{/if}}"
+                    id="settingsNotifyAttachmentSize" min="0" name="notifyAttachmentSize"
+                    value="{{values.notifyAttachmentSize}}" placeholder="2MB" />
+                <span class="helper-text">Include attachment content only when it fits this limit. Larger limits increase Redis memory use.</span>
+                {{/ui/form-field}}
+            </div>
+        </div>
+    </div>
+
+
+    {{#> ui/card title="Webhook Scripts" id="script_settings" bodyClass="space-y-4"}}
+
+
+            <p>Global settings for filter and map functions in <a href="/admin/webhooks"
+                    class="link link-animated">webhook routes</a>.</p>
+
+            <div id="scriptEnv">
+
+                {{> ui/setting-ref name="scriptEnv"}}
+
+                <label class="label-text">Script Variables (JSON)</label>
+
+                <input type="hidden" class="{{#if errors.scriptEnv}}is-invalid{{/if}}" id="scriptEnvElement"
+                    name="scriptEnv" value="{{values.scriptEnv}}">
+
+                {{> ui/code-editor id="editor-env" title="Global variables"}}
+
+                {{#if errors.scriptEnv}}
+                <span class="helper-text text-error">{{errors.scriptEnv}}</span>
+                {{/if}}
+
+                <span class="helper-text">JSON object available as <code>env</code> variable in all filter and map
+                    functions. Use for shared secrets like API keys, access tokens, or configuration values. For
+                    example, if set to <code>{"token":"secret123"}</code>, then <code>env.token</code> in your scripts
+                    returns <code>"secret123"</code>.</span>
+            </div>
+
+
+    {{/ui/card}}
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--settings]"}}
+    </div>
+
+</form>
+
+{{> ace_assets}}
+<script data-cfasync="false" src="/static/js/ace/ext-language_tools.js"></script>
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        const sendTestPayload = async () => {
+            const webhooks = document.getElementById('settingsWebhooks').value.trim();
+            const customHeaders = document.getElementById('customHeaders').value.trim();
+
+            const data = await uiPostJson('/admin/config/webhooks/test', {
+                webhooks,
+                customHeaders
+            });
+
+            return data;
+        }
+
+        const testPayloadBtn = document.getElementById('test-payload-btn');
+        testPayloadBtn.addEventListener('click', e => {
+            e.preventDefault()
+            // The delivery waits for the configured URL to answer; a second click would send a
+            // second payload.
+            uiBusyAction(testPayloadBtn, () =>
+                sendTestPayload().then(data => uiToastResult(data, 'Test payload sent', 'Failed to send payload'))
+            );
+        });
+
+        const editors = new Map();
+
+        const editorEnv = uiAceEditor("editor-env", "json", document.getElementById('scriptEnvElement').value, {
+            enableBasicAutocompletion: true,
+            enableSnippets: false,
+            enableLiveAutocompletion: false,
+            useWorker: true
+        });
+        editors.set("editor-env", editorEnv);
+
+        document.getElementById('settings-form').addEventListener('submit', () => {
+            document.getElementById('scriptEnvElement').value = editorEnv.getValue();
+        });
+
+        uiEditorFullscreen(editors);
+    })
+</script>

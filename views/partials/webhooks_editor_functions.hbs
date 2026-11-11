@@ -1,0 +1,29 @@
+{{!-- Webhook routing editor script: the shared filter/map test machinery plus the
+      webhooks-specific "send test payload" action (posts the mapped preview to the
+      configured target URL). --}}
+{{> filter_editor_js hasMap=true}}
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        const sendTestPayload = async () => {
+            const webhooks = document.getElementById('inputTargetUrl').value.trim();
+            {{!-- ace.edit() on an initialized element returns the live instance created
+                  by filter_editor_js --}}
+            const payload = ace.edit('editor-map-preview').getValue().trim();
+            const customHeaders = document.getElementById('customHeaders').value.trim();
+
+            return await uiPostJson('/admin/config/webhooks/test', { webhooks, customHeaders, payload });
+        }
+
+        const testSendBtn = document.getElementById('test-send-btn');
+        testSendBtn.addEventListener('click', e => {
+            e.preventDefault();
+            // Waits for the target server to answer; clicking again would deliver the preview
+            // payload a second time.
+            uiBusyAction(testSendBtn, () =>
+                sendTestPayload().then(data => uiToastResult(data, 'Test payload sent', 'Failed to send payload'))
+            );
+        });
+    });
+</script>

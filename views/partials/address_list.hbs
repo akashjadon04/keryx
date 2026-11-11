@@ -1,0 +1,33 @@
+{{!-- Rendered server-side on first paint AND again by POST /admin/config/network/reload
+      after an IP rescan (compiledFragments.addressList in lib/ui-routes/route-helpers.js,
+      which renders without the page's view context - so no inline scripts here, and
+      nothing that needs cspNonce or the locale). --}}
+{{#each addresses}}
+<tr class="hover:bg-base-200/60">
+    <td>
+        <input type="checkbox" class="checkbox checkbox-sm checkbox-entry" data-ip="{{localAddress}}"
+            name="localAddresses" value="{{localAddress}}" {{#if checked}}checked{{/if}}>
+    </td>
+    <td data-label="Local IP">{{localAddress}}
+
+        {{#if notice}}<span class="tooltip [--placement:top] inline-flex align-middle"><span
+                class="tooltip-toggle cursor-default"><span
+                    class="icon-[tabler--alert-triangle] text-warning size-4"></span></span><span
+                class="tooltip-content tooltip-shown:opacity-100 tooltip-shown:visible" role="tooltip"><span
+                    class="tooltip-body">{{notice}}</span></span></span>{{/if}}
+        <div class="float-right">
+            {{#if defaultInterface}}<span class="badge badge-soft">default</span>{{/if}}
+        </div>
+    </td>
+    <td data-label="Public IP">{{ip}}</td>
+    <td data-label="Hostname">
+        {{name}}
+    </td>
+    <td class="ee-stack-actions text-end">
+        <button type="button" class="btn btn-error btn-soft btn-circle btn-sm address-action-delete"
+            data-address="{{localAddress}}" aria-label="Delete this address" title="Delete this address">
+            <span class="icon-[tabler--trash] size-4"></span>
+        </button>
+    </td>
+</tr>
+{{/each}}

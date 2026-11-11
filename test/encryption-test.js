@@ -1,0 +1,397 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert').strict;
+const crypto = require('crypto');
+
+const { encrypt, decrypt, encryptField, decryptField, parseEncryptedData, isCurrentScheme, reencrypt } = require('../lib/encrypt');
+
+// A value sealed by hand: the stored format, under a key, salt and iv of the test's choosing
+function sealed(scheme, key, salt, iv, cleartext) {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
+    const ciphertext = Buffer.concat([cipher.update(cleartext), cipher.final()]);
+    return ['', scheme, 'aes-256-gcm', cipher.getAuthTag(), iv, salt, ciphertext].map(part => (Buffer.isBuffer(part) ? part.toString('hex') : part)).join('$');
+}
+
+test('Encryption tests', async t => {
+    const testSecret = 'test-secret-password-123';
+
+    await t.test('encrypt() and decrypt() round-trip with string input', async () => {
+        const cleartext = 'Hello, World!';
+        const encrypted = encrypt(cleartext, testSecret);
+        const decrypted = decrypt(encrypted, testSecret);
+
+        assert.strictEqual(decrypted, cleartext);
+    });
+
+    await t.test('encrypt() and decrypt() round-trip with unicode content', async () => {
+        const cleartext = 'Unicode test: cafe, nino, Munchen';
+        const encrypted = encrypt(cleartext, testSecret);
+        const decrypted = decrypt(encrypted, testSecret);
+
+        assert.strictEqual(decrypted, cleartext);
+    });
+
+    await t.test('encrypt() and decrypt() round-trip with JSON data', async () => {
+        const data = { username: 'test', password: 'secret123', nested: { key: 'value' } };
+        const cleartext = JSON.stringify(data);
+        const encrypted = encrypt(cleartext, testSecret);
+        const decrypted = decrypt(encrypted, testSecret);
+
+        assert.deepStrictEqual(JSON.parse(decrypted), data);
+    });
+
+    await t.test('encrypt() and decrypt() round-trip with empty string', async () => {
+        const cleartext = '';
+        const encrypted = encrypt(cleartext, testSecret);
+        // Empty string returns as-is (no encryption)
+        assert.strictEqual(encrypted, '');
+        const decrypted = decrypt(encrypted, testSecret);
+        assert.strictEqual(decrypted, '');
+    });
+
+    await t.test('encrypt() never encrypts a value that is already ciphertext', async () => {
+        // A stored value that did not decrypt (a rotated secret) is read back as it was, and a
+        // partial update of the record writes it back; encrypting it again under the new secret
+        // would put the only recoverable copy beyond the rotation CLI
+        const once = encrypt('the password', 'secret one');
+        assert.strictEqual(encrypt(once, 'secret two'), once);
+        assert.strictEqual(encrypt(once, 'secret one'), once);
+        assert.strictEqual(decrypt(once, 'secret one'), 'the password');
+        // cleartext that merely starts with a dollar is still encrypted
+        const dollar = encrypt('$notaformat$x', 'secret one');
+        assert.notStrictEqual(dollar, '$notaformat$x');
+        assert.strictEqual(decrypt(dollar, 'secret one'), '$notaformat$x');
+    });
+
+    await t.test('encrypt() returns different ciphertext for same input (random IV)', async () => {
+        const cleartext = 'Same input text';
+        const encrypted1 = encrypt(cleartext, testSecret);
+        const encrypted2 = encrypt(cleartext, testSecret);
+
+        // Both should decrypt to same value
+        assert.strictEqual(decrypt(encrypted1, testSecret), cleartext);
+        assert.strictEqual(decrypt(encrypted2, testSecret), cleartext);
+
+        // But encrypted values should be different due to random IV/salt
+        assert.notStrictEqual(encrypted1, encrypted2);
+    });
+
+    await t.test('different secrets produce different ciphertext', async () => {
+        const cleartext = 'Test data';
+        const encrypted1 = encrypt(cleartext, 'secret1');
+        const encrypted2 = encrypt(cleartext, 'secret2');
+
+        assert.notStrictEqual(encrypted1, encrypted2);
+    });
+
+    await t.test('decrypt() fails with wrong password', async () => {
+        const cleartext = 'Sensitive data';
+        const encrypted = encrypt(cleartext, 'correct-password');
+
+        assert.throws(
+            () => decrypt(encrypted, 'wrong-password'),
+            err => {
+                assert.ok(err.message.includes('Failed to decrypt'));
+                assert.strictEqual(err.code, 'InternalConfigError');
+                return true;
+            }
+        );
+    });
+
+    await t.test('decrypt() fails with tampered ciphertext', async () => {
+        const cleartext = 'Original data';
+        const encrypted = encrypt(cleartext, testSecret);
+
+        // Tamper with the encrypted text portion (last part after $)
+        const parts = encrypted.split('$');
+        const tamperedHex = parts[6];
+        // Flip some bits in the middle
+        const tamperedPart = tamperedHex.substring(0, 10) + (parseInt(tamperedHex[10], 16) ^ 0xf).toString(16) + tamperedHex.substring(11);
+        parts[6] = tamperedPart;
+        const tampered = parts.join('$');
+
+        assert.throws(
+            () => decrypt(tampered, testSecret),
+            err => {
+                assert.ok(err.message.includes('Failed to decrypt'));
+                return true;
+            }
+        );
+    });
+
+    await t.test('decrypt() fails with tampered auth tag', async () => {
+        const cleartext = 'Protected data';
+        const encrypted = encrypt(cleartext, testSecret);
+
+        // Tamper with auth tag (4th part after $)
+        const parts = encrypted.split('$');
+        const authTag = parts[3];
+        const tamperedAuthTag = authTag.substring(0, 5) + (parseInt(authTag[5], 16) ^ 0xf).toString(16) + authTag.substring(6);
+        parts[3] = tamperedAuthTag;
+        const tampered = parts.join('$');
+
+        assert.throws(
+            () => decrypt(tampered, testSecret),
+            err => {
+                assert.ok(err.message.includes('Failed to decrypt'));
+                return true;
+            }
+        );
+    });
+
+    await t.test('decrypt() handles cleartext (no encryption marker)', async () => {
+        const cleartext = 'Plain text without encryption';
+        const decrypted = decrypt(cleartext, testSecret);
+
+        assert.strictEqual(decrypted, cleartext);
+    });
+
+    await t.test('decrypt() handles cleartext when no secret provided', async () => {
+        const encrypted = encrypt('data', testSecret);
+        // With no secret, should return raw string
+        const result = decrypt(encrypted, null);
+        assert.strictEqual(result, encrypted);
+    });
+
+    await t.test('encrypt() returns cleartext when no secret provided', async () => {
+        const cleartext = 'unencrypted data';
+        const result = encrypt(cleartext, null);
+        assert.strictEqual(result, cleartext);
+    });
+
+    await t.test('encrypted format has correct structure', async () => {
+        const cleartext = 'Test data';
+        const encrypted = encrypt(cleartext, testSecret);
+
+        // Format: $format$cipher$authTag$iv$salt$encryptedText
+        const parts = encrypted.split('$');
+        assert.strictEqual(parts.length, 7);
+        assert.strictEqual(parts[0], ''); // Leading $
+        assert.strictEqual(parts[1], 'wd02'); // Format version
+        assert.strictEqual(parts[2], 'aes-256-gcm'); // Cipher
+        assert.strictEqual(parts[3].length, 32); // Auth tag (16 bytes = 32 hex)
+        assert.strictEqual(parts[4].length, 24); // IV (12 bytes = 24 hex)
+        assert.strictEqual(parts[5].length, 32); // Salt (16 bytes = 32 hex)
+        assert.ok(parts[6].length > 0); // Encrypted text
+    });
+
+    await t.test('parseEncryptedData() parses valid encrypted string', async () => {
+        const cleartext = 'Test';
+        const encrypted = encrypt(cleartext, testSecret);
+        const parsed = parseEncryptedData(encrypted);
+
+        assert.strictEqual(parsed.format, 'wd02');
+        assert.strictEqual(parsed.cipher, 'aes-256-gcm');
+        assert.ok(Buffer.isBuffer(parsed.authTag));
+        assert.strictEqual(parsed.authTag.length, 16);
+        assert.ok(Buffer.isBuffer(parsed.iv));
+        assert.strictEqual(parsed.iv.length, 12);
+        assert.ok(Buffer.isBuffer(parsed.salt));
+        assert.strictEqual(parsed.salt.length, 16);
+        assert.ok(Buffer.isBuffer(parsed.data));
+    });
+
+    await t.test('parseEncryptedData() returns cleartext format for plain strings', async () => {
+        const parsed = parseEncryptedData('plain text');
+        assert.strictEqual(parsed.format, 'cleartext');
+        assert.strictEqual(parsed.data, 'plain text');
+    });
+
+    await t.test('parseEncryptedData() returns cleartext for malformed encrypted string', async () => {
+        // Missing parts
+        const parsed = parseEncryptedData('$wd01$aes-256-gcm$incomplete');
+        assert.strictEqual(parsed.format, 'cleartext');
+    });
+
+    await t.test('parseEncryptedData() handles empty input', async () => {
+        const parsed = parseEncryptedData('');
+        assert.strictEqual(parsed.format, 'cleartext');
+        assert.strictEqual(parsed.data, '');
+    });
+
+    await t.test('parseEncryptedData() handles null input', async () => {
+        const parsed = parseEncryptedData(null);
+        assert.strictEqual(parsed.format, 'cleartext');
+        assert.strictEqual(parsed.data, '');
+    });
+
+    await t.test('values written by one process share a salt, so one derived key serves them all', async () => {
+        // The derived key is cached per (secret, salt): a salt per value made the cache useless
+        // past its size, and every hot-path decrypt of a fresh value ran a cold scrypt
+        const encrypted1 = encrypt('first value', testSecret);
+        const encrypted2 = encrypt('second value', testSecret);
+        const parsed1 = parseEncryptedData(encrypted1);
+        const parsed2 = parseEncryptedData(encrypted2);
+
+        assert.ok(parsed1.salt.equals(parsed2.salt), 'one salt per process');
+        assert.ok(!parsed1.iv.equals(parsed2.iv), 'the GCM IV stays random per value');
+        assert.strictEqual(parsed1.iv.length, 12);
+
+        assert.strictEqual(decrypt(encrypted1, testSecret), 'first value');
+        assert.strictEqual(decrypt(encrypted2, testSecret), 'second value');
+    });
+
+    await t.test('two secrets sharing the process salt keep their own derived keys', async () => {
+        // The key cache is keyed per (secret, salt). With one salt buffer for every write, an
+        // entry keyed on that buffer's identity let the second secret's key overwrite the first's,
+        // and a value then decrypted "successfully" with the wrong secret
+        const first = encrypt('for the first secret', 'first-secret');
+        const second = encrypt('for the second secret', 'second-secret');
+
+        assert.strictEqual(decrypt(first, 'first-secret'), 'for the first secret');
+        assert.strictEqual(decrypt(second, 'second-secret'), 'for the second secret');
+        assert.throws(() => decrypt(first, 'second-secret'));
+        assert.throws(() => decrypt(second, 'first-secret'));
+        // and again, now that both keys have been through the cache in the other order
+        assert.strictEqual(decrypt(first, 'first-secret'), 'for the first secret');
+        assert.strictEqual(encrypt('again', 'first-secret') !== encrypt('again', 'second-secret'), true);
+        assert.strictEqual(decrypt(encrypt('again', 'first-secret'), 'first-secret'), 'again');
+    });
+
+    await t.test('a value written with its own salt still decrypts', async () => {
+        // What every value stored before the shared salt looks like: the same format, a random
+        // salt of its own. Built by hand, since encrypt() no longer writes one.
+        const cleartext = 'legacy value';
+        const salt = crypto.randomBytes(16);
+        const legacy = sealed('wd01', crypto.scryptSync(testSecret, salt, 32), salt, crypto.randomBytes(12), cleartext);
+
+        assert.strictEqual(decrypt(legacy, testSecret), cleartext);
+        assert.ok(!parseEncryptedData(encrypt(cleartext, testSecret)).salt.equals(salt), 'and the next write uses the process salt');
+    });
+
+    await t.test('encryptField() and decryptField() treat empty and unreadable values as unset', async () => {
+        assert.strictEqual(encryptField('', testSecret), '', 'the empty string is a cleared marker and stays as it is');
+        assert.strictEqual(encryptField('value', ''), 'value', 'nothing to encrypt with without a secret');
+        const stored = encryptField('value', testSecret);
+        assert.ok(stored.startsWith('$wd02$'));
+
+        assert.strictEqual(decryptField(stored, testSecret), 'value');
+        assert.strictEqual(decryptField('cleartext', testSecret), 'cleartext', 'a value stored before its field was encrypted passes through');
+        assert.strictEqual(decryptField('', testSecret), '');
+        assert.strictEqual(decryptField(null, testSecret), null);
+
+        const errors = [];
+        assert.strictEqual(
+            decryptField(stored, 'another-secret', err => errors.push(err)),
+            undefined,
+            'unreadable reads as unset'
+        );
+        assert.strictEqual(errors.length, 1);
+        assert.strictEqual(errors[0].code, 'InternalConfigError');
+        assert.strictEqual(decryptField(stored, 'another-secret'), undefined, 'the report callback is optional');
+    });
+
+    await t.test('scrypt key derivation is consistent for same password and salt', async () => {
+        const password = 'test-password';
+        const salt = crypto.randomBytes(16);
+
+        // Derive key twice with same inputs
+        const key1 = crypto.scryptSync(password, salt, 32);
+        const key2 = crypto.scryptSync(password, salt, 32);
+
+        assert.ok(key1.equals(key2));
+    });
+
+    await t.test('encrypt/decrypt handles large data', async () => {
+        const largeData = 'x'.repeat(100000); // 100KB of data
+        const encrypted = encrypt(largeData, testSecret);
+        const decrypted = decrypt(encrypted, testSecret);
+
+        assert.strictEqual(decrypted, largeData);
+    });
+
+    await t.test('encrypt/decrypt handles special characters', async () => {
+        const specialChars = '!@#$%^&*()_+-=[]{}|;:\'",.<>?/\\`~\n\t\r';
+        const encrypted = encrypt(specialChars, testSecret);
+        const decrypted = decrypt(encrypted, testSecret);
+
+        assert.strictEqual(decrypted, specialChars);
+    });
+
+    await t.test('decrypt() rejects invalid auth tag length', async () => {
+        // Manually construct invalid encrypted data with wrong auth tag length
+        const encrypted = encrypt('test', testSecret);
+        const parts = encrypted.split('$');
+        parts[3] = 'ab'; // Too short auth tag (should be 32 hex chars)
+        const invalid = parts.join('$');
+
+        assert.throws(
+            () => decrypt(invalid, testSecret),
+            err => {
+                assert.ok(err.message.includes('Failed to decrypt'));
+                return true;
+            }
+        );
+    });
+
+    await t.test('decrypt() rejects invalid IV length', async () => {
+        const encrypted = encrypt('test', testSecret);
+        const parts = encrypted.split('$');
+        parts[4] = 'ab'; // Too short IV (should be 24 hex chars)
+        const invalid = parts.join('$');
+
+        assert.throws(
+            () => decrypt(invalid, testSecret),
+            err => {
+                assert.ok(err.message.includes('Failed to decrypt'));
+                return true;
+            }
+        );
+    });
+
+    await t.test('decrypt() rejects invalid salt length', async () => {
+        const encrypted = encrypt('test', testSecret);
+        const parts = encrypted.split('$');
+        parts[5] = 'ab'; // Too short salt (should be 32 hex chars)
+        const invalid = parts.join('$');
+
+        assert.throws(
+            () => decrypt(invalid, testSecret),
+            err => {
+                assert.ok(err.message.includes('Failed to decrypt'));
+                return true;
+            }
+        );
+    });
+});
+
+// Pinned fixtures: a value sealed by hand under each scheme, with a fixed secret and salt, so a
+// change to either derivation fails loudly rather than making stored credentials unreadable
+test('Encryption schemes', async t => {
+    const secret = 'pinned-secret';
+    const salt = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+    const iv = Buffer.from('0a0b0c0d0e0f101112131415', 'hex');
+    const wd01 = sealed('wd01', crypto.scryptSync(secret, salt, 32), salt, iv, 'pinned cleartext');
+    const wd02 = sealed('wd02', crypto.pbkdf2Sync(secret, salt, 600000, 32, 'sha256'), salt, iv, 'pinned cleartext');
+
+    await t.test('a wd01 value written by an earlier release still decrypts', () => {
+        assert.strictEqual(decrypt(wd01, secret), 'pinned cleartext');
+        assert.strictEqual(isCurrentScheme(wd01), false);
+    });
+
+    await t.test('a wd02 value decrypts with the pinned PBKDF2 parameters', () => {
+        // after the wd01 case on purpose: the same secret and salt under the other scheme must not
+        // be served the key cached for wd01
+        assert.strictEqual(decrypt(wd02, secret), 'pinned cleartext');
+        assert.strictEqual(isCurrentScheme(wd02), true);
+    });
+
+    await t.test('an unknown scheme is read as cleartext, as before', () => {
+        assert.strictEqual(decrypt('$wd09$aes-256-gcm$00$00$00$00', secret), '$wd09$aes-256-gcm$00$00$00$00');
+    });
+
+    await t.test('reencrypt() moves a value to the current secret and scheme, and only then', () => {
+        const stale = sealed('wd01', crypto.scryptSync('old-secret', salt, 32), salt, iv, 'pinned cleartext');
+        const moved = reencrypt(stale, ['old-secret'], secret);
+        assert.ok(moved.startsWith('$wd02$'), 'read with the old secret, written with the new one');
+        assert.strictEqual(decrypt(moved, secret), 'pinned cleartext');
+
+        assert.strictEqual(reencrypt(wd02, ['old-secret'], secret), wd02, 'already current: stored as it is');
+        assert.ok(reencrypt(wd01, [], secret).startsWith('$wd02$'), 'the current secret under the old scheme is rewritten');
+        assert.ok(reencrypt('cleartext', [], secret).startsWith('$wd02$'), 'cleartext is encrypted');
+        assert.strictEqual(reencrypt(wd02, [secret], ''), 'pinned cleartext', 'no secret to write with removes the encryption');
+        assert.throws(() => reencrypt(stale, ['another-secret'], secret), /Failed to decrypt/);
+        assert.throws(() => reencrypt('$wd09$aes-256-gcm$00$00$00$00', [], secret), /Could not decrypt/);
+    });
+});

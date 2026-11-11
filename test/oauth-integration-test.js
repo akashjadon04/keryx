@@ -1,0 +1,650 @@
+'use strict';
+
+const http = require('node:http');
+const { withCapturingServer } = require('./helpers/capture-http-server');
+const test = require('node:test');
+const assert = require('node:assert').strict;
+const exitWhenStandalone = require('./helpers/exit-standalone');
+
+test('OAuth integration tests', async t => {
+    t.after(() => {
+        exitWhenStandalone();
+    });
+
+    const { GmailOauth, OPENID_SCOPES } = require('../lib/oauth/gmail');
+    const { OutlookOauth } = require('../lib/oauth/outlook');
+    const { MailRuOauth } = require('../lib/oauth/mail-ru');
+
+    const baseOpts = {
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        redirectUrl: 'http://localhost/callback',
+        setFlag: async () => {}
+    };
+
+    await t.test('Gmail OAuth module exports expected members', async () => {
+        const gmailModule = require('../lib/oauth/gmail');
+        assert.ok(gmailModule.GmailOauth);
+        assert.ok(gmailModule.GMAIL_SCOPES);
+    });
+
+    await t.test('Outlook OAuth module exports expected members', async () => {
+        const outlookModule = require('../lib/oauth/outlook');
+        assert.ok(outlookModule.OutlookOauth);
+        assert.ok(outlookModule.outlookScopes);
+    });
+
+    await t.test('Mail.ru OAuth module exports expected members', async () => {
+        const mailruModule = require('../lib/oauth/mail-ru');
+        assert.ok(mailruModule.MailRuOauth);
+    });
+
+    await t.test('GmailOauth.getTokenRequest returns URL-encoded string body', async () => {
+        const gmail = new GmailOauth(baseOpts);
+
+        const tokenRequest = gmail.getTokenRequest({ code: 'test-auth-code' });
+
+        assert.strictEqual(typeof tokenRequest.body, 'string');
+
+        const params = new URLSearchParams(tokenRequest.body);
+        assert.strictEqual(params.get('code'), 'test-auth-code');
+        assert.strictEqual(params.get('client_id'), 'test-client-id');
+        assert.strictEqual(params.get('client_secret'), 'test-client-secret');
+        assert.strictEqual(params.get('grant_type'), 'authorization_code');
+    });
+
+    await t.test('OutlookOauth.getTokenRequest returns URL-encoded string body', async () => {
+        const outlook = new OutlookOauth({ ...baseOpts, authority: 'common' });
+
+        const tokenRequest = outlook.getTokenRequest({ code: 'test-auth-code' });
+
+        assert.strictEqual(typeof tokenRequest.body, 'string');
+
+        const params = new URLSearchParams(tokenRequest.body);
+        assert.strictEqual(params.get('code'), 'test-auth-code');
+        assert.strictEqual(params.get('client_id'), 'test-client-id');
+        assert.strictEqual(params.get('grant_type'), 'authorization_code');
+    });
+
+    await t.test('MailRuOauth.getTokenRequest returns URL-encoded string body', async () => {
+        const mailru = new MailRuOauth(baseOpts);
+
+        const tokenRequest = mailru.getTokenRequest({ code: 'test-auth-code' });
+
+        assert.strictEqual(typeof tokenRequest.body, 'string');
+
+        const params = new URLSearchParams(tokenRequest.body);
+        assert.strictEqual(params.get('code'), 'test-auth-code');
+        assert.strictEqual(params.get('grant_type'), 'authorization_code');
+    });
+
+    await t.test('Token request body properly encodes special characters', async () => {
+        const gmail = new GmailOauth({
+            ...baseOpts,
+            clientSecret: 'test-secret-with-special-chars!@#',
+            redirectUrl: 'http://localhost/callback?param=value'
+        });
+
+        const tokenRequest = gmail.getTokenRequest({ code: 'test-code' });
+
+        const params = new URLSearchParams(tokenRequest.body);
+        assert.strictEqual(params.get('code'), 'test-code');
+        assert.strictEqual(params.get('client_id'), 'test-client-id');
+        assert.strictEqual(params.get('client_secret'), 'test-secret-with-special-chars!@#');
+        assert.strictEqual(params.get('redirect_uri'), 'http://localhost/callback?param=value');
+    });
+
+    // Token-error handling is exercised through the real OutlookOauth.refreshToken() against a local
+    // token endpoint. These used to be hand-written copies of the fallback and the partial-secret
+    // regex, and the regex copy had already drifted from lib/oauth/outlook.js.
+    async function withTokenEndpoint(respond, fn) {
+        const requests = [];
+        const server = http.createServer((req, res) => {
+            const chunks = [];
+            req.on('data', chunk => chunks.push(chunk));
+            req.on('end', () => {
+                requests.push({ method: req.method, url: req.url, body: Buffer.concat(chunks).toString() });
+                const { status, body } = respond();
+                res.writeHead(status, { 'Content-Type': 'application/json' });
+                res.end(body);
+            });
+        });
+        await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+        try {
+            const flags = [];
+            const outlook = new OutlookOauth({
+                ...baseOpts,
+                clientSecret: 'abcdefghijklmnopqrstuvwxyz',
+                authority: 'common',
+                setFlag: async (...args) => flags.push(args)
+            });
+            outlook.entraEndpoint = `http://127.0.0.1:${server.address().port}`;
+            await fn(outlook, { requests, flags });
+        } finally {
+            await new Promise(resolve => server.close(resolve));
+        }
+    }
+
+    await t.test('OutlookOauth.refreshToken falls back to a placeholder when the error body is not JSON', async () => {
+        await withTokenEndpoint(
+            () => ({ status: 400, body: '<html>Bad Request</html>' }),
+            async (outlook, { requests }) => {
+                await assert.rejects(
+                    () => outlook.refreshToken({ refreshToken: 'rt-1' }),
+                    err => {
+                        assert.strictEqual(err.code, 'ETokenRefresh');
+                        assert.strictEqual(err.statusCode, 400);
+                        assert.deepStrictEqual(err.tokenRequest.response, { error: 'Failed to parse response' });
+                        assert.strictEqual(err.clientSecretHint, undefined);
+                        return true;
+                    }
+                );
+                assert.strictEqual(requests.length, 1);
+                assert.strictEqual(requests[0].url, '/common/oauth2/v2.0/token');
+                const params = new URLSearchParams(requests[0].body);
+                assert.strictEqual(params.get('grant_type'), 'refresh_token');
+                assert.strictEqual(params.get('refresh_token'), 'rt-1');
+            }
+        );
+    });
+
+    await t.test('OutlookOauth.refreshToken exposes a partial client secret and flags the app for a rejected secret', async () => {
+        await withTokenEndpoint(
+            () => ({
+                status: 401,
+                body: JSON.stringify({ error: 'invalid_client', error_description: 'AADSTS7000215: Invalid client secret is provided.' })
+            }),
+            async (outlook, { flags }) => {
+                await assert.rejects(
+                    () => outlook.refreshToken({ refreshToken: 'rt-1' }),
+                    err => {
+                        assert.strictEqual(err.code, 'ETokenRefresh');
+                        assert.ok(err.clientSecretHint, 'partial secret is attached');
+                        assert.notStrictEqual(err.clientSecretHint, 'abcdefghijklmnopqrstuvwxyz', 'never the whole secret');
+                        return true;
+                    }
+                );
+                assert.strictEqual(flags.length, 1);
+                assert.strictEqual(flags[0][0].code, 'OUTLOOK_CLIENT_SECRET_INVALID');
+            }
+        );
+    });
+
+    await t.test('OutlookOauth.refreshToken handles an invalid_grant without error_description', async () => {
+        await withTokenEndpoint(
+            () => ({ status: 400, body: JSON.stringify({ error: 'invalid_grant', error_description: null }) }),
+            async (outlook, { flags }) => {
+                await assert.rejects(
+                    () => outlook.refreshToken({ refreshToken: 'rt-1' }),
+                    err => {
+                        assert.strictEqual(err.clientSecretHint, undefined);
+                        assert.strictEqual(err.tokenRequest.userFlag.code, 'OUTLOOK_TOKEN_RENEWAL_FAILED');
+                        return true;
+                    }
+                );
+                // A user-level failure is not an app misconfiguration
+                assert.strictEqual(flags.length, 0);
+            }
+        );
+    });
+
+    await t.test('OutlookOauth.refreshToken clears the app flag on success', async () => {
+        await withTokenEndpoint(
+            () => ({ status: 200, body: JSON.stringify({ access_token: 'at-1', refresh_token: 'rt-2', expires_in: 3600 }) }),
+            async (outlook, { flags }) => {
+                const result = await outlook.refreshToken({ refreshToken: 'rt-1' });
+                assert.strictEqual(result.access_token, 'at-1');
+                assert.deepStrictEqual(flags, [[]]);
+            }
+        );
+    });
+
+    await t.test('GmailOauth generates valid auth URL', async () => {
+        const gmail = new GmailOauth(baseOpts);
+
+        const authUrl = gmail.generateAuthUrl({ state: 'test-state' });
+
+        assert.ok(authUrl.startsWith('https://accounts.google.com/o/oauth2/v2/auth'));
+        assert.ok(authUrl.includes('client_id=test-client-id'));
+        assert.ok(authUrl.includes('state=test-state'));
+    });
+
+    await t.test('OutlookOauth generates valid auth URL', async () => {
+        const outlook = new OutlookOauth({ ...baseOpts, authority: 'common' });
+
+        const authUrl = outlook.generateAuthUrl({ state: 'test-state' });
+
+        assert.ok(authUrl.includes('login.microsoftonline.com'));
+        assert.ok(authUrl.includes('client_id=test-client-id'));
+        assert.ok(authUrl.includes('state=test-state'));
+    });
+
+    await t.test('OutlookOauth instantiates with different cloud configurations', async () => {
+        const clouds = ['global', 'gcc-high', 'dod', 'china'];
+
+        for (const cloud of clouds) {
+            const outlook = new OutlookOauth({ ...baseOpts, authority: 'common', cloud });
+
+            assert.strictEqual(outlook.cloud, cloud);
+            assert.ok(outlook.entraEndpoint, `Should have entraEndpoint for ${cloud}`);
+            assert.ok(outlook.apiBase, `Should have apiBase for ${cloud}`);
+        }
+    });
+
+    await t.test('GmailOauth has default scopes', async () => {
+        const gmail = new GmailOauth(baseOpts);
+
+        assert.ok(gmail.scopes.length > 0);
+    });
+
+    await t.test('GmailOauth.revokeToken sends correct revocation request', async () => {
+        let capturedBody = null;
+        let capturedHeaders = null;
+        let capturedMethod = null;
+
+        const server = http.createServer((req, res) => {
+            capturedMethod = req.method;
+            capturedHeaders = req.headers;
+            const chunks = [];
+            req.on('data', chunk => chunks.push(chunk));
+            req.on('end', () => {
+                capturedBody = Buffer.concat(chunks).toString();
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end('{}');
+            });
+        });
+
+        await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+        const { port } = server.address();
+
+        try {
+            const gmail = new GmailOauth(baseOpts);
+            gmail.revokeUrl = `http://127.0.0.1:${port}/revoke`;
+
+            const result = await gmail.revokeToken('test-access-token-123');
+
+            assert.deepStrictEqual(result, { revoked: true, status: 200 });
+            assert.strictEqual(capturedMethod, 'POST');
+            assert.ok(capturedHeaders['content-type'].includes('application/x-www-form-urlencoded'));
+            assert.strictEqual(capturedBody, 'token=test-access-token-123');
+        } finally {
+            await new Promise(resolve => server.close(resolve));
+        }
+    });
+
+    async function revokeAgainst(status, body) {
+        let result;
+        const responder = res => {
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(body);
+        };
+        await withCapturingServer(responder, async ({ baseUrl }) => {
+            const gmail = new GmailOauth(baseOpts);
+            gmail.revokeUrl = `${baseUrl}/revoke`;
+            result = await gmail.revokeToken('bad-token');
+        });
+        return result;
+    }
+
+    await t.test('GmailOauth.revokeToken reports an already invalid token without throwing', async () => {
+        const result = await revokeAgainst(400, JSON.stringify({ error: 'invalid_token', error_description: 'Token expired or revoked' }));
+        assert.deepStrictEqual(result, { revoked: false, status: 400, reason: 'TokenInvalid', error: 'invalid_token' });
+    });
+
+    await t.test('GmailOauth.revokeToken reports any other refusal as ProviderRefused', async () => {
+        const result = await revokeAgainst(503, 'Service Unavailable');
+        assert.deepStrictEqual(result, { revoked: false, status: 503, reason: 'ProviderRefused' });
+
+        const coded = await revokeAgainst(400, JSON.stringify({ error: 'unsupported_token_type' }));
+        assert.strictEqual(coded.reason, 'ProviderRefused');
+        assert.strictEqual(coded.error, 'unsupported_token_type');
+    });
+
+    await t.test('GmailOauth.revokeToken reports a network error as RequestFailed without throwing', async () => {
+        const gmail = new GmailOauth(baseOpts);
+        gmail.revokeUrl = 'http://127.0.0.1:1/revoke';
+
+        const result = await gmail.revokeToken('any-token');
+        assert.strictEqual(result.revoked, false);
+        assert.strictEqual(result.reason, 'RequestFailed');
+        assert.strictEqual(result.status, undefined);
+        assert.ok(result.error);
+    });
+
+    await t.test('Scope comparison detects missing functional scopes', async () => {
+        const requested = ['openid', 'email', 'profile', 'https://mail.google.com/'];
+        const granted = ['openid', 'email', 'profile'];
+
+        const requiredFunctional = requested.filter(s => !OPENID_SCOPES.includes(s));
+        const missing = requiredFunctional.filter(s => !granted.includes(s));
+
+        assert.deepStrictEqual(requiredFunctional, ['https://mail.google.com/']);
+        assert.deepStrictEqual(missing, ['https://mail.google.com/']);
+    });
+
+    await t.test('Scope comparison returns empty when all functional scopes granted', async () => {
+        const requested = ['openid', 'email', 'profile', 'https://mail.google.com/'];
+        const granted = ['openid', 'email', 'profile', 'https://mail.google.com/'];
+
+        const requiredFunctional = requested.filter(s => !OPENID_SCOPES.includes(s));
+        const missing = requiredFunctional.filter(s => !granted.includes(s));
+
+        assert.deepStrictEqual(missing, []);
+    });
+
+    await t.test('Scope comparison handles multiple missing scopes', async () => {
+        const requested = ['openid', 'email', 'profile', 'https://mail.google.com/', 'https://www.googleapis.com/auth/pubsub'];
+        const granted = ['openid', 'email', 'profile'];
+
+        const requiredFunctional = requested.filter(s => !OPENID_SCOPES.includes(s));
+        const missing = requiredFunctional.filter(s => !granted.includes(s));
+
+        assert.deepStrictEqual(missing, ['https://mail.google.com/', 'https://www.googleapis.com/auth/pubsub']);
+    });
+
+    await t.test('GmailOauth uses LocalKeySigner by default for service account configs', async () => {
+        const { LocalKeySigner } = require('../lib/oauth/gmail');
+        const gmail = new GmailOauth({
+            ...baseOpts,
+            serviceClient: '7103296518315821565203',
+            serviceClientEmail: 'svc@proj.iam.gserviceaccount.com',
+            serviceKey: '-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----'
+        });
+        assert.strictEqual(gmail.authMethod, 'serviceKey');
+        assert.ok(gmail.signer instanceof LocalKeySigner);
+    });
+
+    await t.test('GmailOauth uses ExternalAccountSigner when authMethod is externalAccount', async () => {
+        const { ExternalAccountSigner } = require('../lib/oauth/external-account-signer');
+        const externalAccount = JSON.stringify({
+            type: 'external_account',
+            audience: '//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/p',
+            subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+            token_url: 'https://sts.googleapis.com/v1/token',
+            service_account_impersonation_url:
+                'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/svc@proj.iam.gserviceaccount.com:generateAccessToken',
+            credential_source: { file: '/tmp/oidc-token' }
+        });
+        const gmail = new GmailOauth({
+            ...baseOpts,
+            serviceClient: '7103296518315821565203',
+            serviceClientEmail: 'svc@proj.iam.gserviceaccount.com',
+            authMethod: 'externalAccount',
+            externalAccount
+        });
+        assert.strictEqual(gmail.authMethod, 'externalAccount');
+        assert.ok(gmail.signer instanceof ExternalAccountSigner);
+    });
+
+    await t.test('GmailOauth.parseExternalAccountConfig rejects empty input', () => {
+        const { parseExternalAccountConfig } = require('../lib/oauth/gmail');
+        assert.throws(
+            () => parseExternalAccountConfig(''),
+            err => err.code === 'EExternalAccountConfig'
+        );
+        assert.throws(
+            () => parseExternalAccountConfig('not-json'),
+            err => err.code === 'EExternalAccountConfig'
+        );
+        const parsed = parseExternalAccountConfig('{"type":"external_account"}');
+        assert.strictEqual(parsed.type, 'external_account');
+    });
+
+    await t.test('generateServiceRequest throws when no signer is configured', async () => {
+        // No serviceClient -> no signer is built.
+        const gmail = new GmailOauth(baseOpts);
+        await assert.rejects(
+            () => gmail.generateServiceRequest('user@example.com', false),
+            err => err.code === 'EServiceCredentialsMissing'
+        );
+    });
+
+    await t.test('generateServiceRequest issues WIF assertions as the signing service account', async () => {
+        // Deterministic timestamp so both signers see the same iat/exp.
+        const fixedNow = 1700000000000;
+        const origNow = Date.now;
+        Date.now = () => fixedNow;
+        try {
+            const localGmail = new GmailOauth({
+                ...baseOpts,
+                serviceClient: '7103296518315821565203',
+                serviceClientEmail: 'svc@proj.iam.gserviceaccount.com',
+                serviceKey: '-----BEGIN PRIVATE KEY-----\nstub\n-----END PRIVATE KEY-----'
+            });
+            // Replace the local signer with a fake that just returns its inputs, so we can compare payloads.
+            localGmail.signer = {
+                async sign(payload) {
+                    return JSON.stringify(payload);
+                }
+            };
+
+            const wifGmail = new GmailOauth({
+                ...baseOpts,
+                serviceClient: '7103296518315821565203',
+                serviceClientEmail: 'svc@proj.iam.gserviceaccount.com',
+                authMethod: 'externalAccount',
+                externalAccount: JSON.stringify({
+                    type: 'external_account',
+                    audience: '//iam.googleapis.com/projects/x/locations/global/workloadIdentityPools/p/providers/q',
+                    subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+                    token_url: 'https://sts.googleapis.com/v1/token',
+                    service_account_impersonation_url:
+                        'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/svc@proj.iam.gserviceaccount.com:generateAccessToken',
+                    credential_source: { file: '/tmp/x' }
+                })
+            });
+            wifGmail.signer = Object.assign(wifGmail.signer, {
+                async sign(payload) {
+                    return JSON.stringify(payload);
+                }
+            });
+
+            const localReq = await localGmail.generateServiceRequest('user@example.com', false);
+            const wifReq = await wifGmail.generateServiceRequest('user@example.com', false);
+
+            // In delegation mode the local key issues as the numeric client ID, while the WIF
+            // assertion MUST be issued as the impersonated service account email so Google can
+            // verify the signature (made by that account via signJwt) against the issuer.
+            assert.strictEqual(localReq.tokenData.iss, '7103296518315821565203');
+            assert.strictEqual(wifReq.tokenData.iss, 'svc@proj.iam.gserviceaccount.com');
+
+            // Every other claim stays identical between the two signers.
+            for (let key of ['scope', 'sub', 'aud', 'iat', 'exp']) {
+                assert.strictEqual(localReq.tokenData[key], wifReq.tokenData[key]);
+            }
+            assert.strictEqual(localReq.payload.grant_type, wifReq.payload.grant_type);
+
+            // In principal mode the local key already issues as the service account email,
+            // so the issuer (and the entire payload) matches the WIF assertion.
+            const localPrincipal = await localGmail.generateServiceRequest(null, true);
+            const wifPrincipal = await wifGmail.generateServiceRequest(null, true);
+            assert.strictEqual(localPrincipal.tokenData.iss, 'svc@proj.iam.gserviceaccount.com');
+            assert.deepStrictEqual(localPrincipal.tokenData, wifPrincipal.tokenData);
+        } finally {
+            Date.now = origNow;
+        }
+    });
+
+    await t.test('GmailOauth rejects external account whose service account differs from serviceClientEmail', () => {
+        assert.throws(
+            () =>
+                new GmailOauth({
+                    ...baseOpts,
+                    serviceClient: '7103296518315821565203',
+                    serviceClientEmail: 'wrong@proj.iam.gserviceaccount.com',
+                    authMethod: 'externalAccount',
+                    externalAccount: JSON.stringify({
+                        type: 'external_account',
+                        audience: '//iam.googleapis.com/projects/x/locations/global/workloadIdentityPools/p/providers/q',
+                        subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+                        token_url: 'https://sts.googleapis.com/v1/token',
+                        service_account_impersonation_url:
+                            'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/svc@proj.iam.gserviceaccount.com:generateAccessToken',
+                        credential_source: { file: '/tmp/x' }
+                    })
+                }),
+            err => err.code === 'EServiceAccountMismatch'
+        );
+    });
+
+    await t.test('refreshToken drives the WIF signer through the jwt-bearer grant end to end', async () => {
+        const { ExternalAccountSigner } = require('../lib/oauth/external-account-signer');
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const os = require('node:os');
+
+        let tokenRequestBodies = [];
+        let server = http.createServer((req, res) => {
+            let chunks = [];
+            req.on('data', chunk => chunks.push(chunk));
+            req.on('end', () => {
+                let body = Buffer.concat(chunks).toString();
+                if (req.url === '/sts' && req.method === 'POST') {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ access_token: 'fed-tok', expires_in: 3600, token_type: 'Bearer' }));
+                }
+                if (/:signJwt$/.test(req.url) && req.method === 'POST') {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ signedJwt: 'signed.jwt.assertion' }));
+                }
+                if (req.url === '/token' && req.method === 'POST') {
+                    tokenRequestBodies.push(body);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ access_token: 'ya29.real-token', expires_in: 3599, token_type: 'Bearer' }));
+                }
+                res.writeHead(404).end();
+            });
+        });
+
+        await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+        let { port } = server.address();
+        let base = `http://127.0.0.1:${port}`;
+
+        let tokenDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'wif-rt-'));
+        let tokenPath = path.join(tokenDir, 'token');
+        await fs.promises.writeFile(tokenPath, 'subject-token', 'utf8');
+
+        try {
+            const buildConfig = tokenUrl => ({
+                type: 'external_account',
+                audience: '//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/q',
+                subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+                token_url: tokenUrl,
+                service_account_impersonation_url: `${base}/v1/projects/-/serviceAccounts/svc@proj.iam.gserviceaccount.com:generateAccessToken`,
+                credential_source: { file: tokenPath }
+            });
+
+            // The constructor's own signer is replaced below, so it only has to be structurally
+            // valid - and token_url is pinned to Google STS, so it has to name the real endpoint.
+            let gmail = new GmailOauth({
+                ...baseOpts,
+                serviceClient: '7103296518315821565203',
+                serviceClientEmail: 'svc@proj.iam.gserviceaccount.com',
+                authMethod: 'externalAccount',
+                externalAccount: JSON.stringify(buildConfig('https://sts.googleapis.com/v1/token'))
+            });
+
+            // Redirect the Google token endpoint and the signer's iamcredentials base to the mock.
+            gmail.tokenUrl = `${base}/token`;
+            // allowedTokenHosts is the injection point that lets the STS exchange reach the mock
+            gmail.signer = new ExternalAccountSigner({
+                config: buildConfig(`${base}/sts`),
+                allowedTokenHosts: ['127.0.0.1'],
+                iamCredentialsBaseUrl: base
+            });
+
+            let result = await gmail.refreshToken({ user: 'user@example.com' });
+
+            assert.strictEqual(result.access_token, 'ya29.real-token');
+
+            assert.strictEqual(tokenRequestBodies.length, 1);
+            let params = new URLSearchParams(tokenRequestBodies[0]);
+            assert.strictEqual(params.get('grant_type'), 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+            assert.strictEqual(params.get('assertion'), 'signed.jwt.assertion');
+        } finally {
+            await new Promise(resolve => server.close(resolve));
+            await fs.promises.rm(tokenDir, { recursive: true, force: true });
+        }
+    });
+
+    await t.test('LocalKeySigner.sign includes kid in header only when kid option is set', async () => {
+        const crypto = require('node:crypto');
+        const { generateKeyPairSync } = crypto;
+        const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+        const pem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+
+        const { LocalKeySigner } = require('../lib/oauth/gmail');
+        const signer = new LocalKeySigner({ serviceKey: pem });
+
+        const withKid = await signer.sign({ iss: 'a' }, { kid: 'key-id-123' });
+        const withoutKid = await signer.sign({ iss: 'a' }, {});
+
+        const decodeHeader = jwt => JSON.parse(Buffer.from(jwt.split('.')[0], 'base64url').toString('utf8'));
+        assert.strictEqual(decodeHeader(withKid).kid, 'key-id-123');
+        assert.strictEqual(decodeHeader(withoutKid).kid, undefined);
+        assert.strictEqual(decodeHeader(withKid).alg, 'RS256');
+        assert.strictEqual(decodeHeader(withKid).typ, 'JWT');
+    });
+
+    await t.test('LocalKeySigner throws if serviceKey is missing', async () => {
+        const { LocalKeySigner } = require('../lib/oauth/gmail');
+        const signer = new LocalKeySigner({});
+        await assert.rejects(
+            () => signer.sign({ iss: 'a' }, {}),
+            err => err.code === 'EServiceKeyMissing'
+        );
+    });
+
+    await t.test('oauthCreateSchema rejects a structurally invalid external_account config', () => {
+        const Joi = require('joi');
+        const { oauthCreateSchema } = require('../lib/schemas');
+        const schema = Joi.object(oauthCreateSchema);
+
+        const base = {
+            provider: 'gmailService',
+            name: 'WIF app',
+            authMethod: 'externalAccount',
+            serviceClient: '7103296518315821565203',
+            serviceClientEmail: 'svc@proj.iam.gserviceaccount.com'
+        };
+
+        // type is correct but the impersonation URL is malformed - this must be caught
+        // at save time rather than on the first token refresh.
+        const badConfig = {
+            type: 'external_account',
+            audience: '//iam.googleapis.com/x',
+            subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+            token_url: 'https://sts.googleapis.com/v1/token',
+            service_account_impersonation_url: 'https://example.com/not-a-valid-endpoint',
+            credential_source: { file: '/var/run/secrets/token' }
+        };
+        const badResult = schema.validate({ ...base, externalAccount: JSON.stringify(badConfig) }, { abortEarly: false });
+        assert.ok(badResult.error, 'malformed external_account config must be rejected');
+        assert.ok(/service_account_impersonation_url/.test(badResult.error.message), 'error should point at the bad field');
+
+        // A well-formed config validates cleanly.
+        const goodConfig = {
+            type: 'external_account',
+            audience: '//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/q',
+            subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+            token_url: 'https://sts.googleapis.com/v1/token',
+            service_account_impersonation_url:
+                'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/svc@proj.iam.gserviceaccount.com:generateAccessToken',
+            credential_source: { file: '/var/run/secrets/token' }
+        };
+        const goodResult = schema.validate({ ...base, externalAccount: JSON.stringify(goodConfig) }, { abortEarly: false });
+        assert.ok(!goodResult.error, goodResult.error && goodResult.error.message);
+    });
+
+    await t.test('GmailOauth constructor rejects unknown authMethod', () => {
+        assert.throws(
+            () =>
+                new GmailOauth({
+                    ...baseOpts,
+                    serviceClient: 'sc',
+                    authMethod: 'magic'
+                }),
+            err => err.code === 'EUnknownAuthMethod'
+        );
+    });
+});

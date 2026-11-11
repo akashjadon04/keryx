@@ -1,0 +1,76 @@
+{{> ui/page-header title="Logging" icon="icon-[tabler--settings]" class="mb-1"}}
+
+<p class="mb-6">
+    Record account connection activity for troubleshooting, including IMAP, SMTP, Gmail API, and Microsoft Graph
+    requests. Download stored logs from each account's page.
+</p>
+
+{{> ui/env-managed-alert}}
+
+<form method="post" action="/admin/config/logging">
+    {{!-- no id: the layout already renders the #crumb element scripts read --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+
+    {{#> ui/card bodyClass="space-y-4"}}
+            <div>
+                {{> ui/setting-ref name="logs.all"}}
+                {{> ui/checkbox id="settingsLogsAll" name="all" label="Enable Logging for All Accounts"
+                checked=values.all error=errors.all}}
+                <span class="helper-text">Record logs for every connected account. Logging many accounts increases memory use and can affect performance.<br>
+                    <strong>Restart required</strong> after changing this setting.</span>
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="logs.maxLogLines"}}
+                {{#> ui/form-field id="settingsLogsMaxLogLines" label="Log Storage Limit (per account)"
+                error=errors.maxLogLines}}
+                <input type="number" class="input{{#if errors.maxLogLines}} is-invalid{{/if}}"
+                    id="settingsLogsMaxLogLines" min="0" max="10000000" name="maxLogLines"
+                    value="{{values.maxLogLines}}" />
+                <span class="helper-text">Maximum log entries to retain per account. Higher limits use more Redis memory.</span>
+                {{/ui/form-field}}
+            </div>
+        
+    {{/ui/card}}
+
+    {{#> ui/card title="Error Reporting" bodyClass="space-y-4"}}
+
+            {{#if sentryEnvManaged}}
+            <div class="alert alert-soft alert-info">Error reporting is currently managed by the
+                <code>SENTRY_DSN</code> environment variable. The settings below are ignored until that variable is
+                removed.</div>
+            {{/if}}
+
+            {{#if sentryTrialManaged}}
+            <div class="alert alert-soft alert-info">Error reporting was enabled automatically when the trial license
+                was activated, so that problems with evaluation instances reach the EmailEngine developers. It turns
+                itself off when a full license is activated. Saving this page stores your own choice instead.</div>
+            {{/if}}
+
+            <div>
+                {{> ui/setting-ref name="sentryEnabled"}}
+                {{> ui/checkbox id="settingsSentryEnabled" name="sentryEnabled"
+                label="Report Unhandled Errors to Sentry" checked=sentryChecked error=errors.sentryEnabled
+                disabled=sentryEnvManaged
+                hint="Send unhandled errors to a Sentry server. Reports include stack traces, account IDs, and error details, but never credentials or message content. Changes apply within a minute - no restart needed."}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="sentryDsn"}}
+                {{#> ui/form-field id="settingsSentryDsn" label="Sentry DSN" error=errors.sentryDsn}}
+                <input type="text" class="input{{#if errors.sentryDsn}} is-invalid{{/if}}" id="settingsSentryDsn"
+                    name="sentryDsn" placeholder="https://public-key@sentry.example.com/1" value="{{values.sentryDsn}}"
+                    {{#if sentryEnvManaged}}disabled{{/if}} />
+                <span class="helper-text">Leave empty to send reports to the Sentry instance run by the EmailEngine
+                    developers (sentry.emailengine.dev). Enabling this temporarily during a support case helps to debug
+                    problems with your installation. Set your own DSN to keep reports in-house.</span>
+                {{/ui/form-field}}
+            </div>
+        
+    {{/ui/card}}
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--settings]"}}
+    </div>
+
+</form>

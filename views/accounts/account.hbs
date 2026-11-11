@@ -1,0 +1,1501 @@
+{{> accounts_header}}
+
+{{> ui/breadcrumb parentHref="/admin/accounts" parentLabel="Accounts" current=account.account class="mt-6 mb-6"}}
+
+{{#if accountAlert}}
+{{#> ui/alert-banner variant="error"}}
+<div class="font-semibold">{{accountAlert.title}}{{#if accountAlert.path}} in folder <em>{{accountAlert.path}}</em>{{/if}}</div>
+{{#if accountAlert.message}}
+<div class="break-words"><small>{{accountAlert.message}}</small></div>
+{{/if}}
+{{#if accountAlert.time}}
+<div><small>{{accountAlert.timeLabel}} <span class="local-date-time" data-time="{{accountAlert.time}}"></span></small></div>
+{{/if}}
+{{/ui/alert-banner}}
+{{/if}}
+
+{{#> ui/card}}
+
+        {{#> ui/detail-toolbar label="Account actions"}}
+
+            {{!-- Primary: the two most common reasons to open an account --}}
+            {{#if canReadMail}}
+            {{#> ui/tooltip text="Browse messages in this account"}}
+            {{> ui/btn variant="primary" size="sm" href=(concat "/admin/accounts/" (urlpart account.account) "/browse") icon="icon-[tabler--folder-open]" label="Browse messages"}}
+            {{/ui/tooltip}}
+            {{/if}}
+
+            {{#> ui/tooltip text="Edit account configuration"}}
+            {{> ui/btn variant="primary" style="outline" size="sm" href=(concat "/admin/accounts/" (urlpart account.account) "/edit") icon="icon-[tabler--user-edit]" label="Edit"}}
+            {{/ui/tooltip}}
+
+            <div class="bg-base-content/10 mx-1 hidden h-6 w-px self-center sm:block" aria-hidden="true"></div>
+
+            {{!-- Operations: act on this account now --}}
+            {{!-- Disabled while the account is switched off: a reconnect rebuilds the connection,
+                 but init() checks the disable flag before it dials out and returns without
+                 connecting, so the click would report success and do nothing. --}}
+            {{#> ui/tooltip text=(when accountParked "Syncing is switched off - use Resume syncing instead" "Close and re-open the connection")}}
+            {{> ui/btn label="Reconnect" bare=true style="soft" size="sm" icon="icon-[tabler--refresh]"
+            id="request-reconnect" disabled=accountParked}}
+            {{/ui/tooltip}}
+
+            {{#> ui/tooltip text="Sync folders now without waiting for the next scheduled sync"}}
+            <button type="button" class="btn btn-soft btn-sm" id="request-sync">
+                <span class="icon-[tabler--rotate-clockwise] size-4"></span> Run sync
+            </button>
+            {{/ui/tooltip}}
+
+            {{#if account.oauth2.provider}}
+            {{#> ui/tooltip text="Re-authenticate OAuth2 account"}}
+            <button type="button" class="btn btn-soft btn-sm" data-overlay="#renewGrantModal" id="renew-grant-btn">
+                {{#if account.type.icon}}
+                <span class="{{account.type.icon}} size-4 align-text-bottom"></span>
+                {{/if}} Re-authenticate
+            </button>
+            {{/ui/tooltip}}
+            {{/if}}
+
+            {{!-- Only for an account the auth-failure safety net switched off. An API account has
+                 no IMAP card, so this is the one control that reaches the flag. --}}
+            {{#if accountParked}}
+            {{#> ui/tooltip text="Turn syncing back on with the stored credentials"}}
+            {{> ui/btn bare=true style="soft" size="sm" id="request-resume" icon="icon-[tabler--player-play]" label="Resume syncing"}}
+            {{/ui/tooltip}}
+            {{/if}}
+
+            {{#if canSend}}
+            {{#unless gateways}}
+            {{#> ui/tooltip text="Test SMTP delivery settings for this account"}}
+            <button type="button" class="btn btn-soft btn-sm test-send-trigger" data-account="{{account.account}}">
+                <span class="icon-[tabler--mail-opened] size-4"></span> Delivery test
+            </button>
+            {{/ui/tooltip}}
+            {{else}}
+            {{#> ui/tooltip text="Test SMTP delivery settings for this account"}}
+            {{!-- fixed strategy + bottom placement so the (potentially tall) gateway menu opens
+                 downward and escapes the card's overflow:hidden clip instead of flipping up --}}
+            <div class="dropdown relative inline-flex [--strategy:fixed] [--placement:bottom-end]">
+                <button type="button" class="dropdown-toggle btn btn-soft btn-sm" aria-haspopup="menu"
+                    aria-expanded="false">
+                    <span class="icon-[tabler--mail-opened] size-4"></span> Delivery test
+                    <span class="icon-[tabler--chevron-down] size-3.5"></span>
+                </button>
+                <ul class="dropdown-menu dropdown-open:opacity-100 hidden min-w-52" role="menu"
+                    aria-orientation="vertical">
+                    {{#if canUseSmtp}}
+                    <li><button type="button" class="dropdown-item test-send-trigger"
+                            data-account="{{account.account}}">Account mail server</button></li>
+                    <li>
+                        <div class="divider my-1"></div>
+                    </li>
+                    {{/if}}
+                    {{#each gateways}}
+                    <li><button type="button" class="dropdown-item test-send-trigger"
+                            data-account="{{../account.account}}" data-gateway="{{gateway}}">{{name}}</button></li>
+                    {{/each}}
+                </ul>
+            </div>
+            {{/ui/tooltip}}
+            {{/unless}}
+            {{/if}}
+
+            {{#if canReadMail}}
+            {{#> ui/tooltip text="Export messages to file"}}
+            <button type="button" class="btn btn-soft btn-sm" id="request-export" data-overlay="#exportModal">
+                <span class="icon-[tabler--file-export] size-4"></span> Export
+                <span id="export-status-indicator" class="badge badge-sm ms-1 hidden"></span>
+            </button>
+            {{/ui/tooltip}}
+            {{/if}}
+
+            {{!-- Logs: download, enable/disable and clear consolidated into one control --}}
+            <div class="dropdown relative inline-flex [--strategy:fixed] [--placement:bottom-end]">
+                <button type="button" class="dropdown-toggle btn btn-soft btn-sm" id="logs-info" aria-haspopup="menu"
+                    aria-expanded="false" data-logs="{{#if account.logs}}enabled{{else}}disabled{{/if}}">
+                    <span class="icon-[tabler--file-text] size-4"></span> Logs
+                    <span class="icon-[tabler--chevron-down] size-3.5"></span>
+                </button>
+                <ul class="dropdown-menu dropdown-open:opacity-100 hidden min-w-56" role="menu"
+                    aria-orientation="vertical" aria-labelledby="logs-info">
+                    {{!-- Downloading or clearing an empty log is a no-op dressed as work, so both
+                    entries below render inert. This line says why: an inert entry is out of hit
+                    testing, so it cannot carry a tooltip of its own --}}
+                    <li id="no-stored-logs" class="{{#if hasStoredLogs}}hidden{{/if}}"><span
+                            class="text-base-content/60 block px-4 py-2 text-sm">No stored logs for this account</span>
+                    </li>
+                    <li>
+                        <a id="download-logs" class="dropdown-item{{#unless hasStoredLogs}} dropdown-disabled{{/unless}}"
+                            {{#if hasStoredLogs}}href="/admin/accounts/{{urlpart account.account}}/logs.txt" download{{else}}aria-disabled="true"{{/if}}>Download stored logs</a>
+                    </li>
+                    <li>
+                        <div class="divider my-1"></div>
+                    </li>
+                    {{#if logs.all}}
+                    <li><span class="text-base-content/60 block px-4 py-2 text-sm">Logging is enabled for all accounts</span></li>
+                    {{else}}
+                    <li><a class="dropdown-item" href="#" id="toggle-logs">{{#if account.logs}}Disable logging{{else}}Enable logging{{/if}}</a></li>
+                    <li><a id="flush-logs" class="dropdown-item{{#unless hasStoredLogs}} dropdown-disabled{{/unless}}"
+                            {{#if hasStoredLogs}}href="#"{{else}}aria-disabled="true"{{/if}}>Clear stored logs</a></li>
+                    {{/if}}
+                </ul>
+            </div>
+
+            {{!-- destructive action kept out of the primary row --}}
+            {{> ui/overflow-menu label="More account actions" deleteLabel="Delete account"}}
+        {{/ui/detail-toolbar}}
+
+        {{!-- Related resources scoped to this account (these navigate elsewhere) --}}
+        <div class="mb-4 text-base-content/60 text-sm">
+            <span class="font-semibold">Related:</span>
+            <a class="link link-animated" href="/admin/templates/?account={{urlpart account.account}}">Email templates</a>
+            <span class="text-base-content/30 mx-1">&middot;</span>
+            <a class="link link-animated" href="/admin/tokens/?account={{urlpart account.account}}">Access tokens</a>
+        </div>
+
+        <dl class="ee-dl">
+            {{#if account.account}}
+            <dt>ID</dt>
+            <dd>
+                <strong>{{account.account}}</strong>
+                {{> ui/state-badge label=account.stateLabel account=account.account}}
+            </dd>
+            {{/if}}
+
+            {{#if account.name}}
+            <dt>Name</dt>
+            <dd>{{account.name}}</dd>
+            {{/if}}
+
+            {{#if account.email}}
+            <dt>Email</dt>
+            <dd>{{account.email}}</dd>
+            {{/if}}
+
+            <dt>Account type</dt>
+            <dd>
+                {{#if account.type.icon}}
+                <span class="{{account.type.icon}} size-4 align-text-bottom"></span>
+                {{/if}}
+
+                {{account.type.name}}
+
+                {{#if account.type.comment}}
+                <span class="text-base-content/60">({{account.type.comment}})</span>
+                {{/if}}
+            </dd>
+
+            {{#if account.sync}}
+            <dt>Last synced</dt>
+            <dd>
+                <span class="local-date-time code-link" data-time="{{account.sync}}" title="{{account.sync}}"></span>
+            </dd>
+            {{/if}}
+        </dl>
+
+    
+{{/ui/card}}
+
+{{#if account._app}}
+
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="card-header"><h6 class="card-title text-primary">OAuth2
+        </h6>
+    </div>
+    <div class="card-body">
+
+        {{#if account.oauth2.userFlag.message }}
+        <div class="alert alert-soft alert-error">{{account.oauth2.userFlag.message}}
+
+            {{#if account.oauth2.userFlag.description}}
+            <hr>
+            <p class="mb-0">
+                <small>{{account.oauth2.userFlag.description}}</small>
+            </p>
+            {{/if}}
+
+        </div>
+        <hr>
+
+        {{/if}}
+
+        <dl class="ee-dl">
+
+
+            <dt>Provider</dt>
+
+            {{#if account.oauth2.app}}
+            <dd>
+                <a href="/admin/config/oauth/app/{{account.oauth2.app.id}}">{{account.type.comment}}</a>
+                (<em>{{account.oauth2.app.id}}</em>)
+
+                {{#if account.oauth2.app.meta.authFlag}}
+                {{#> ui/tooltip text=account.oauth2.app.meta.authFlag.message}}<span
+                    class="icon-[tabler--alert-triangle] text-error size-4 align-text-bottom"></span>{{/ui/tooltip}}
+                {{/if}}
+            </dd>
+            {{else}}
+            <dd>{{account.type.comment}}</dd>
+            {{/if}}
+
+            <dt>Connection method</dt>
+            <dd>
+                {{#if account.isApi}}
+                {{#if account.sendOnly}}
+                API {{#> ui/tooltip text="This account can only send emails. It does not have read access to the mailbox."}}<span
+                    class="badge badge-info badge-sm">Send-only</span>{{/ui/tooltip}}
+                {{else}}
+                API
+                {{/if}}
+                {{else}}
+                IMAP
+                {{/if}}
+            </dd>
+
+            {{#if account.oauth2.auth.user}}
+            <dt>Username</dt>
+            <dd>
+                {{account.oauth2.auth.user}}
+                {{#if account.oauth2.auth.delegatedUser}}
+                <em>as</em>
+                {{account.oauth2.auth.delegatedUser}}
+                {{/if}}
+            </dd>
+            {{/if}}
+
+            {{#if account.oauth2.scopes}}
+            <dt>Scopes</dt>
+            <dd>
+                <div>
+                    {{#each account.oauth2.scopes}}
+                    <div><code>{{this}}</code></div>
+                    {{/each}}
+                </div>
+            </dd>
+            {{/if}}
+
+            {{#if account.oauth2.expiresStr}}
+            <dt>Access token validity</dt>
+            <dd>
+
+                {{#if account.oauth2.generatedStr}}
+                <span class="local-date-time code-link" data-time="{{account.oauth2.generatedStr}}"
+                    title="{{account.oauth2.generatedStr}}"></span> -
+                {{else}}
+                To
+                {{/if}}
+
+                {{#if account.oauth2.accessTokenInvalidated}}
+                {{!-- the expiry was rewound to force a renewal, so the stored end is meaningless --}}
+                invalidated, a new token is requested on the next connection
+                {{else}}
+                <span class="local-date-time code-link" data-time="{{account.oauth2.expiresStr}}"
+                    title="{{account.oauth2.expiresStr}}"></span>
+                {{/if}}
+            </dd>
+            {{/if}}
+
+            {{#if gmailWatch}}
+            <dt>Change subscription</dt>
+
+            <dd>
+
+                {{#*inline "gmailWatchBadge"}}
+                <span class="badge badge-{{#if gmailWatch.active}}success{{else}}{{#if gmailWatch.error}}error{{else}}warning{{/if}}{{/if}}">
+                    {{gmailWatch.stateLabel}}
+                </span>
+                {{/inline}}
+                {{#if gmailWatch.error}}
+                {{#> ui/tooltip text=gmailWatch.error}}{{> gmailWatchBadge}}{{/ui/tooltip}}
+                {{else}}
+                {{> gmailWatchBadge}}
+                {{/if}}
+
+                {{#if gmailWatch.expiresStr}}
+                Valid until <span class="local-date-time code-link" data-time="{{gmailWatch.expiresStr}}"
+                    title="{{gmailWatch.expiresStr}}"></span>
+                {{/if}}
+
+                {{#if gmailWatch.error}}
+                <div class="mt-4">
+                    <div class="alert alert-soft alert-error">
+                        <div>
+                            <small>The last attempt to renew the change subscription failed with the following
+                                error.</small>
+                        </div>
+                        <div>
+                            {{gmailWatch.error}}
+                        </div>
+
+                        {{#if gmailWatch.request}}
+                        <div class="mt-4">
+                            <button type="button" class="btn btn-error btn-sm" data-overlay="#watchDetails">
+                                Show details
+                            </button>
+                        </div>
+                        {{/if}}
+                    </div>
+
+                </div>
+                {{/if}}
+
+            </dd>
+
+
+
+
+            {{/if}}
+
+            {{#if account.outlookSubscription}}
+            <dt>Change subscription</dt>
+            <dd>
+
+                {{#*inline "outlookWatchBadge"}}
+                <span class="badge badge-{{account.outlookSubscription.variant}}">
+                    {{account.outlookSubscription.stateLabel}}
+                </span>
+                {{/inline}}
+                {{#if account.outlookSubscription.state.error}}
+                {{#> ui/tooltip text=account.outlookSubscription.state.error}}{{> outlookWatchBadge}}{{/ui/tooltip}}
+                {{else}}
+                {{> outlookWatchBadge}}
+                {{/if}}
+
+                {{#if account.outlookSubscription.expirationDateTime}}
+                Valid until <span class="local-date-time code-link"
+                    data-time="{{account.outlookSubscription.subscriptionExpiresStr}}"
+                    title="{{account.outlookSubscription.subscriptionExpiresStr}}"></span>
+                {{/if}}
+
+                {{#if account.outlookSubscription.state.error}}
+                <div class="alert alert-soft alert-{{account.outlookSubscription.variant}}">
+                    {{account.outlookSubscription.state.error}}
+                    {{#if account.outlookSubscription.polling}}
+                    <p class="mt-1">New messages are still found by a periodic check, but changes to and deletions of existing messages are not reported until a subscription can be created.</p>
+                    {{/if}}
+
+                    {{#if account.outlookSubscription.state.time}}
+                    <small>(last checked <span class="local-date-time"
+                            data-time="{{isodate account.outlookSubscription.state.time}}"
+                            title="{{isodate account.outlookSubscription.state.time}}"></span>)</small>
+                    {{/if}}
+
+                </div>
+                {{/if}}
+
+            </dd>
+            {{/if}}
+
+        </dl>
+
+    </div>
+</div>
+
+{{/if}}
+
+{{#unless account.isApi}}
+
+{{!-- IMAP and SMTP sit side by side on wide screens; the deep-technical server
+     info moves into the collapsed detail cards below the grid --}}
+<div class="grid gap-6 {{#if showSmtp}}lg:grid-cols-2 {{/if}}items-start mb-6">
+
+<div class="card bg-base-100 shadow-md">
+    <div class="card-header"><h6 class="card-title text-primary">IMAP {{#if account.lastErrorState}}<span class="badge badge-error badge-sm">Error</span>{{/if}}</h6>
+    </div>
+    <div class="card-body">
+
+        {{#if account.lastErrorState}}
+        {{#if account.lastErrorState.description}}
+        <div class="alert alert-soft alert-error">{{account.lastErrorState.description}}</div>
+        {{/if}}
+        <dl class="ee-dl">
+
+
+
+            {{#if account.lastErrorState.response}}
+            <dt>IMAP response</dt>
+            <dd><code>{{account.lastErrorState.response}}</code></dd>
+            {{/if}}
+        </dl>
+
+        <hr>
+        {{/if}}
+
+        <dl class="ee-dl">
+
+
+            <dt>Enabled</dt>
+
+            {{#if account.imap.disabled}}
+            <dd>No</dd>
+            {{else}}
+            <dd>Yes</dd>
+            {{/if}}
+
+
+            {{#unless account.imap.disabled}}
+            {{#unless account.oauth2.provider}}
+
+            {{#if account.imap.auth.user}}
+            <dt>Username</dt>
+            <dd>{{account.imap.auth.user}}</dd>
+            {{/if}}
+
+            <dt>Authentication</dt>
+            {{#if account.imap.auth.pass}}
+            <dd>Password</dd>
+            {{else}}
+            <dd>None</dd>
+            {{/if}}
+
+            {{#if account.imap.host}}
+            <dt>Hostname</dt>
+            <dd>{{account.imap.host}}</dd>
+            {{/if}}
+
+            {{#if account.imap.port}}
+            <dt>Port</dt>
+            <dd>{{account.imap.port}}</dd>
+            {{/if}}
+
+            <dt>TLS</dt>
+            <dd>{{#if account.imap.secure}}Yes{{else}}Uses STARTTLS if possible{{/if}}
+            </dd>
+
+            {{else}}
+            {{!-- OAuth account: username and auth method already appear in the OAuth2 card above;
+                 list only the provider-derived endpoint here to avoid repeating them --}}
+            {{#if account.oauth2.providerData.imap.host}}
+            <dt>Hostname</dt>
+            <dd>{{account.oauth2.providerData.imap.host}}</dd>
+            {{/if}}
+
+            {{#if account.oauth2.providerData.imap.port}}
+            <dt>Port</dt>
+            <dd>{{account.oauth2.providerData.imap.port}}</dd>
+            {{/if}}
+
+            <dt>TLS</dt>
+            <dd>{{#if account.oauth2.providerData.imap.secure}}Yes{{else}}Uses STARTTLS if
+                possible{{/if}}
+            </dd>
+
+            {{/unless}}
+
+            {{#if account.imap.resyncDelay}}
+            <dt>Resync interval (seconds)</dt>
+            <dd>{{account.imap.resyncDelay}}</dd>
+            {{/if}}
+
+            {{!-- The special-use folder overrides, from the same list the edit form renders, and each
+            shown only where one is set: EmailEngine detects these folders from the server's own flags,
+            so an absent row means it detected the folder rather than that there is none. --}}
+            {{#each specialUsePathFields}}
+            {{#with (lookup ../account.imap this.key)}}
+            <dt>{{../this.label}} folder</dt>
+            <dd>{{this}}</dd>
+            {{/with}}
+            {{/each}}
+
+            {{#if account.path}}
+            <dt>Syncing paths
+
+                {{#> ui/tooltip text="EmailEngine only checks for new or updated emails from the selected paths"}}<span
+                    class="icon-[tabler--info-circle] text-base-content/50 size-4 align-text-bottom"></span>{{/ui/tooltip}}
+
+            </dt>
+            <dd>
+                {{#each account.path}}
+                <span class="badge badge-soft">
+                    {{this}}
+                </span>
+                {{/each}}
+            </dd>
+            {{/if}}
+
+            {{/unless}}
+
+        </dl>
+
+        {{#if subConnectionInfo}}
+        <hr>
+        <h6 class="card-title text-primary">Subconnections</h6>
+
+        <p>Subconnections are additional IMAP connections that watch secondary folders for changes.
+            They provide faster updates than the periodic sync used for these folders by default.</p>
+
+        <dl class="ee-dl mt-4">
+            {{#each subConnectionInfo}}
+            <dt>{{path}}</dt>
+            <dd>
+                {{> ui/state-badge label=stateLabel}}
+            </dd>
+            {{/each}}
+        </dl>
+        {{/if}}
+
+    </div>
+</div>
+
+{{#if showSmtp}}
+<div class="card bg-base-100 shadow-md">
+    <div class="card-header"><h6 class="card-title text-primary">SMTP {{#if smtpError}}<span class="badge badge-error badge-sm">Error</span>{{/if}}</h6>
+    </div>
+    <div class="card-body">
+
+        {{#if smtpError}}
+        <dl class="ee-dl">
+            <dt>Error</dt>
+            <dd>{{account.smtpStatus.description}}</dd>
+
+            {{#if account.smtpStatus.response}}
+            <dt>SMTP response</dt>
+            <dd><code>{{account.smtpStatus.response}}</code></dd>
+            {{/if}}
+        </dl>
+
+        <hr>
+        {{/if}}
+
+        <dl class="ee-dl">
+
+            {{#unless account.oauth2.provider}}
+            {{#if account.smtp.auth.user}}
+            <dt>Username</dt>
+            <dd>{{account.smtp.auth.user}}</dd>
+            {{/if}}
+
+            <dt>Authentication</dt>
+            {{#if account.smtp.auth.pass}}
+            <dd>Password</dd>
+            {{else}}
+            <dd>None</dd>
+            {{/if}}
+
+            {{#if account.smtp.host}}
+            <dt>Hostname</dt>
+            <dd>{{account.smtp.host}}</dd>
+            {{/if}}
+
+            {{#if account.smtp.port}}
+            <dt>Port</dt>
+            <dd>{{account.smtp.port}}</dd>
+            {{/if}}
+
+            <dt>TLS</dt>
+            <dd>{{#if account.smtp.secure}}Yes{{else}}Uses STARTTLS if possible{{/if}}
+            </dd>
+
+            {{else}}
+            {{!-- OAuth account: username and auth method already appear in the OAuth2 card above;
+                 list only the provider-derived endpoint here to avoid repeating them --}}
+            {{#if account.oauth2.providerData.smtp.host}}
+            <dt>Hostname</dt>
+            <dd>{{account.oauth2.providerData.smtp.host}}</dd>
+            {{/if}}
+
+            {{#if account.oauth2.providerData.smtp.port}}
+            <dt>Port</dt>
+            <dd>{{account.oauth2.providerData.smtp.port}}</dd>
+            {{/if}}
+
+            <dt>TLS</dt>
+            <dd>{{#if account.oauth2.providerData.smtp.secure}}Yes{{else}}Uses STARTTLS if
+                possible{{/if}}
+            </dd>
+
+            {{/unless}}
+
+        </dl>
+
+    </div>
+</div>
+{{/if}}
+
+</div>
+{{!-- /IMAP + SMTP grid --}}
+
+{{#if account.imapServerInfo}}
+{{#> ui/details summary="IMAP server details" class="card bg-base-100 shadow-md mb-6"}}
+<dl class="ee-dl">
+
+    {{#if account.imapServerInfo.name}}
+    <dt>Server Software</dt>
+    <dd>{{account.imapServerInfo.name}}</dd>
+    {{/if}}
+
+    {{#if account.imapServerInfo.vendor}}
+    <dt>Vendor</dt>
+    <dd>{{account.imapServerInfo.vendor}}</dd>
+    {{/if}}
+
+    {{#if account.imapServerInfo.version}}
+    <dt>Version</dt>
+    <dd>{{account.imapServerInfo.version}}</dd>
+    {{/if}}
+
+    {{#if account.imapServerInfo.[support-url]}}
+    <dt>Support URL</dt>
+    <dd><a href="{{account.imapServerInfo.[support-url]}}" target="_blank" rel="noopener noreferrer"
+            referrerpolicy="no-referrer" class="link link-animated">{{account.imapServerInfo.[support-url]}}</a>
+    </dd>
+    {{/if}}
+
+    <dt>Capabilities</dt>
+    <dd>
+        {{#each capabilities}}
+        {{#if url}}
+        {{#> ui/tooltip text=rfc}}<a href="{{url}}" target="_blank" rel="noopener noreferrer"
+            referrerpolicy="no-referrer" class="link link-animated"><small>{{capability}}</small></a>{{/ui/tooltip}}
+        {{else}}
+        <small class="cursor-default">{{capability}}</small>
+        {{/if}}
+        {{/each}}
+    </dd>
+
+    <dt>Authentication</dt>
+    <dd>
+        {{#each authCapabilities}}
+        {{#if url}}
+        {{#if lastUsed}}
+        {{#> ui/tooltip text=(concat "Active method | " rfc)}}<a href="{{url}}" class="badge badge-neutral badge-sm"
+            target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"><small>{{capability}}</small></a>{{/ui/tooltip}}
+        {{else}}
+        {{#> ui/tooltip text=rfc}}<a href="{{url}}" class="link link-animated"
+            target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"><small>{{capability}}</small></a>{{/ui/tooltip}}
+        {{/if}}
+        {{else}}
+        <small class="cursor-default">{{capability}}</small>
+        {{/if}}
+        {{/each}}
+    </dd>
+
+</dl>
+{{/ui/details}}
+{{/if}}
+
+{{#if account.smtpServerEhlo}}
+{{#> ui/details summary="SMTP server details" class="card bg-base-100 shadow-md mb-6"}}
+<dl class="ee-dl">
+    <dt>Extensions</dt>
+    <dd>
+        {{#each account.smtpServerEhlo}}
+        <small class="cursor-default">{{this}}</small>
+        {{/each}}
+    </dd>
+
+    <dt>Authentication</dt>
+    <dd>
+        {{#each account.smtpAuthMechanisms}}
+        {{#if url}}
+        {{#> ui/tooltip text=rfc}}<a href="{{url}}" target="_blank" rel="noopener noreferrer"
+            referrerpolicy="no-referrer" class="link link-animated"><small>{{auth}}</small></a>{{/ui/tooltip}}
+        {{else}}
+        <small class="cursor-default">{{this}}</small>
+        {{/if}}
+        {{/each}}
+    </dd>
+</dl>
+{{/ui/details}}
+{{/if}}
+
+{{/unless}}
+
+{{!-- The account's share of the queues: what it still has to send, and the failed messages
+     kept for a retry. Links go to the queue browser filtered to this account. --}}
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="card-header flex flex-wrap items-center justify-between gap-3">
+        <h6 class="card-title text-primary mb-0">Queues</h6>
+        <a href="{{queuedMessages.url}}" class="link link-animated text-sm">Open in the queue browser</a>
+    </div>
+    <div class="card-body">
+        <dl class="ee-dl">
+            <dt>Messages to send</dt>
+            <dd>
+                {{#if queuedMessages.pending}}
+                <a href="{{queuedMessages.url}}" class="link link-animated">{{formatInteger queuedMessages.pending userLocale}} waiting or scheduled</a>
+                {{else}}
+                <span class="text-base-content/60">None waiting</span>
+                {{/if}}
+            </dd>
+            <dt>Failed messages</dt>
+            <dd>
+                {{#if queuedMessages.failed}}
+                <a href="{{queuedMessages.failedUrl}}" class="link link-animated">{{formatInteger queuedMessages.failed userLocale}} kept for a retry</a>
+                {{else}}
+                <span class="text-base-content/60">None kept</span>
+                {{/if}}
+            </dd>
+            <dt>Webhooks</dt>
+            <dd><a href="{{queuedMessages.webhooksUrl}}" class="link link-animated">Failed deliveries for this account</a></dd>
+        </dl>
+    </div>
+</div>
+
+{{#if showAdvanced}}
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="card-header"><h6 class="card-title text-primary">Advanced</h6>
+    </div>
+    <div class="card-body">
+
+        <dl class="ee-dl">
+
+            {{#if account.path}}
+            <dt>Path to sync</dt>
+            <dd><code class="text-base-content/60">{{account.path}}</code></dd>
+            {{/if}}
+
+            {{#if account.proxy}}
+            <dt>Proxy</dt>
+            <dd><code class="text-base-content/60">{{account.proxy}}</code></dd>
+            {{/if}}
+
+        </dl>
+
+    </div>
+</div>
+{{/if}}
+
+{{!-- Effective webhook routing for this account. Mirrors the precedence the notify worker
+     applies (custom route target, account override, global setting) so a misdirected webhook
+     can be debugged from one place. --}}
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="card-header"><h6 class="card-title text-primary">Webhook routing</h6>
+    </div>
+    <div class="card-body">
+
+        {{#unless webhookRouting.enabled}}
+        {{#> ui/alert-banner variant="warning" title="Webhook delivery is disabled"}}
+        Webhooks are turned off globally, so no events are delivered for any account. Enable them under <a href="/admin/config/webhooks" class="link">Webhook settings</a>.
+        {{/ui/alert-banner}}
+        {{/unless}}
+
+        <dl class="ee-dl">
+
+            <dt>Default webhook target</dt>
+            <dd>
+                {{#if webhookRouting.defaultRoute.url}}
+                <code class="text-base-content/60">{{webhookRouting.defaultRoute.url}}</code>
+                {{#equals webhookRouting.defaultRoute.source "account"}}
+                {{> ui/badge label="account override" variant="info" soft=true}}
+                {{else}}
+                {{> ui/badge label="global setting" variant="neutral" soft=true}}
+                {{/equals}}
+                {{else}}
+                <span class="text-base-content/60">Not configured - events are only delivered to matching webhook routes</span>
+                {{/if}}
+            </dd>
+
+            {{#if webhookRouting.defaultRoute.url}}
+            <dt>Event types</dt>
+            <dd>
+                {{#if webhookRouting.defaultRoute.allEvents}}
+                All event types
+                {{else if webhookRouting.defaultRoute.events.length}}
+                {{#each webhookRouting.defaultRoute.events}}<code class="text-base-content/60">{{this}}</code>{{#unless @last}}, {{/unless}}{{/each}}
+                {{else}}
+                <span class="text-base-content/60">None selected - the default target receives no events</span>
+                {{/if}}
+                {{#if webhookRouting.defaultRoute.inboxNewOnly}}
+                <div><small>New-message notifications are limited to the Inbox (<code>inboxNewOnly</code>).</small></div>
+                {{/if}}
+            </dd>
+            {{/if}}
+
+            {{#if webhookRouting.defaultRoute.customHeadersLabel}}
+            <dt>Custom headers</dt>
+            <dd>{{webhookRouting.defaultRoute.customHeadersLabel}}</dd>
+            {{/if}}
+
+            <dt>Webhook routes</dt>
+            <dd>
+                {{#if webhookRouting.customRoutes.length}}
+                <ul class="list-none p-0 m-0">
+                    {{#each webhookRouting.customRoutes}}
+                    <li><a href="/admin/webhooks/webhook/{{this.id}}" class="link link-primary">{{this.name}}</a> <code class="text-base-content/60">{{this.targetUrl}}</code>{{#if this.missingFilter}} {{> ui/badge label="no filter - never delivers" variant="warning" soft=true}}{{/if}}</li>
+                    {{/each}}
+                </ul>
+                <small class="text-base-content/60">Enabled webhook routes deliver independently of the default target; each route applies its own filter function instead of the event type list. A route without a filter function never delivers anything.</small>
+                {{else}}
+                <span class="text-base-content/60">None enabled</span>
+                {{/if}}
+            </dd>
+
+        </dl>
+
+        {{#if account.webhookErrorFlag.message}}
+        <hr />
+
+        <div><small>The last webhook delivery attempt failed:</small></div>
+        <div><code>{{account.webhookErrorFlag.message}}</code></div>
+        {{/if}}
+
+    </div>
+</div>
+
+{{#> ui/modal id="renewGrantModal" title="Re-authenticate account"}}
+<div class="modal-body">
+    <p>
+        When renewing the OAuth2 grant, ensure you are not logged in to another account for the same
+        provider in this browser. Otherwise, that account might override the settings and messages for
+        <em>{{account.name}}</em> in EmailEngine.
+    </p>
+</div>
+<div class="modal-footer">
+    <form method="post" action="/accounts/new" class="flex gap-2">
+        <input type="hidden" name="crumb" value="{{crumb}}">
+        <input type="hidden" name="type" value="{{account.oauth2.provider}}">
+        <input type="hidden" name="data" value="{{accountForm.data}}">
+        <input type="hidden" name="sig" value="{{accountForm.signature}}">
+        {{> ui/btn label="Cancel" variant="neutral" style="soft" overlay="#renewGrantModal"}}
+        <button type="submit" class="btn btn-primary">
+            {{#if account.type.icon}}
+            <span class="{{account.type.icon}} size-4 align-text-bottom"></span>
+            {{/if}} Re-authenticate
+        </button>
+    </form>
+</div>
+{{/ui/modal}}
+
+{{#> ui/confirm-modal id="deleteModal" title="Delete account" action=(concat "/admin/accounts/" (urlpart account.account) "/delete")
+submitLabel="Delete account"}}
+<p>Delete <strong>{{account.name}}</strong> from EmailEngine? This removes its synced data, account-specific templates, access tokens, and queued emails. Emails on the mail server are not deleted. This action cannot be undone.</p>
+{{/ui/confirm-modal}}
+
+{{#> ui/modal id="testSendModal" title="Email delivery test" dialogClass="max-w-3xl"}}
+<div class="modal-body">
+    <p><small class="text-base-content/60">EmailEngine sends a test email from the selected account to EmailEngine's
+            remote testing server. Once the test email has been processed, EmailEngine displays the
+            SPF, DKIM, and DMARC authentication results below.</small>
+    </p>
+    <div id="test-send-pending-message">
+        <p><span class="loading loading-spinner loading-sm align-middle"></span> Testing email delivery. Please
+            wait&mldr;<br />
+            <small><strong>Note:</strong> This process may take several
+                minutes depending on the SMTP server.</small>
+        </p>
+    </div>
+    <div id="test-send-error">
+        <p>The test email could not be submitted:</p>
+        <div>
+            <small class="alert alert-soft alert-error error-message block font-mono"></small>
+        </div>
+    </div>
+    <div id="test-send-results"></div>
+</div>
+<div class="modal-footer">
+    {{> ui/btn label="Close" variant="neutral" style="soft" overlay="#testSendModal"}}
+</div>
+{{/ui/modal}}
+
+{{#> ui/modal id="watchDetails" title="Renewal request details" dialogClass="max-w-3xl"}}
+<div class="modal-body">
+    <dl class="ee-dl">
+
+        <dt>Error message</dt>
+        <dd>{{gmailWatch.error}}</dd>
+
+        <dt>Request time</dt>
+        <dd>
+            <span class="local-date-time" data-time="{{gmailWatch.lastCheckStr}}"
+                title="{{gmailWatch.lastCheckStr}}"></span>
+        </dd>
+
+        {{#if gmailWatch.request.status}}
+        <dt>Response status</dt>
+        <dd>
+            {{gmailWatch.request.status}}
+        </dd>
+        {{/if}}
+
+        {{#if gmailWatch.request.contentType}}
+        <dt>Content Type</dt>
+        <dd>
+            <span class="code-link">{{gmailWatch.request.contentType}}</span>
+        </dd>
+        {{/if}}
+
+    </dl>
+
+    {{#if gmailWatch.request.response}}
+
+    <div class="mt-4">
+        <textarea class="textarea font-mono w-full" rows="5" spellcheck="false" data-enable-grammarly="false"
+            readonly>{{json gmailWatch.request.response}}</textarea>
+    </div>
+
+    {{/if}}
+
+</div>
+<div class="modal-footer">
+    {{> ui/btn label="Close" variant="neutral" style="soft" overlay="#watchDetails"}}
+</div>
+{{/ui/modal}}
+
+{{#> ui/modal id="exportModal" title="Export Messages"}}
+<div class="modal-body">
+    <div id="export-form-view" class="space-y-4">
+        {{> ui/form-field id="export-start-date" type="date" label="Start Date"}}
+        {{> ui/form-field id="export-end-date" type="date" label="End Date"}}
+        {{> ui/checkbox id="export-include-attachments" label="Include attachments" hint="Download and include attachment file contents in the export. This increases export size and time."}}
+        <small class="text-base-content/60 block">Gmail accounts export from All Mail. Other accounts export all folders
+            (excluding Junk and Trash).</small>
+    </div>
+
+    <div id="export-status-view" class="hidden">
+        <div class="mb-4">
+            <strong>Status:</strong>
+            <span id="export-status-badge" class="badge badge-info">Queued</span>
+            <span id="export-phase-badge" class="badge badge-neutral ms-1 hidden"></span>
+        </div>
+        <div class="mb-4">
+            <strong>Expires:</strong>
+            <span id="export-expires-at" class="text-base-content/60"></span>
+        </div>
+        <div id="export-progress-section">
+            <div class="progress mb-2">
+                <div id="export-progress-bar" class="progress-bar bg-info" role="progressbar" aria-valuenow="0"
+                    aria-valuemin="0" aria-valuemax="100" style="width: 0%"></div>
+            </div>
+            <small id="export-progress-text" class="text-base-content/60"></small>
+        </div>
+        <div id="export-error-section" class="hidden">
+            <div class="alert alert-soft alert-error" id="export-error-message"></div>
+        </div>
+        <div id="export-download-section" class="hidden mt-4">
+            <a href="#" id="export-download-link" class="btn btn-success btn-block">
+                <span class="icon-[tabler--download] size-4"></span> Download export
+            </a>
+        </div>
+    </div>
+</div>
+<div class="modal-footer">
+    {{> ui/btn label="Close" variant="neutral" style="soft" overlay="#exportModal"}}
+    <button type="button" class="btn btn-error hidden" id="export-reset-btn">
+        <span class="icon-[tabler--trash] size-4"></span> Reset
+    </button>
+    <button type="button" class="btn btn-primary" id="export-start-btn">
+        <span class="icon-[tabler--file-export] size-4"></span> Start export
+    </button>
+</div>
+{{/ui/modal}}
+
+{{!-- no #crumb input: the layout already renders the element the script reads --}}
+<input type="hidden" id="account-id" value="{{account.account}}">
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        const reconnectAccount = async () => {
+            const account = document.getElementById('account-id').value.trim();
+
+            const data = await uiPostJson(`/admin/accounts/${encodeURIComponent(account)}/reconnect`, {
+                reconnect: true
+            });
+
+            return data;
+        }
+
+        const requestReconnectElm = document.getElementById('request-reconnect');
+        requestReconnectElm.addEventListener('click', e => {
+            e.preventDefault();
+            // Busy for the round trip: the request goes to a worker that has to reach the mail
+            // server, and the busy button is what stops a second one being asked for meanwhile.
+            uiBusyAction(requestReconnectElm, () =>
+                reconnectAccount().then(data => uiToastResult(data, 'Account reconnection requested', 'Failed to request reconnect'))
+            );
+        });
+
+        // Only rendered for an account the auth-failure safety net switched off
+        const requestResumeElm = document.getElementById('request-resume');
+        if (requestResumeElm) {
+            requestResumeElm.addEventListener('click', e => {
+                e.preventDefault();
+                // The disabled button is the re-entrancy guard
+                if (requestResumeElm.disabled) {
+                    return
+                }
+
+                uiButtonBusy(requestResumeElm, true);
+                const account = document.getElementById('account-id').value.trim();
+                uiPostJson(`/admin/accounts/${encodeURIComponent(account)}/resume`, {}).then(data => {
+                    if (data.success) {
+                        // Both the button and the alert explaining why it was there belong to the
+                        // switched-off state, so reload rather than leave either behind. No toast:
+                        // the navigation would destroy it before it could be read.
+                        window.location.reload();
+                        return;
+                    }
+                    uiButtonBusy(requestResumeElm, false);
+                    uiToastResult(data, 'Syncing resumed', 'Failed to resume syncing');
+                }).catch(err => {
+                    uiButtonBusy(requestResumeElm, false);
+                    showToast('Request failed\n' + err.message, 'alert-triangle');
+                })
+            });
+        }
+
+        const syncAccount = async () => {
+            const account = document.getElementById('account-id').value.trim();
+
+            const data = await uiPostJson(`/admin/accounts/${encodeURIComponent(account)}/sync`, {
+                sync: true
+            });
+
+            return data;
+        }
+
+        const requestSyncElm = document.getElementById('request-sync');
+        requestSyncElm.addEventListener('click', e => {
+            e.preventDefault();
+            uiBusyAction(requestSyncElm, () =>
+                syncAccount().then(data => uiToastResult(data, 'Account sync requested', 'Failed to request syncing'))
+            );
+        });
+
+        const toggleLogs = async () => {
+            const account = document.getElementById('account-id').value.trim();
+
+            let current = document.getElementById('logs-info').dataset.logs;
+            let toggled = current === 'enabled' ? false : true;
+
+            const data = await uiPostJson(`/admin/accounts/${encodeURIComponent(account)}/logs`, {
+                enabled: toggled
+            });
+            if (data.enabled) {
+                // mark as enabled
+                document.getElementById('logs-info').dataset.logs = 'enabled'
+                document.getElementById('toggle-logs').textContent = 'Disable logging';
+            } else {
+                // mark as disabled
+                document.getElementById('logs-info').dataset.logs = 'disabled'
+                document.getElementById('toggle-logs').textContent = 'Enable logging';
+            }
+            return data;
+        }
+
+        // #toggle-logs / #flush-logs only render when the global "log all accounts"
+        // setting is off - guard so the rest of this block still gets wired
+        const toggleLogsElm = document.getElementById('toggle-logs');
+        toggleLogsElm?.addEventListener('click', e => {
+            e.preventDefault();
+            uiBusyAction(toggleLogsElm, () =>
+                toggleLogs().then(data => uiToastResult(data, 'Logging settings updated', 'Failed to update logging settings'))
+            );
+        });
+
+        const downloadLogsElm = document.getElementById('download-logs');
+        const flushLogsElm = document.getElementById('flush-logs');
+
+        // The client-side mirror of hasStoredLogs = false: nothing left to download or to clear,
+        // and the note carries the reason that an entry out of hit testing cannot show itself
+        const markLogsEmpty = () => {
+            for (const elm of [downloadLogsElm, flushLogsElm]) {
+                elm.classList.add('dropdown-disabled');
+                elm.removeAttribute('href');
+                elm.setAttribute('aria-disabled', 'true');
+            }
+            document.getElementById('no-stored-logs').classList.remove('hidden');
+        }
+
+        flushLogsElm?.addEventListener('click', e => {
+            e.preventDefault();
+            const account = document.getElementById('account-id').value.trim();
+            uiBusyAction(flushLogsElm, () =>
+                uiPostJson(`/admin/accounts/${encodeURIComponent(account)}/logs-flush`).then(data => {
+                    if (data.success) {
+                        markLogsEmpty();
+                    }
+                    uiToastResult(data, 'Stored logs were flushed', 'Failed to flush logs');
+                })
+            );
+        });
+
+        // Export status indicator on page load
+        async function updateExportIndicator() {
+            const account = document.getElementById('account-id').value.trim();
+            const indicator = document.getElementById('export-status-indicator');
+            if (!indicator) return;
+
+            try {
+                const res = await fetch(`/admin/accounts/${encodeURIComponent(account)}/exports?pageSize=1`);
+                if (!res.ok) {
+                    indicator.classList.add('hidden');
+                    return;
+                }
+                const data = await res.json();
+
+                if (data.exports && data.exports.length > 0) {
+                    const latest = data.exports[0];
+                    if (latest.status === 'queued' || latest.status === 'processing') {
+                        indicator.textContent = latest.status === 'queued' ? 'Queued' : 'Exporting';
+                        indicator.className = 'badge badge-info badge-sm ms-1';
+                    } else if (latest.status === 'completed') {
+                        indicator.textContent = 'Ready';
+                        indicator.className = 'badge badge-success badge-sm ms-1';
+                    } else {
+                        indicator.classList.add('hidden');
+                        return;
+                    }
+                    indicator.classList.remove('hidden');
+                } else {
+                    indicator.classList.add('hidden');
+                }
+            } catch (err) {
+                console.error('Failed to check export status', err);
+                indicator.classList.add('hidden');
+            }
+        }
+
+        // Check export status on page load
+        updateExportIndicator();
+
+        // Export modal functionality
+        let currentExportId = null;
+        let exportPollingInterval = null;
+
+        function showFormView() {
+            document.getElementById('export-form-view').classList.remove('hidden');
+            document.getElementById('export-status-view').classList.add('hidden');
+            document.getElementById('export-start-btn').classList.remove('hidden');
+            document.getElementById('export-reset-btn').classList.add('hidden');
+
+            // Set default dates (last 1 year)
+            const today = new Date();
+            const lastYear = new Date(today);
+            lastYear.setFullYear(lastYear.getFullYear() - 1);
+            document.getElementById('export-end-date').value = today.toISOString().split('T')[0];
+            document.getElementById('export-start-date').value = lastYear.toISOString().split('T')[0];
+        }
+
+        function showStatusView() {
+            document.getElementById('export-form-view').classList.add('hidden');
+            document.getElementById('export-status-view').classList.remove('hidden');
+            document.getElementById('export-start-btn').classList.add('hidden');
+            document.getElementById('export-reset-btn').classList.remove('hidden');
+        }
+
+        function getStatusBadgeClass(status) {
+            switch (status) {
+                case 'completed': return 'success';
+                case 'failed': return 'error';
+                case 'processing': return 'info';
+                default: return 'neutral';
+            }
+        }
+
+        function startPolling() {
+            if (exportPollingInterval) return;
+            exportPollingInterval = setInterval(updateExportStatus, 3000);
+        }
+
+        function stopPolling() {
+            if (exportPollingInterval) {
+                clearInterval(exportPollingInterval);
+                exportPollingInterval = null;
+            }
+        }
+
+        async function updateExportStatus() {
+            if (!currentExportId) return;
+
+            const account = document.getElementById('account-id').value.trim();
+            try {
+                const res = await fetch(`/admin/accounts/${encodeURIComponent(account)}/export/${currentExportId}`);
+                if (!res.ok) {
+                    throw new Error(`HTTP error! status: ${res.status}`);
+                }
+                const data = await res.json();
+
+                // Update status badge
+                const badge = document.getElementById('export-status-badge');
+                badge.textContent = data.status.charAt(0).toUpperCase() + data.status.slice(1);
+                badge.className = 'badge badge-' + getStatusBadgeClass(data.status);
+
+                // Update phase badge
+                const phaseBadge = document.getElementById('export-phase-badge');
+                if (data.phase && data.status === 'processing') {
+                    phaseBadge.textContent = data.phase.charAt(0).toUpperCase() + data.phase.slice(1);
+                    phaseBadge.classList.remove('hidden');
+                } else {
+                    phaseBadge.classList.add('hidden');
+                }
+
+                // Update expiration date
+                const expiresAtEl = document.getElementById('export-expires-at');
+                if (data.expiresAt) {
+                    const expiresDate = new Date(data.expiresAt);
+                    expiresAtEl.textContent = expiresDate.toLocaleString();
+                } else {
+                    expiresAtEl.textContent = 'Unknown';
+                }
+
+                // Update progress bar
+                const progressBar = document.getElementById('export-progress-bar');
+                const progressText = document.getElementById('export-progress-text');
+
+                if (data.phase === 'indexing' && data.progress) {
+                    // During indexing, show folders scanned progress
+                    const pct = data.progress.foldersTotal > 0
+                        ? Math.round((data.progress.foldersScanned / data.progress.foldersTotal) * 100)
+                        : 0;
+                    progressBar.style.width = pct + '%';
+                    progressBar.setAttribute('aria-valuenow', pct);
+                    progressText.textContent = `Scanning folders: ${data.progress.foldersScanned || 0} / ${data.progress.foldersTotal || '?'}`;
+                } else if (data.progress) {
+                    // During exporting, show messages exported progress
+                    const pct = data.progress.messagesQueued > 0
+                        ? Math.round((data.progress.messagesExported / data.progress.messagesQueued) * 100)
+                        : 0;
+                    progressBar.style.width = pct + '%';
+                    progressBar.setAttribute('aria-valuenow', pct);
+                    progressText.textContent =
+                        `${data.progress.messagesExported} / ${data.progress.messagesQueued} messages exported`;
+                }
+
+                // Handle completion
+                if (data.status === 'completed') {
+                    stopPolling();
+                    document.getElementById('export-download-section').classList.remove('hidden');
+                    document.getElementById('export-download-link').href =
+                        `/admin/accounts/${encodeURIComponent(account)}/export/${currentExportId}/download`;
+                    progressBar.style.width = '100%';
+                    progressBar.setAttribute('aria-valuenow', 100);
+                    progressBar.classList.remove('bg-info');
+                    progressBar.classList.add('bg-success');
+                }
+
+                // Handle failure
+                if (data.status === 'failed') {
+                    stopPolling();
+                    document.getElementById('export-error-section').classList.remove('hidden');
+                    document.getElementById('export-error-message').textContent = data.error || 'Export failed';
+                    document.getElementById('export-progress-section').classList.add('hidden');
+                }
+            } catch (err) {
+                console.error('Failed to update export status', err);
+            }
+        }
+
+        async function checkExistingExport() {
+            const account = document.getElementById('account-id').value.trim();
+            try {
+                const res = await fetch(`/admin/accounts/${encodeURIComponent(account)}/exports?pageSize=1`);
+                if (!res.ok) {
+                    showFormView();
+                    return;
+                }
+                const data = await res.json();
+
+                if (data.exports && data.exports.length > 0) {
+                    const latest = data.exports[0];
+                    if (latest.status === 'queued' || latest.status === 'processing' || latest.status === 'completed') {
+                        currentExportId = latest.exportId;
+                        showStatusView();
+                        // Reset progress display state
+                        document.getElementById('export-progress-section').classList.remove('hidden');
+                        document.getElementById('export-error-section').classList.add('hidden');
+                        document.getElementById('export-download-section').classList.add('hidden');
+                        document.getElementById('export-phase-badge').classList.add('hidden');
+                        const progressBar = document.getElementById('export-progress-bar');
+                        progressBar.classList.remove('bg-success');
+                        progressBar.classList.add('bg-info');
+                        await updateExportStatus();
+                        if (latest.status !== 'completed' && latest.status !== 'failed') {
+                            startPolling();
+                        }
+                        return;
+                    }
+                }
+                showFormView();
+            } catch (err) {
+                console.error('Failed to check existing export', err);
+                showFormView();
+            }
+        }
+
+        const exportModalElm = document.getElementById('exportModal');
+        exportModalElm.addEventListener('open.overlay', () => {
+            checkExistingExport().catch(err => console.error(err));
+        });
+
+        exportModalElm.addEventListener('close.overlay', () => {
+            stopPolling();
+            updateExportIndicator();
+        });
+
+        const exportStartBtn = document.getElementById('export-start-btn');
+        exportStartBtn.addEventListener('click', () => {
+            const account = document.getElementById('account-id').value.trim();
+            const startDate = document.getElementById('export-start-date').value;
+            const endDate = document.getElementById('export-end-date').value;
+            const includeAttachments = document.getElementById('export-include-attachments').checked;
+
+            if (!startDate || !endDate) {
+                showToast('Please select date range', 'alert-triangle');
+                return;
+            }
+
+            // Every call mints its own exportId and starts a full mailbox walk, so a second click
+            // would run two exports and leave the first one with nothing pointing at it.
+            uiBusyAction(exportStartBtn, async () => {
+                try {
+                    const data = await uiPostJson(`/admin/accounts/${encodeURIComponent(account)}/export`, {
+                        startDate: startDate + 'T00:00:00Z',
+                        endDate: endDate + 'T23:59:59Z',
+                        includeAttachments
+                    });
+                    if (data.exportId) {
+                        currentExportId = data.exportId;
+                        showStatusView();
+                        // Reset progress display state
+                        document.getElementById('export-progress-section').classList.remove('hidden');
+                        document.getElementById('export-error-section').classList.add('hidden');
+                        document.getElementById('export-download-section').classList.add('hidden');
+                        document.getElementById('export-phase-badge').classList.add('hidden');
+                        const progressBar = document.getElementById('export-progress-bar');
+                        progressBar.classList.remove('bg-success');
+                        progressBar.classList.add('bg-info');
+                        progressBar.style.width = '0%';
+                        progressBar.setAttribute('aria-valuenow', 0);
+                        document.getElementById('export-progress-text').textContent = '';
+                        await updateExportStatus();
+                        startPolling();
+                        showToast('Export started', 'check-circle');
+                    } else {
+                        showToast(data.error || data.message || 'Failed to start export', 'alert-triangle');
+                    }
+                } catch (err) {
+                    showToast('Export failed: ' + err.message, 'alert-triangle');
+                }
+            });
+        });
+
+        document.getElementById('export-reset-btn').addEventListener('click', async function () {
+            if (!currentExportId) return;
+
+            const account = document.getElementById('account-id').value.trim();
+
+            try {
+                // the crumb travels in the header: the route validates DELETE in restful mode
+                const res = await fetch(`/admin/accounts/${encodeURIComponent(account)}/export/${currentExportId}`, {
+                    method: 'DELETE',
+                    headers: { 'X-CSRF-Token': document.getElementById('crumb').value }
+                });
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+
+                stopPolling();
+                currentExportId = null;
+                showFormView();
+                showToast('Export cleared', 'check-circle');
+            } catch (err) {
+                showToast('Failed to clear export: ' + err.message, 'alert-triangle');
+            }
+        });
+    });
+</script>
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+        let aborted = false;
+
+        const createSmtpTestAccount = async (account, gateway) => {
+            aborted = false;
+            const data = await uiPostJson(`/admin/smtp/create-test`, {
+                account,
+                gateway
+            });
+
+            return data;
+        }
+
+
+        const checkSmtpTestAccount = async user => {
+            if (aborted) {
+                return false
+            }
+
+            const data = await uiPostJson(`/admin/smtp/check-test`, {
+                user
+            });
+
+            return data;
+        }
+
+        const waitForTestResults = async user => {
+            let results;
+
+            while (!results) {
+                if (aborted) {
+                    return false
+                }
+
+                let data = await checkSmtpTestAccount(user);
+                switch (data.status) {
+                    case 'error':
+                        throw new Error(data.error)
+                    case 'success':
+                        results = data;
+                        break;
+                    case 'no data':
+                    default:
+                        await new Promise(r => setTimeout(r, 5 * 1000))
+                }
+
+            }
+
+            return results;
+        }
+
+        const runDeliveryTest = testData => {
+            document.getElementById('test-send-pending-message').classList.remove('hidden');
+            document.getElementById('test-send-results').classList.add('hidden');
+            document.getElementById('test-send-error').classList.add('hidden');
+            document.getElementById('test-send-results').innerHTML = '';
+
+            uiModal.open('#testSendModal');
+
+            createSmtpTestAccount(testData.account, testData.gateway).then((result) => {
+                if (result.error) {
+                    // the route answers 200 with { error } when the account could not be loaded or
+                    // the probe could not be queued - polling with no user would only report "Not Found"
+                    throw new Error(result.error);
+                }
+                return waitForTestResults(result.user);
+            }).then(results => {
+                document.getElementById('test-send-pending-message').classList.add('hidden');
+                document.getElementById('test-send-error').classList.add('hidden');
+                if (aborted) {
+                    return false
+                }
+                document.getElementById('test-send-results').classList.remove('hidden');
+                // rendered server-side by /admin/smtp/check-test from views/partials/test_send.hbs
+                document.getElementById('test-send-results').innerHTML = results.html;
+            }).catch(err => {
+                if (aborted) {
+                    return false
+                }
+                document.getElementById('test-send-pending-message').classList.add('hidden');
+                document.getElementById('test-send-results').classList.add('hidden');
+                document.getElementById('test-send-error').classList.remove('hidden');
+                document.querySelector('#test-send-error .error-message').textContent = err.message;
+            });
+        };
+
+        for (let trigger of document.querySelectorAll('.test-send-trigger')) {
+            trigger.addEventListener('click', e => {
+                e.preventDefault();
+                runDeliveryTest({
+                    account: trigger.dataset.account || '',
+                    gateway: trigger.dataset.gateway || ''
+                });
+            });
+        }
+
+        document.getElementById('testSendModal').addEventListener('close.overlay', () => {
+            aborted = true;
+        });
+    })
+</script>

@@ -1,0 +1,22 @@
+{{> ui/page-header title=(concat "Thread " threadId " Accounts") icon="icon-[tabler--settings]" class="mb-1"}}
+
+{{> ui/breadcrumb parentHref="/admin/internals" parentLabel="Workers" current=(concat "Thread " threadId)
+class="mt-6 mb-6"}}
+
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="card-header">
+        <h6 class="card-title text-primary">{{threadInfo.description}} <small
+                class="text-base-content/60 font-normal">Thread ID: {{threadId}}</small></h6>
+    </div>
+    <div class="card-body">
+        <p class="mb-0">
+            <strong>Total Accounts:</strong> {{formatInteger total userLocale}}
+        </p>
+    </div>
+</div>
+
+{{#if accounts}}
+{{> accounts_table}}
+{{else}}
+{{#> ui/card}}No accounts assigned to this thread.{{/ui/card}}
+{{/if}}

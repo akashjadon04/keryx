@@ -1,0 +1,187 @@
+{{!-- live state badge: app.js updates the badge-{type} class, text and error
+      tooltip through the /admin/changes SSE feed (targets .state-info[data-type]) --}}
+{{> ui/page-header title="IMAP Proxy" icon="icon-[tabler--server]" stateLabel=serverState.label stateType="imapProxy" class="mb-1"}}
+
+<p>Connect an IMAP client to an account managed by EmailEngine. The proxy authenticates with the email server
+    using the account's stored credentials. Your client signs in with an access token or the global password.</p>
+
+<div class="alert alert-soft alert-info mb-6">
+    <span class="icon-[tabler--info-circle] size-5 shrink-0"></span>
+    <span><strong>Compatibility Note:</strong> IMAP proxy only works with accounts that
+        connect via IMAP protocol. This includes Gmail and Microsoft 365 accounts using OAuth2 authentication with IMAP
+        access. Accounts using Microsoft Graph or Gmail API as their mail backend are not supported through the
+        proxy.</span>
+</div>
+
+<p class="mb-6">Configure your IMAP proxy server below.</p>
+
+{{> ui/env-managed-alert}}
+
+<form method="post" action="/admin/config/imap-proxy">
+    {{!-- no id: the layout already renders the #crumb element the script reads --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">Server Configuration</h6>
+        </div>
+
+        <div class="px-6 py-4 border-b border-base-content/10 ee-toggle-row flex items-start justify-between gap-4">
+            {{> ui/checkbox id="imapProxyServerEnabled" name="imapProxyServerEnabled" label="Enable IMAP Proxy"
+            checked=values.imapProxyServerEnabled error=errors.imapProxyServerEnabled}}
+
+            <div class="text-end">
+                {{> ui/setting-ref name="imapProxyServerEnabled" class="whitespace-nowrap"}}
+            </div>
+        </div>
+
+        <div class="card-body space-y-4">
+            <div>
+                {{> ui/setting-ref name="imapProxyServerPort"}}
+                {{#> ui/form-field id="imapProxyServerPort" label="Port" error=errors.imapProxyServerPort}}
+                <input type="number"
+                    class="input trigger-example-render{{#if errors.imapProxyServerPort}} is-invalid{{/if}}"
+                    id="imapProxyServerPort" name="imapProxyServerPort" value="{{values.imapProxyServerPort}}" />
+                <span class="helper-text">TCP port for IMAP connections. Ports below 1024 may require elevated
+                    privileges.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="imapProxyServerHost"}}
+                {{#> ui/form-field id="imapProxyServerHost" label="Listen Address" error=errors.imapProxyServerHost}}
+                <input type="text"
+                    class="input basicAutoComplete trigger-example-render{{#if errors.imapProxyServerHost}} is-invalid{{/if}}"
+                    id="imapProxyServerHost" name="imapProxyServerHost" value="{{values.imapProxyServerHost}}"
+                    data-lpignore="true" autocomplete="off" />
+                <span class="helper-text">IP address the proxy listens on. Use "0.0.0.0" or leave blank to listen on all IPv4 interfaces.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="imapProxyServerProxy"}}
+                {{> ui/checkbox id="imapProxyServerProxy" name="imapProxyServerProxy" label="Enable PROXY Protocol"
+                checked=values.imapProxyServerProxy error=errors.imapProxyServerProxy}}
+                <span class="helper-text">Required when using HAProxy with <code>send-proxy</code>. The PROXY header is trusted from any peer, so only enable this when the port is reachable through the load balancer alone.</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">Authentication</h6>
+        </div>
+        <div class="card-body">
+
+            <div>
+                {{> ui/setting-ref name="imapProxyServerPassword"}}
+                {{#> ui/form-field id="imapProxyServerPassword" label="Global Password"
+                error=errors.imapProxyServerPassword}}
+                {{> ui/secret-field id="imapProxyServerPassword" value=values.imapProxyServerPassword
+                error=errors.imapProxyServerPassword placeholder="No global password set"
+                inputClass="trigger-example-render" toggleId="showPassword"}}
+                <span class="helper-text">Optional shared password for all accounts. Leave empty to use only access
+                    tokens.</span>
+                {{/ui/form-field}}
+            </div>
+        </div>
+
+        <div class="card-footer border-base-content/10 border-t px-6 py-4">
+            <small class="text-base-content/60">
+                <span class="icon-[tabler--info-circle] size-4 align-text-bottom"></span>
+
+                <strong>How to connect:</strong> Use account IDs as usernames. For passwords, use either the global
+                password above or <a href="/admin/tokens" class="link link-animated">access tokens</a> with IMAP Proxy
+                scope.
+            </small>
+        </div>
+
+    </div>
+
+    {{> tls_security_card field="imapProxyServerTLSEnabled"}}
+
+    {{#> ui/details summary="Client Configuration Examples" class="card bg-base-100 shadow-md mb-6"}}
+
+    <p class="mb-4">Connect to the proxy using the account ID as your IMAP username.</p>
+
+    {{#> ui/tabs label="Client configuration examples" elId="code-examples"}}
+    {{> ui/tab target="example-node-imap" label="Node.js (node-imap)" active=true}}
+    {{> ui/tab target="example-php-imap" label="PHP (php-imap)"}}
+    {{/ui/tabs}}
+
+    <div class="mt-4 mb-4">
+        <div id="example-node-imap" role="tabpanel" aria-labelledby="example-node-imap-tab">
+
+            <pre class="ee-code-block"><code id="example-node-imap-code"></code></pre>
+
+        </div>
+
+        <div id="example-php-imap" class="hidden" role="tabpanel" aria-labelledby="example-php-imap-tab">
+
+            <pre class="ee-code-block"><code id="example-php-imap-code"></code></pre>
+
+        </div>
+    </div>
+
+    <div>
+        {{> ui/checkbox id="exampleShowPassword" noName=true label="Show password in examples" class="trigger-example-render"}}
+    </div>
+
+    {{/ui/details}}
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--settings]"}}
+    </div>
+
+</form>
+
+
+<input type="hidden" id="availableAddresses" value="{{availableAddresses}}">
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        let availableAddresses = document.getElementById('availableAddresses').value.split(',').map(e => e.trim()).filter(e => e);
+        uiDatalist('available-addresses-list', availableAddresses, document.querySelectorAll('.basicAutoComplete'));
+
+
+        let renderExamples = uiCodeExamples({
+            header: `// Replace "USERNAME" with the account id of a registered user you want to connect as.
+// Replace "HOST" with the hostname or IP address of the IMAP proxy interface.
+// NB! Make sure that firewall settings allow accessing the IMAP proxy interface.
+
+`,
+            portField: 'imapProxyServerPort',
+            passwordField: 'imapProxyServerPassword',
+            passwordFallback: '<imap-proxy-access-token>',
+            replacements: {
+                USE_TLS: () => document.getElementById('imapProxyServerTLSEnabled').checked ? 'true' : 'false',
+                PHPIMAP_TLS: () => document.getElementById('imapProxyServerTLSEnabled').checked ? "'ssl'" : 'false'
+            },
+            templates: {
+                nodeImap: {
+                    lang: 'javascript',
+                    target: 'example-node-imap-code',
+                    codeAuth: `const imap = new Imap({
+  user: 'USERNAME',
+  password: 'PASSWORD',
+  host: 'HOST',
+  port: PORT,
+  tls: USE_TLS
+});`},
+                phpImap: {
+                    lang: 'php',
+                    target: 'example-php-imap-code',
+                    codeAuth: `// https://www.php-imap.com/configuration/account/account
+$client = $cm->make([
+    'host' => 'HOST',
+    'port' => PORT,
+    'encryption' => PHPIMAP_TLS,
+    'username' => 'USERNAME',
+    'password' => 'PASSWORD',
+    'protocol' => 'imap'
+]);`}
+            }
+        });
+    });
+</script>

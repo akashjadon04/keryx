@@ -1,0 +1,499 @@
+'use strict';
+
+// Unit tests for lib/get-raw-email.js, the send-pipeline helper that turns an
+// API submission (`data`) into a ready-to-send RFC822 message. Two distinct code
+// paths are covered:
+//
+//   1. The "raw" path (data.raw provided): processMessage() streams the message
+//      through a HeadersRewriter that injects Date/MIME-Version/Message-ID,
+//      strips and interprets the X-EE-* control headers, applies from/to/cc/bcc
+//      overrides, and computes the SMTP envelope.
+//   2. The "composed" path (structured html/text/address fields): MailComposer
+//      builds the MIME, with preview-text injection and message/rfc822
+//      "as is" attachment embedding handled before the build.
+//
+// Both paths also have a returnObject variant, plus the removeBcc() helper.
+// This module is pure (no network, no Redis writes) but pulls in lib/tools which
+// transitively opens a Redis client, so the standard teardown helper is used.
+
+const test = require('node:test');
+const assert = require('node:assert').strict;
+
+const { getRawEmail, removeBcc } = require('../lib/get-raw-email');
+const { MAX_DELIVERY_ATTEMPTS } = require('../lib/consts');
+const { redis } = require('../lib/db');
+const registerRedisTeardown = require('./helpers/redis-teardown');
+
+registerRedisTeardown(redis);
+
+// Build a minimal RFC822 message for the data.raw path.
+function rawMessage(headerLines, body) {
+    return Buffer.from([...headerLines, '', body].join('\r\n'));
+}
+
+test('getRawEmail - raw path (processMessage)', async t => {
+    await t.test('injects Date, MIME-Version and a generated Message-ID', async () => {
+        const raw = rawMessage(['From: Alice <alice@example.com>', 'To: bob@example.org', 'Subject: Hello'], 'Body text');
+        const res = await getRawEmail({ raw }, null);
+
+        const out = res.raw.toString();
+        assert.ok(Buffer.isBuffer(res.raw));
+        assert.match(out, /^Date:/m);
+        assert.match(out, /^MIME-Version: 1\.0/m);
+        assert.match(out, /^Message-ID:/m);
+
+        // Message-ID domain is taken from the envelope From address.
+        assert.match(res.messageId, /@example\.com>$/);
+        assert.strictEqual(res.subject, 'Hello');
+        assert.strictEqual(res.hasBcc, false);
+        assert.strictEqual(res.envelope.from, 'alice@example.com');
+        assert.deepStrictEqual(res.envelope.to, ['bob@example.org']);
+    });
+
+    await t.test('a delivery-attempts header is held to the bound the API applies', async () => {
+        // the header is what a stored draft or an SMTP submission carries, and nothing else
+        // validated it: 1e9 attempts, or zero, were taken as written
+        const attempts = async value => {
+            const raw = rawMessage(['From: Alice <alice@example.com>', 'To: bob@example.org', `X-EE-Delivery-Attempts: ${value}`], 'Body');
+            const res = await getRawEmail({ raw }, null);
+            assert.doesNotMatch(res.raw.toString(), /^X-EE-Delivery-Attempts/m, 'the header is removed');
+            return res.deliveryAttempts;
+        };
+        assert.strictEqual(await attempts('5'), 5);
+        assert.strictEqual(await attempts('1000000000'), MAX_DELIVERY_ATTEMPTS);
+        assert.strictEqual(await attempts('0'), 1);
+        assert.strictEqual(await attempts('-3'), 1);
+    });
+
+    await t.test('accepts data.raw as a base64 string', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Subject: B64'], 'hi');
+        const res = await getRawEmail({ raw: raw.toString('base64') }, null);
+        assert.match(res.raw.toString(), /^Subject: B64/m);
+        assert.strictEqual(res.subject, 'B64');
+    });
+
+    await t.test('does not regenerate an existing Message-ID', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Message-ID: <keep-me@local>', 'Subject: x'], 'hi');
+        const res = await getRawEmail({ raw }, null);
+        assert.strictEqual(res.messageId, '<keep-me@local>');
+        assert.strictEqual(res.raw.toString().match(/^Message-ID:/gim).length, 1);
+    });
+
+    await t.test('normalizes a caller-supplied messageId and replaces the header', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Message-ID: <old@local>', 'Subject: x'], 'hi');
+        const res = await getRawEmail({ raw, messageId: 'new@local' }, null);
+        assert.strictEqual(res.messageId, '<new@local>');
+        assert.match(res.raw.toString(), /^Message-ID: <new@local>/m);
+        assert.doesNotMatch(res.raw.toString(), /old@local/);
+    });
+
+    await t.test('strips angle brackets correctly when normalizing messageId', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Subject: x'], 'hi');
+        const res = await getRawEmail({ raw, messageId: '<<weird@local>>' }, null);
+        assert.strictEqual(res.messageId, '<weird@local>');
+    });
+
+    await t.test('overrides the To header from data.to and adds Bcc', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: original@example.com', 'Subject: x'], 'hi');
+        const res = await getRawEmail({ raw, to: [{ address: 'new@example.com' }], bcc: [{ address: 'secret@example.com' }] }, null);
+
+        const out = res.raw.toString();
+        assert.match(out, /^To: .*new@example\.com/m);
+        assert.doesNotMatch(out, /original@example\.com/);
+        assert.strictEqual(res.hasBcc, true);
+        // The envelope collects to + cc + bcc recipients.
+        assert.ok(res.envelope.to.includes('new@example.com'));
+        assert.ok(res.envelope.to.includes('secret@example.com'));
+    });
+
+    await t.test('does not replace an existing header with a default-only address', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: original@example.com', 'Subject: x'], 'hi');
+        const res = await getRawEmail({ raw, to: [{ address: 'fallback@example.com', _default: true }] }, null);
+        assert.match(res.raw.toString(), /^To: original@example\.com/m);
+    });
+
+    await t.test('removes an address header when data provides an empty array', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: original@example.com', 'Cc: cc@example.com', 'Subject: x'], 'hi');
+        const res = await getRawEmail({ raw, cc: [] }, null);
+        assert.doesNotMatch(res.raw.toString(), /^Cc:/m);
+    });
+
+    await t.test('honors a caller-provided envelope', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Subject: x'], 'hi');
+        const res = await getRawEmail({ raw, envelope: { from: 'envfrom@example.com', to: ['env-to@example.com'] } }, null);
+        assert.strictEqual(res.envelope.from, 'envfrom@example.com');
+        assert.deepStrictEqual(res.envelope.to, ['env-to@example.com']);
+    });
+
+    await t.test('extracts and strips the X-EE-* control headers', async () => {
+        const future = new Date(Date.now() + 24 * 3600 * 1000);
+        const raw = rawMessage(
+            [
+                'From: a@example.com',
+                'To: b@example.com',
+                'Subject: x',
+                `X-EE-Send-At: ${future.toISOString()}`,
+                'X-EE-Delivery-Attempts: 7',
+                'X-EE-Gateway: gw-123',
+                'X-EE-Tracking-Enabled: true'
+            ],
+            'hi'
+        );
+        const res = await getRawEmail({ raw }, null);
+
+        const out = res.raw.toString();
+        // Control headers are consumed and removed from the outgoing message.
+        assert.doesNotMatch(out, /^X-EE-Send-At:/im);
+        assert.doesNotMatch(out, /^X-EE-Delivery-Attempts:/im);
+        assert.doesNotMatch(out, /^X-EE-Gateway:/im);
+        assert.doesNotMatch(out, /^X-EE-Tracking-Enabled:/im);
+
+        assert.ok(res.sendAt instanceof Date);
+        assert.strictEqual(res.sendAt.getTime(), future.getTime());
+        assert.strictEqual(res.deliveryAttempts, 7);
+        assert.strictEqual(res.gateway, 'gw-123');
+        assert.strictEqual(res.trackingEnabled, true);
+        // A future sendAt rewrites the Date header to match.
+        assert.match(out, new RegExp(`^Date: ${future.toUTCString().replace('GMT', '\\+0000')}`, 'm'));
+    });
+
+    await t.test('adds the X-Ee-Sid header from licenseInfo', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Subject: x'], 'hi');
+        const licensed = await getRawEmail({ raw }, { details: { key: 'abcdef0123456789' } });
+        assert.match(licensed.raw.toString(), /^X-Ee-Sid: \S+/m);
+
+        const unlicensed = await getRawEmail({ raw }, {});
+        assert.match(unlicensed.raw.toString(), /^X-Ee-Sid: UNLICENSED_COPY/m);
+
+        const none = await getRawEmail({ raw }, null);
+        assert.doesNotMatch(none.raw.toString(), /^X-Ee-Sid:/m);
+    });
+
+    await t.test('returnObject parses the message into a structured object', async () => {
+        const raw = rawMessage(
+            ['From: Alice <alice@example.com>', 'To: bob@example.org', 'Subject: Parsed', 'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="BB"'],
+            [
+                '--BB',
+                'Content-Type: text/plain',
+                '',
+                'body here',
+                '--BB',
+                'Content-Type: text/plain; name="note.txt"',
+                'Content-Disposition: attachment; filename="note.txt"',
+                '',
+                'attached text',
+                '--BB--'
+            ].join('\r\n')
+        );
+
+        const res = await getRawEmail({ raw }, null, { returnObject: true });
+        const parsed = res.emailObject;
+
+        assert.ok(parsed);
+        assert.strictEqual(parsed.subject, 'Parsed');
+        // from is collapsed to a single address object, to/cc/bcc to value arrays.
+        assert.strictEqual(parsed.from.address, 'alice@example.com');
+        assert.strictEqual(parsed.to[0].address, 'bob@example.org');
+        // headers Map is deleted to avoid conflicts.
+        assert.strictEqual(parsed.headers, undefined);
+
+        assert.strictEqual(parsed.attachments.length, 1);
+        const att = parsed.attachments[0];
+        assert.strictEqual(att.encoding, 'base64');
+        assert.strictEqual(att.isInline, false);
+        assert.strictEqual(Buffer.from(att.content, 'base64').toString(), 'attached text');
+    });
+});
+
+test('getRawEmail - envelope addresses from the raw headers', async t => {
+    await t.test('an IDN domain stays in ASCII form in the envelope', async () => {
+        // the envelope goes to an SMTP server, which may not accept a Unicode domain
+        const raw = rawMessage(['From: Alice <alice@xn--mnchen-3ya.de>', 'To: bob@xn--mnchen-3ya.de', 'Cc: Team: carol@xn--mnchen-3ya.de;'], 'Body');
+        const res = await getRawEmail({ raw }, null);
+        assert.strictEqual(res.envelope.from, 'alice@xn--mnchen-3ya.de');
+        assert.deepStrictEqual(res.envelope.to, ['bob@xn--mnchen-3ya.de', 'carol@xn--mnchen-3ya.de']);
+    });
+
+    await t.test('an encoded word in the address part is not taken for a recipient', async () => {
+        // RFC 2047 keeps encoded words out of the addr-spec; this one would name ceo@bank.com
+        const raw = rawMessage(['From: =?utf-8?B?SsO1ZQ==?= <joe@example.com>', 'To: =?utf-8?Q?ceo=40bank=2Ecom?=@example.com, dave@example.org'], 'Body');
+        const res = await getRawEmail({ raw }, null);
+        assert.strictEqual(res.envelope.from, 'joe@example.com');
+        assert.deepStrictEqual(res.envelope.to, ['dave@example.org']);
+    });
+
+    await t.test('a header that names a group with no address yields no empty recipient', async () => {
+        const raw = rawMessage(['From: alice@example.com', 'To: undisclosed-recipients:;', 'Bcc: hidden@example.com'], 'Body');
+        const res = await getRawEmail({ raw }, null);
+        assert.deepStrictEqual(res.envelope.to, ['hidden@example.com']);
+    });
+});
+
+test('getRawEmail - composed path (MailComposer)', async t => {
+    await t.test('builds a MIME message from structured fields', async () => {
+        const res = await getRawEmail(
+            {
+                from: { name: 'Alice', address: 'alice@example.com' },
+                to: [{ address: 'bob@example.org' }],
+                subject: 'Composed',
+                text: 'plain body',
+                html: '<p>html body</p>'
+            },
+            null
+        );
+
+        const out = res.raw.toString();
+        assert.ok(Buffer.isBuffer(res.raw));
+        assert.match(out, /^From: Alice <alice@example\.com>/m);
+        assert.match(out, /^Subject: Composed/m);
+        assert.ok(res.messageId && /^<.+>$/.test(res.messageId));
+        assert.strictEqual(res.subject, 'Composed');
+        assert.strictEqual(res.hasBcc, false);
+        assert.strictEqual(res.envelope.from, 'alice@example.com');
+        assert.deepStrictEqual(res.envelope.to, ['bob@example.org']);
+    });
+
+    await t.test('reports hasBcc and keeps the Bcc header in the built message', async () => {
+        const res = await getRawEmail(
+            {
+                from: { address: 'alice@example.com' },
+                to: [{ address: 'bob@example.org' }],
+                bcc: [{ address: 'secret@example.com' }],
+                text: 'x'
+            },
+            null
+        );
+        assert.strictEqual(res.hasBcc, true);
+        // getRawEmail builds with keepBcc=true; removeBcc strips it later in the pipeline.
+        assert.match(res.raw.toString(), /^Bcc: .*secret@example\.com/m);
+        assert.ok(res.envelope.to.includes('secret@example.com'));
+    });
+
+    await t.test('adds the X-Ee-Sid header from licenseInfo', async () => {
+        const res = await getRawEmail(
+            { from: { address: 'a@example.com' }, to: [{ address: 'b@example.com' }], text: 'x' },
+            { details: { key: 'abcdef0123456789' } }
+        );
+        assert.match(res.raw.toString(), /^X-Ee-Sid: \S+/m);
+    });
+
+    await t.test('injects preview text after the <body> tag', async () => {
+        const res = await getRawEmail(
+            {
+                from: { address: 'a@example.com' },
+                to: [{ address: 'b@example.com' }],
+                html: '<html><body class="x">Hi</body></html>',
+                previewText: 'Sneak peek'
+            },
+            null,
+            { returnObject: true }
+        );
+        // returnObject (composed) exposes the processed mailComposer options directly.
+        const html = res.emailObject.html;
+        assert.match(html, /Sneak peek/);
+        assert.match(html, /display:none/);
+        // Preview block is inserted right after the body open tag.
+        assert.match(html, /<body class="x">\s*\n?<!--\[if !gte mso 9\]>/);
+        // previewText is consumed.
+        assert.strictEqual(res.emailObject.previewText, null);
+    });
+
+    await t.test('prepends preview text when there is no <body> tag', async () => {
+        const res = await getRawEmail(
+            {
+                from: { address: 'a@example.com' },
+                to: [{ address: 'b@example.com' }],
+                html: '<p>No body tag</p>',
+                previewText: 'Preview first'
+            },
+            null,
+            { returnObject: true }
+        );
+        const html = res.emailObject.html;
+        assert.ok(html.indexOf('Preview first') < html.indexOf('<p>No body tag</p>'));
+    });
+
+    await t.test('embeds a message/rfc822 attachment as-is and detects 8bit content', async () => {
+        // Inner message contains a non-ASCII byte, so the wrapper must use 8bit.
+        const inner = Buffer.from('From: inner@example.com\r\nSubject: Iñner\r\n\r\nbody', 'utf-8');
+        const res = await getRawEmail(
+            {
+                from: { address: 'a@example.com' },
+                to: [{ address: 'b@example.com' }],
+                text: 'see attached',
+                attachments: [
+                    {
+                        filename: 'forwarded.eml',
+                        contentType: 'message/rfc822',
+                        encoding: 'base64',
+                        content: inner.toString('base64')
+                    }
+                ]
+            },
+            null
+        );
+
+        const out = res.raw.toString();
+        assert.match(out, /Content-Type: message\/rfc822/i);
+        assert.match(out, /Content-Transfer-Encoding: 8bit/i);
+        // The inner message is embedded unencoded, so its raw headers/body survive verbatim.
+        assert.match(out, /^From: inner@example\.com/m);
+        assert.match(out, /^body$/m);
+    });
+
+    await t.test('uses 7bit for a pure-ASCII message/rfc822 attachment', async () => {
+        const inner = Buffer.from('From: inner@example.com\r\nSubject: Plain inner\r\n\r\nbody', 'ascii');
+        const res = await getRawEmail(
+            {
+                from: { address: 'a@example.com' },
+                to: [{ address: 'b@example.com' }],
+                text: 'see attached',
+                attachments: [{ filename: 'fwd.eml', contentType: 'message/rfc822', encoding: 'base64', content: inner.toString('base64') }]
+            },
+            null
+        );
+        assert.match(res.raw.toString(), /Content-Transfer-Encoding: 7bit/i);
+    });
+
+    await t.test('returnObject returns the composer options and a computed envelope', async () => {
+        const res = await getRawEmail(
+            {
+                messageId: '<fixed@local>',
+                from: { address: 'alice@example.com' },
+                to: [{ address: 'bob@example.org' }],
+                cc: [{ address: 'carol@example.org' }],
+                bcc: [{ address: 'secret@example.com' }],
+                subject: 'Obj',
+                text: 'x'
+            },
+            null,
+            { returnObject: true }
+        );
+
+        assert.strictEqual(res.raw, undefined);
+        assert.ok(res.emailObject);
+        assert.strictEqual(res.emailObject.subject, 'Obj');
+        assert.strictEqual(res.messageId, '<fixed@local>');
+        assert.strictEqual(res.envelope.from, 'alice@example.com');
+        // Envelope recipients are the de-duplicated union of to/cc/bcc.
+        assert.deepStrictEqual(res.envelope.to.sort(), ['bob@example.org', 'carol@example.org', 'secret@example.com'].sort());
+        assert.strictEqual(res.hasBcc, true);
+    });
+});
+
+test('removeBcc', async t => {
+    await t.test('strips the Bcc header but keeps everything else', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Bcc: secret@example.com', 'Subject: keep'], 'body stays');
+        const out = (await removeBcc(raw)).toString();
+
+        assert.doesNotMatch(out, /^Bcc:/im);
+        assert.match(out, /^From: a@example\.com/m);
+        assert.match(out, /^To: b@example\.com/m);
+        assert.match(out, /^Subject: keep/m);
+        assert.match(out, /body stays/);
+    });
+
+    await t.test('is a no-op for a message without a Bcc header', async () => {
+        const raw = rawMessage(['From: a@example.com', 'To: b@example.com', 'Subject: no bcc'], 'body');
+        const out = (await removeBcc(raw)).toString();
+        assert.match(out, /^Subject: no bcc/m);
+        assert.match(out, /body/);
+    });
+});
+
+// A multipart message with more MIME nodes than the splitter allows (1000). The splitter raises
+// EMAXLEN on it, and before the error was forwarded that was an uncaught exception that took the
+// whole IMAP worker down (every account on it) instead of failing the one submission.
+function manyPartsMessage(parts) {
+    const lines = [
+        'From: a@example.com',
+        'To: b@example.com',
+        'Bcc: c@example.com',
+        'Subject: many parts',
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/mixed; boundary="xx"',
+        ''
+    ];
+    for (let i = 0; i < parts; i++) {
+        lines.push('--xx', 'Content-Type: text/plain', '', `part${i}`);
+    }
+    lines.push('--xx--', '');
+    return Buffer.from(lines.join('\r\n'));
+}
+
+// A single MIME node whose header block exceeds the splitter's 1MB cap.
+function hugeHeaderMessage() {
+    return Buffer.from(['From: a@example.com', 'To: b@example.com', 'Bcc: c@example.com', `X-Big: ${'a'.repeat(1100 * 1024)}`, '', 'body'].join('\r\n'));
+}
+
+test('splitter limits reject instead of crashing the worker', async t => {
+    const assertPermanent = err => {
+        assert.strictEqual(err.code, 'EMAXLEN');
+        assert.match(err.message, /Failed to parse message/);
+        // 552 is what lib/delivery-error.js reads as a permanent rejection, so a retried
+        // delivery does not hit the same wall again; 400 is what the API answers.
+        assert.strictEqual(err.responseCode, 552);
+        assert.strictEqual(err.statusCode, 400);
+        return true;
+    };
+
+    await t.test('getRawEmail with 1100 MIME parts rejects', async () => {
+        await assert.rejects(() => getRawEmail({ raw: manyPartsMessage(1100) }, null), assertPermanent);
+    });
+
+    await t.test('getRawEmail with an oversized header block rejects', async () => {
+        await assert.rejects(() => getRawEmail({ raw: hugeHeaderMessage() }, null), assertPermanent);
+    });
+
+    await t.test('removeBcc with 1100 MIME parts rejects', async () => {
+        await assert.rejects(() => removeBcc(manyPartsMessage(1100)), assertPermanent);
+    });
+
+    await t.test('the rejection is classified as permanent by the submit worker', async () => {
+        const { isPermanentDeliveryError } = require('../lib/delivery-error');
+        const err = await removeBcc(manyPartsMessage(1100)).catch(err => err);
+        assert.strictEqual(isPermanentDeliveryError(err), true);
+    });
+
+    await t.test('a message within the limits still goes through', async () => {
+        const out = (await removeBcc(manyPartsMessage(10))).toString();
+        assert.doesNotMatch(out, /^Bcc:/im);
+        assert.match(out, /part9/);
+    });
+});
+
+test('getRawEmail - custom headers and forwarded messages', async t => {
+    await t.test('a non-ASCII custom header is encoded instead of sent as raw 8-bit (regression)', async () => {
+        const raw = rawMessage(['From: Alice <alice@example.com>', 'To: bob@example.org', 'Subject: Hello'], 'Body text');
+        const res = await getRawEmail({ raw, headers: { 'x-customer': 'Jõgeva Öö', 'x-plain': 'ascii only' } }, null);
+        const out = res.raw.toString();
+        assert.match(out, /^X-Customer: =\?UTF-8\?Q\?J=C3=B5geva_=C3=96=C3=B6\?=$/m);
+        assert.match(out, /^X-Plain: ascii only$/m);
+        assert.ok(!/[\u0080-￿]/.test(out.split('\r\n\r\n')[0]), 'the header block is 7-bit');
+    });
+
+    for (const [label, body, encoding] of [
+        ['an ASCII message is labelled 7bit', 'From: a@example.com\r\nSubject: inner\r\n\r\nHello', '7bit'],
+        ['a message with 8-bit content is labelled 8bit', 'From: a@example.com\r\nSubject: inner\r\n\r\nTere õhtust', '8bit']
+    ]) {
+        await t.test(`a forwarded message/rfc822 attachment: ${label}, inserted as is`, async () => {
+            const res = await getRawEmail(
+                {
+                    from: { address: 'alice@example.com' },
+                    to: [{ address: 'bob@example.org' }],
+                    subject: 'Fwd',
+                    text: 'see attached',
+                    attachments: [
+                        { filename: 'forwarded.eml', contentType: 'message/rfc822', content: Buffer.from(body).toString('base64'), encoding: 'base64' }
+                    ]
+                },
+                null
+            );
+            const out = res.raw.toString();
+            const part = out.slice(out.indexOf('Content-Type: message/rfc822'));
+            assert.match(part, new RegExp(`^Content-Transfer-Encoding: ${encoding}$`, 'm'));
+            assert.match(part, /^Content-Disposition: attachment; filename=forwarded\.eml$/m);
+            assert.ok(part.includes(body), 'the forwarded message is not re-encoded');
+        });
+    }
+});

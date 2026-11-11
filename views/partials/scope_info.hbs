@@ -1,0 +1,135 @@
+{{#if activeGmail}}
+<div>Your <a href="https://console.cloud.google.com/auth/scopes?project={{app.googleProjectId}}" target="_blank"
+        rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">OAuth2 project</a>
+    <strong>must</strong> have the following scopes enabled{{#if disabledScopes.Gmail_Modify}} and
+    listed in the <em>Custom OAuth2 scopes</em> section{{/if}}:
+</div>
+<ul class="list-disc ps-6 my-2">
+
+    {{#if baseScopesImap}}
+    <li><code>"https://mail.google.com/"</code></li>
+    {{/if}}
+
+    {{#if baseScopesApi}}
+    {{> gmail_api_scopes}}
+    {{/if}}
+
+    {{#if baseScopesPubsub}}
+    <li><code>"https://www.googleapis.com/auth/pubsub"</code></li>
+    {{/if}}
+
+</ul>
+
+<div>Read about setting up the OAuth2 project in Google Cloud from
+
+    {{#if baseScopesImap}}
+    <a href="https://learn.emailengine.app/docs/accounts/gmail/gmail-imap" target="_blank" rel="noopener noreferrer"
+        referrerpolicy="no-referrer" class="link link-animated">here</a>.
+    {{/if}}
+
+    {{#if baseScopesApi}}
+    <a href="https://learn.emailengine.app/docs/accounts/gmail/gmail-api" target="_blank" rel="noopener noreferrer"
+        referrerpolicy="no-referrer" class="link link-animated">here</a>.
+    {{/if}}
+</div>
+{{/if}}
+
+{{#if activeGmailService}}
+
+{{#if baseScopesImap}}
+<div>Your OAuth2 project <strong>must</strong> have the following scopes enabled:</div>
+<ul class="list-disc ps-6 my-2">
+    <li><code>"https://mail.google.com/"</code></li>
+</ul>
+
+<div>Read about setting up Google service accounts from <a href="https://learn.emailengine.app/docs/accounts/gmail/google-service-accounts"
+        target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">here</a>.
+</div>
+{{/if}}
+
+{{#if baseScopesApi}}
+<div>The service account's domain-wide delegation <strong>must</strong> list the following scopes:</div>
+<ul class="list-disc ps-6 my-2">
+    {{> gmail_api_scopes}}
+</ul>
+{{/if}}
+
+{{#if baseScopesPubsub}}
+<div>Your OAuth2 Service App Credentials <strong>must</strong> have the following role enabled:</div>
+<ul class="list-disc ps-6 my-2">
+    <li><code>Pub/Sub Admin</code></li>
+</ul>
+
+<div>Read about setting up Google service accounts for Pub/Sub from <a href="https://learn.emailengine.app/docs/accounts/gmail/gmail-api"
+        target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">here</a>.
+</div>
+{{/if}}
+
+{{/if}}
+
+{{#if activeOutlook}}
+<div>Your OAuth2 project <strong>must</strong> have the following scopes enabled:</div>
+<ul class="list-disc ps-6 my-2">
+
+    {{#if baseScopesImap}}
+    <li><code>"IMAP.AccessAsUser.All"</code></li>
+
+    {{#unless disabledScopes.SMTP_Send}}
+    <li><code>"SMTP.Send"</code></li>
+    {{/unless}}
+
+    <li><code>"offline_access"</code></li>
+
+    {{/if}}
+
+    {{#if baseScopesApi}}
+
+    <li><code>"Mail.ReadWrite"</code></li>
+
+    {{#unless disabledScopes.Mail_Send}}
+    <li><code>"Mail.Send"</code></li>
+    {{/unless}}
+
+    <li><code>"offline_access"</code></li>
+
+    {{/if}}
+</ul>
+<div>
+    Read about setting up the OAuth2 project in Azure Active Directory from <a
+        href="https://learn.emailengine.app/docs/accounts/microsoft-365/outlook-365" target="_blank" rel="noopener noreferrer"
+        referrerpolicy="no-referrer" class="link link-animated">here</a>.
+</div>
+{{/if}}
+
+{{#if activeOutlookService}}
+<div>Your Entra app registration <strong>must</strong> have the following <strong>application permissions</strong> (not
+    delegated) with admin consent:</div>
+<ul class="list-disc ps-6 my-2">
+    <li><code>"Mail.ReadWrite"</code></li>
+    <li><code>"Mail.Send"</code></li>
+    <li><code>"User.Read.All"</code></li>
+</ul>
+{{/if}}
+
+{{#if activeMailRu}}
+<div>Your OAuth2 project <strong>must</strong> have the following scopes enabled:</div>
+<ul class="list-disc ps-6 my-2">
+    <li><code>"userinfo"</code>
+    <li><code>"mail.imap"</code>
+</ul>
+
+<div class="alert alert-soft alert-info block"><strong>Note:</strong> The required "mail.imap" scope might not be
+    available for your <a href="https://oauth.mail.ru/app/" target="_blank" rel="noopener noreferrer"
+        referrerpolicy="no-referrer" class="link link-animated">OAuth2 apps</a> by default.</div>
+{{/if}}
+
+{{!-- A send-only app is only ever an API-based Gmail app, whichever of the two providers it is, so this
+needs no provider guard - see isSendOnlyGmailApp() in lib/oauth/scope-checker.js. --}}
+{{#if isSendOnlyGmail}}
+<div class="alert alert-soft alert-warning mt-4 block">
+    <strong>Send-only account limitation:</strong> Messages sent through this app cannot be tracked by EmailEngine.
+    The Gmail API modifies the Message-ID header when sending emails, and without read permissions,
+    EmailEngine cannot resolve the new Message-ID assigned by Gmail. Delivery status and bounce
+    notifications may not be accurately associated with the sent message.
+</div>
+{{/if}}

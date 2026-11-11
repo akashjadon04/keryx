@@ -1,0 +1,181 @@
+{{> ui/page-header title="License" icon="icon-[tabler--settings]"
+badgeLabel=(when licenseInfo.details.trial "trial" (when licenseInfo.active "active" (when licenseInfo.subscription "paused" "not activated")))
+badgeVariant=(when licenseInfo.details.trial "warning" (when licenseInfo.active "success" (when licenseInfo.subscription "warning" "error")))
+class="mb-1"}}
+
+<p class="mb-6">
+    EmailEngine requires a valid license key after the free trial period. Licensed under the <a href="/license.html"
+        target="_blank" rel="noopener noreferrer" class="link link-animated">EmailEngine License</a>.
+</p>
+
+{{#if licenseInfo.subscription}}
+{{#> ui/stat-card variant="error" title=(when isPaused "EmailEngine is paused" "Subscription payment overdue") icon=(when isPaused "icon-[tabler--player-pause]" "icon-[tabler--alert-triangle]") class="mb-6"}}
+
+{{#if isPaused}}
+<p class="mb-2">
+    The subscription behind this license key is not in good standing{{#if subscriptionSince}} since
+    {{subscriptionSince}}{{/if}}.
+    Email processing has stopped: accounts do not sync, and no messages or webhooks are sent. Your license key, accounts
+    and data are kept.
+</p>
+<p class="mb-2">
+    EmailEngine resumes on its own within an hour of the invoice being paid, or straight away when you check below.
+</p>
+{{else}}
+<p class="mb-2">
+    The subscription behind this license key has an unpaid invoice. EmailEngine keeps working until
+    <strong>{{subscriptionUntil}}</strong>
+    ({{ngettext '%d day' '%d days' expiresDays}}) and then pauses until the invoice is paid.
+</p>
+{{/if}}
+
+<div class="flex flex-wrap gap-2">
+    {{> ui/btn href="https://postalsys.com/billing/invoices" external=true label="Pay the invoice"
+    icon="icon-[tabler--credit-card]"}}
+    <form method="post" action="/admin/config/license/recheck" class="inline">
+        <input type="hidden" name="crumb" value="{{crumb}}" />
+        {{> ui/btn type="submit" label="Check subscription now" variant="primary" style="soft"
+        icon="icon-[tabler--refresh]"}}
+    </form>
+</div>
+
+{{/ui/stat-card}}
+{{/if}}
+
+{{#unless licenseInfo.details}}
+
+{{#> ui/card}}
+        <div class="float-right ms-4">
+            {{> ui/btn href="https://postalsys.com/licenses" external=true label="Get a license"
+            icon="icon-[tabler--arrow-right]"}}
+        </div>
+        <p>
+            Purchase and manage license keys at <a href="https://postalsys.com/licenses" target="_blank"
+                rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">Postal Systems License
+                Central</a> (subscription required).
+        </p>
+
+    
+{{/ui/card}}
+
+{{/unless}}
+
+{{#if licenseInfo.details}}
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="card-header flex flex-wrap items-center justify-between gap-3">
+        <h6 class="card-title text-primary">Current License</h6>
+        <div class="flex flex-wrap gap-2">
+            {{#if isSubscriptionLicense}}{{#unless licenseInfo.subscription}}
+            <form method="post" action="/admin/config/license/recheck" class="inline">
+                <input type="hidden" name="crumb" value="{{crumb}}" />
+                {{> ui/btn type="submit" label="Check subscription now" variant="primary" style="soft" size="sm"
+                icon="icon-[tabler--refresh]"}}
+            </form>
+            {{/unless}}{{/if}}
+            {{> ui/btn label="Remove license" variant="error" style="soft" size="sm" icon="icon-[tabler--trash]"
+            id="unregister-license-link" overlay="#deleteLicense"}}
+        </div>
+    </div>
+    <div class="card-body">
+
+        <dl class="ee-dl">
+
+            <dt>License Key</dt>
+            <dd>{{licenseInfo.details.key}} ({{licenseInfo.type}})</dd>
+
+            <dt>Licensed To</dt>
+            <dd>{{licenseInfo.details.licensedTo}}</dd>
+
+            <dt>Environment</dt>
+            <dd>{{licenseInfo.details.hostname}}</dd>
+
+            {{#if licenseDetails.expires}}
+            <dt>Expires</dt>
+            <dd>In {{licenseDetails.expiresDays}} days</dd>
+            {{/if}}
+
+            {{#if licenseDetails.lt}}
+            <dt>Expiration</dt>
+            <dd>Never expires</dd>
+            {{/if}}
+
+            {{#if licenseInfo.details.billing}}
+            <dt>Billing</dt>
+            <dd>Monthly plan</dd>
+            {{/if}}
+
+        </dl>
+
+    </div>
+</div>
+
+{{/if}}
+
+
+
+{{#> ui/details summary="Add License Key" class="card bg-base-100 shadow-md mb-6" open=showLicenseText}}
+
+{{#if licenseInfo.active}}<p class="mb-4">Replace your existing license with a new one. Get license keys from <a
+        href="https://postalsys.com/licenses" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"
+        class="link link-animated">Postal Systems License Central</a>.</p>{{/if}}
+
+<form method="post" id="licenseForm" action="/admin/config/license">
+    {{!-- no id: the layout already renders the #crumb element scripts read --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+
+    <div class="mb-6">
+        {{> ui/btn label="Upload license file" variant="info" id="licenseFile" icon="icon-[tabler--file-import]"}}
+    </div>
+
+    <div class="mb-6">
+        {{> ui/setting-ref name="license" href="/admin/reference/license#postV1License"}}
+        {{#> ui/form-field id="licenseTextElement" label="Or paste license key here" error=errors.license}}
+        <textarea class="textarea w-full droptxt autoselect{{#if errors.license}} is-invalid{{/if}}"
+            id="licenseTextElement" name="license" rows="9" data-enable-grammarly="false" spellcheck="false"
+            placeholder="-----BEGIN LICENSE-----" required>{{values.license}}</textarea>
+        <span class="helper-text">Drag and drop or paste your license key</span>
+        {{/ui/form-field}}
+    </div>
+
+    <div class="mb-2">
+        {{> ui/btn label="Activate license" type="submit" icon="icon-[tabler--key]"}}
+    </div>
+
+</form>
+{{/ui/details}}
+
+{{#> ui/confirm-modal id="deleteLicense" title="Remove license" action="/admin/config/license/delete"
+submitLabel="Remove license"}}
+Remove the current license key from this EmailEngine instance?
+{{/ui/confirm-modal}}
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+        let licenseTextElm = document.getElementById('licenseTextElement')
+        let fileSelectElm = document.getElementById('licenseFile');
+        fileSelectElm.addEventListener('click', (e) => {
+            e.preventDefault();
+            browseFileContents('text').then(licenseFileTxt => {
+                if (licenseFileTxt) {
+                    licenseFileTxt = (licenseFileTxt || '').toString().trim().substring(0, 10 * 1024)
+                    licenseTextElm.value = licenseFileTxt;
+                    if (licenseFileTxt.indexOf('BEGIN LICENSE') >= 0) {
+                        // requestSubmit(), not submit(): this posts to the license server like the
+                        // Activate button does, and only requestSubmit fires the submit event the
+                        // busy/double-submit guard in static/js/ui.js listens for.
+                        document.getElementById('licenseForm').requestSubmit();
+                    } else {
+                        licenseTextElm.focus();
+                        licenseTextElm.select();
+                    }
+                }
+            }).catch(err => {
+                console.error(err);
+                if (err.code === 'NoFileSelected') {
+                    return
+                }
+                showToast('Failed to read license key file\n' + err.message, 'alert-triangle');
+            })
+        });
+    });
+</script>

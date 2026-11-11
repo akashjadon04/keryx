@@ -1,0 +1,26 @@
+<div class="text-center">
+    <h1 class="text-xl font-semibold text-base-content mb-6">Two-Factor Authentication</h1>
+</div>
+<form class="space-y-4" method="post" action="/admin/totp">
+    {{!-- the login layout renders no global #crumb, so the page provides it --}}
+    <input type="hidden" id="crumb" name="crumb" value="{{crumb}}" />
+    <input type="hidden" name="next" value="{{values.next}}" />
+    <input type="hidden" name="type" value="totp" />
+
+
+    {{#> ui/form-field id="code" label="Enter your 6-digit verification code" error=errors.code}}
+    <input type="text" pattern="[0-9]{6}" class="input{{#if errors.code}} is-invalid{{/if}}" id="code" name="code"
+        required />
+    {{/ui/form-field}}
+
+    <div>
+        <button type="submit" class="btn btn-primary btn-block">
+            Verify and sign in
+        </button>
+    </div>
+</form>
+<hr class="my-4">
+<div class="text-center">
+    <a class="link link-animated text-sm" href="https://learn.emailengine.app/docs/configuration/reset-password" target="_blank"
+        rel="noopener noreferrer" referrerpolicy="no-referrer">Lost access to your authenticator?</a>
+</div>

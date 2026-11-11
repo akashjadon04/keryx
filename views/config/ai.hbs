@@ -1,0 +1,464 @@
+{{> ui/page-header title="AI Processing" icon="icon-[tabler--robot]" class="mb-1"}}
+
+<p class="mb-6">Analyze new Inbox emails with AI and include the model's answer as <code>summary</code> in
+    <code>messageNew</code> webhooks. EmailEngine sends email content to the AI provider configured below.
+</p>
+
+{{> ui/env-managed-alert}}
+
+<form method="post" id="settings-form" action="/admin/config/ai">
+    {{!-- no id: the layout already renders the #crumb element the script reads --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+    <input type="hidden" id="fn-content-element" name="contentFnJson" value="{{values.contentFnJson}}">
+
+    <div class="card bg-base-100 shadow-md mb-6" id="openai_settings">
+        <div class="card-header">
+            <h6 class="card-title text-primary">AI Configuration</h6>
+        </div>
+
+        {{#if openAiError}}
+        <div class="card-body pb-0">
+            {{#> ui/clear-alert alert="open-ai" class="mb-0"}}
+                <p><strong>OpenAI Error</strong></p>
+                <p>The last API request failed:</p>
+                <hr class="my-2">
+                <p class="mb-0">
+                    <code>{{openAiError.message}}{{#if openAiError.code}} ({{openAiError.code}}){{/if}}</code>
+                </p>
+            {{/ui/clear-alert}}
+        </div>
+        {{/if}}
+
+        <div class="px-6 py-4 border-b border-base-content/10 ee-toggle-row flex items-start justify-between gap-4">
+            <div>
+                {{#> ui/checkbox id="generateEmailSummary" label="Enable AI Email Processing"
+                checked=values.generateEmailSummary error=errors.generateEmailSummary}}
+                {{#> ui/tooltip-rich icon="icon-[tabler--info-circle]"}}
+                <strong>Privacy Notice</strong><br>
+                Email content is sent to the configured AI provider. Review that provider's data handling terms
+                before enabling processing.
+                {{/ui/tooltip-rich}}
+                {{/ui/checkbox}}
+                <span class="helper-text">Process new emails with AI and include the results as
+                    <code>summary</code> in <code>messageNew</code> webhooks.</span>
+            </div>
+
+            <div class="text-end space-y-1">
+                {{> ui/setting-ref name="generateEmailSummary" class="whitespace-nowrap"}}
+                {{#if values.generateEmailSummary}}
+                {{> ui/badge label="enabled" variant="success"}}
+                {{else}}
+                {{> ui/badge label="disabled" variant="warning"}}
+                {{/if}}
+            </div>
+        </div>
+        <div class="card-body space-y-4">
+
+
+            <div>
+                {{> ui/setting-ref name="openAiAPIKey"}}
+                {{#> ui/form-field id="openAiAPIKey" label="API Key" error=errors.openAiAPIKey}}
+                {{> ui/secret-field id="openAiAPIKey" value=values.openAiAPIKey error=errors.openAiAPIKey
+                toggleId="showOpenAiAPIKey" toggleLabel="Show API key" placeholder=(when hasOpenAiAPIKey "Key is set (hidden for security)")}}
+                <span class="helper-text">API key for the AI provider configured below.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="openAiModel"}}
+
+                <div class="flex items-center gap-2">
+                    <label class="label-text" for="openAiModel-search">AI Model</label>
+
+                    {{> ui/btn label="Refresh models" style="text" size="sm" id="reload-models-btn"
+                    icon="icon-[tabler--refresh] reload-icon"}}
+                </div>
+
+                {{> ui/model-picker id="openAiModel" models=openAiModels value=values.openAiModel error=errors.openAiModel
+                hint="Type to search. Refresh models lists what your API key can use; the recommended entries suit reading mail, and Default follows the built-in model across upgrades."}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="openAiAPIUrl"}}
+                {{#> ui/form-field id="openAiAPIUrl" label="API Endpoint" error=errors.openAiAPIUrl}}
+                <input type="url" class="input{{#if errors.openAiAPIUrl}} is-invalid{{/if}}" id="openAiAPIUrl"
+                    name="openAiAPIUrl" value="{{values.openAiAPIUrl}}" placeholder="https://api.openai.com" />
+                <span class="helper-text">Custom API endpoint for OpenAI-compatible services. Leave empty for the default
+                    OpenAI servers. Include the URL path if the service mounts the API under one - for Azure OpenAI, use
+                    https://&lt;your-resource&gt;.openai.azure.com/openai/v1</span>
+                {{/ui/form-field}}
+            </div>
+
+        </div>
+    </div>
+
+    {{#> ui/card title="Email Filtering" id="filtering_settings"}}
+
+            {{#if errorLog}}
+            {{#> ui/tabs label="Email filtering" class="mb-4"}}
+            {{> ui/tab target="fn" label="Filter Rules" active=true}}
+            {{> ui/tab target="errors" label="Error Log"}}
+            {{/ui/tabs}}
+            {{/if}}
+
+            <div>
+                <div id="fn" role="tabpanel" aria-labelledby="fn-tab">
+
+                    <div>
+                        <div class="text-base-content/60 float-right code-link">[<a
+                                href="https://learn.emailengine.app/docs/webhooks/pre-processing" target="_blank"
+                                rel="noopener noreferrer" referrerpolicy="no-referrer"
+                                class="link link-animated">documentation</a>]
+
+                            [<a href="/admin/reference/settings#postV1Settings" target="_blank" rel="noopener noreferrer"
+                                referrerpolicy="no-referrer" class="link link-animated">openAiPreProcessingFn</a>]
+                        </div>
+                        <label class="label-text" for="editor-fn">Filter Function</label>
+                        <div class="mb-2 leading-tight">
+                            <small>JavaScript code to decide which emails to process. Return <code>true</code> to
+                                process the email, <code>false</code> to skip. The email data is available as
+                                <code>payload</code>.</small>
+                        </div>
+                        {{#> ui/code-editor id="editor-fn" title="Email filter"}}
+                        <div class="editor-embed-content editor-embed-content-left editor-embed-content-right">
+                            <a href="#" id="test-payload-btn">Test with sample data</a>
+                        </div>
+
+                        <div class="editor-embed-content editor-embed-content-right editor-embed-content-left">
+                            Result:
+                            <span id="filter-res" class="text-info" data-match-text="match - will process" data-nomatch-text="no match - will skip">no match</span>
+                        </div>
+
+                        <div class="editor-embed-content editor-embed-content-right">
+                            {{> editor_scope_info}}
+                        </div>
+
+                        
+                        {{/ui/code-editor}}
+
+                    </div>
+
+                </div>
+
+
+                {{#if errorLog}}
+                <div id="errors" class="hidden" role="tabpanel" aria-labelledby="errors-tab">
+
+
+                    <p class="mb-4">Recent errors from the filter function execution:</p>
+
+                    <div class="overflow-x-auto">
+                        <table class="table">
+
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th width="40%">Error</th>
+                                    <th width="40%">Email Data</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {{#each errorLog}}
+
+                                <tr>
+
+                                    <td>
+                                        <span class="relative-time" data-time="{{created}}"></span>
+                                    </td>
+
+                                    <td>
+                                        <textarea class="error-log-field autoselect" readonly>{{error}}</textarea>
+                                    </td>
+
+                                    <td>
+                                        <textarea class="error-log-field autoselect" readonly>{{json payload}}</textarea>
+                                    </td>
+
+                                </tr>
+
+                                {{/each}}
+                            </tbody>
+
+                        </table>
+                    </div>
+
+                </div>
+                {{/if}}
+
+            </div>
+
+        
+    {{/ui/card}}
+
+    <div id="prompt_settings" class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header flex flex-wrap items-center justify-between gap-3">
+            <h6 class="card-title text-primary">AI Instructions</h6>
+            {{> ui/btn label="Reset to default" variant="neutral" style="soft" size="sm"
+            icon="icon-[tabler--arrow-back-up]" id="prompt-reset-btn"}}
+        </div>
+        <div class="card-body space-y-4">
+
+            <div>
+                {{> ui/setting-ref name="openAiPrompt"}}
+
+                <label class="label-text">AI Prompt</label>
+
+                <input type="hidden" class="{{#if errors.openAiPromptElement}}is-invalid{{/if}}"
+                    id="openAiPromptElement" name="openAiPrompt" value="{{values.openAiPrompt}}">
+
+                {{#> ui/code-editor id="editor-prompt" title="AI instructions"}}
+                <div class="editor-embed-content editor-embed-content-right">
+                    <a href="#" id="prompt-try-btn">Test with email file</a>
+                </div>
+                
+                {{/ui/code-editor}}
+
+                {{#if errors.openAiPrompt}}
+                <span class="helper-text text-error">{{errors.openAiPrompt}}</span>
+                {{/if}}
+
+                <span class="helper-text">Instructions for the AI, sent as the system message ahead of the email. They must
+                    say which JSON properties to return; the webhook carries the model's answer as it came. The built-in
+                    instructions ask for a summary, the sentiment, whether a reply is expected, a risk score, and the
+                    events and actions the email mentions.</span>
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="openAiTemperature"}}
+                {{#> ui/form-field id="settingsOpenAiTemperature" label="Temperature" error=errors.openAiTemperature}}
+                <input type="number" class="input text-list{{#if errors.openAiTemperature}} is-invalid{{/if}}"
+                    id="settingsOpenAiTemperature" step="0.001" min="0" max="2" name="openAiTemperature"
+                    value="{{values.openAiTemperature}}" />
+                <span class="helper-text">Controls randomness (0-2). Lower = more focused, higher = more creative. Not
+                    sent to a reasoning model while it reasons. <a
+                        href="https://platform.openai.com/docs/api-reference/chat/create#temperature" target="_blank"
+                        rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">Learn
+                        more</a></span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="openAiTopP"}}
+                {{#> ui/form-field id="settingsOpenAiTopP" label="Top-p" error=errors.openAiTopP}}
+                <input type="number" class="input text-list{{#if errors.openAiTopP}} is-invalid{{/if}}"
+                    id="settingsOpenAiTopP" step="0.001" min="0" max="1" name="openAiTopP"
+                    value="{{values.openAiTopP}}" />
+                <span class="helper-text">Alternative to temperature (0-1). Controls diversity of word choices. Not sent
+                    to a reasoning model while it reasons. <a
+                        href="https://platform.openai.com/docs/api-reference/chat/create#top_p" target="_blank"
+                        rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">Learn
+                        more</a></span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="openAiReasoningEffort"}}
+
+                <label class="label-text" for="settingsOpenAiReasoningEffort">Reasoning effort</label>
+
+                <select id="settingsOpenAiReasoningEffort"
+                    class="select max-w-md{{#if errors.openAiReasoningEffort}} is-invalid{{/if}}"
+                    name="openAiReasoningEffort">
+                    {{#each reasoningEffortOptions}}
+                    <option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}}</option>
+                    {{/each}}
+                </select>
+                {{#if errors.openAiReasoningEffort}}
+                <span class="helper-text text-error">{{errors.openAiReasoningEffort}}</span>
+                {{/if}}
+                <span class="helper-text">How much a reasoning model, GPT-5 and later, thinks before answering. Default
+                    sends "low" to such a model and nothing to any other. A value the model does not support is
+                    dropped.</span>
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="openAiMaxTokens"}}
+                {{#> ui/form-field id="settingsOpenAiMaxTokens" label="Input token limit" error=errors.openAiMaxTokens}}
+                <input type="number" class="input text-list{{#if errors.openAiMaxTokens}} is-invalid{{/if}}"
+                    id="settingsOpenAiMaxTokens" step="1" min="0" name="openAiMaxTokens"
+                    value="{{values.openAiMaxTokens}}" />
+                <span class="helper-text">Maximum tokens in the input prompt: the instructions and the email together.
+                    EmailEngine shortens the email text to fit this limit. Leave blank for the default of
+                    {{aiDefaults.maxTokens}}.</span>
+                {{/ui/form-field}}
+            </div>
+
+        </div>
+    </div>
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--settings]"}}
+    </div>
+
+</form>
+
+{{#> ui/modal id="testPromptModal" title="Test AI Processing" titleId="testPromptModalLabel" dialogClass="max-w-3xl"}}
+<div class="modal-body">
+    <p class="mb-2">
+        Upload an email file (.eml) to test your AI configuration.
+    </p>
+
+    <div id="testPromptError" class="hidden">
+        <div class="alert alert-soft alert-error"></div>
+    </div>
+    <div id="testPromptResponse" class="hidden">
+        <pre
+            class="content max-h-[350px] overflow-auto border border-base-content/10 rounded-box p-2 text-base-content/60"></pre>
+    </div>
+
+</div>
+<div class="modal-footer">
+
+    {{> ui/btn label="Close" variant="neutral" style="soft" overlay="#testPromptModal"}}
+    <button type="button" id="prompt-test-btn" class="btn btn-primary">
+        <span class="icon-[tabler--flask] size-4" id="prompt-test-btn-icon"></span>
+        Choose file and test
+    </button>
+
+</div>
+{{/ui/modal}}
+
+{{> filter_editor_js formId="settings-form" modalTitle="Test Filter" payloadLabel="Sample email data (JSON)"
+payloadHelp="Edit the test data to see if your filter matches." selectPlaceholder="Load example..."
+defaultTestPayload='{"account":"test","path":"INBOX","subject":"test email"}'}}
+
+<input type="hidden" id="defaultPromptJson" value="{{defaultPromptJson}}">
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        const editorPrompt = uiAceEditor("editor-prompt", "markdown", document.getElementById('openAiPromptElement').value, {
+            enableBasicAutocompletion: true,
+            enableSnippets: false,
+            enableLiveAutocompletion: false,
+            useWorker: true
+        });
+
+        uiEditorFullscreen(new Map([['editor-prompt', editorPrompt]]));
+
+        // the shared filter_editor_js submit handler syncs the filter function;
+        // this one owns the AI prompt
+        document.getElementById('settings-form').addEventListener('submit', () => {
+            document.getElementById('openAiPromptElement').value = editorPrompt.getValue();
+        });
+
+        document.getElementById('prompt-try-btn').addEventListener('click', e => {
+            e.preventDefault()
+            uiModal.open('#testPromptModal');
+        })
+
+        let testPromptBtn = document.getElementById('prompt-test-btn');
+
+        let showError = message => {
+            document.getElementById('testPromptError').classList.remove('hidden');
+            document.getElementById('testPromptResponse').classList.add('hidden');
+
+            document.querySelector('#testPromptError .alert').textContent = message;
+        }
+
+        let showResponse = value => {
+            document.getElementById('testPromptError').classList.add('hidden');
+            document.getElementById('testPromptResponse').classList.remove('hidden');
+
+            document.querySelector('#testPromptResponse .content').textContent = value;
+        }
+
+        let clearResponses = () => {
+            document.getElementById('testPromptError').classList.add('hidden');
+            document.getElementById('testPromptResponse').classList.add('hidden');
+        }
+
+        async function testPromptFn() {
+            let emailFile;
+
+            clearResponses();
+
+            try {
+                emailFile = await browseFileContents('base64');
+            } catch (err) {
+                return showError(err.message)
+            }
+
+            let payload = {
+                emailFile,
+                openAiPrompt: editorPrompt.getValue(),
+                openAiModel: document.getElementById('openAiModel').value,
+                openAiAPIUrl: document.getElementById('openAiAPIUrl').value,
+                openAiAPIKey: document.getElementById('openAiAPIKey').value,
+                openAiTemperature: document.getElementById('settingsOpenAiTemperature').value,
+                openAiTopP: document.getElementById('settingsOpenAiTopP').value,
+                openAiReasoningEffort: document.getElementById('settingsOpenAiReasoningEffort').value,
+                openAiMaxTokens: document.getElementById('settingsOpenAiMaxTokens').value
+            };
+
+            let data;
+            try {
+                data = await uiPostJson('/admin/config/ai/test-prompt', payload);
+            } catch (err) {
+                return showError(err.message)
+            }
+            if (!data.success) {
+                return showError(data.error || 'Request failed')
+            }
+
+            showResponse(JSON.stringify(data.response, false, 2));
+        }
+
+        document.getElementById('prompt-reset-btn').addEventListener('click', e => {
+            e.preventDefault()
+
+            editorPrompt.setValue(JSON.parse(document.getElementById('defaultPromptJson').value).prompt);
+        });
+
+        let runFileTest = () => {
+            uiButtonBusy(testPromptBtn, true);
+            testPromptFn().catch(() => { }).finally(() => {
+                uiButtonBusy(testPromptBtn, false);
+            });
+        }
+
+        testPromptBtn.addEventListener('click', e => {
+            e.preventDefault();
+            runFileTest();
+        });
+
+        const modelInput = document.getElementById('openAiModel');
+
+        // the server answers with the list in the shape the page first got it
+        function redrawModelList(models) {
+            uiModelPickerSetModels(modelInput, models);
+        }
+
+        let reloadBtn = document.getElementById('reload-models-btn');
+
+        const requestReload = async () => {
+            const data = await uiPostJson('/admin/config/ai/reload-models', {
+                openAiAPIUrl: document.getElementById('openAiAPIUrl').value,
+                openAiAPIKey: document.getElementById('openAiAPIKey').value,
+                openAiModel: modelInput.value
+            });
+
+            return data;
+        }
+
+        let reloadModels = () => {
+            uiButtonBusy(reloadBtn, true);
+
+            requestReload().then(data => {
+                if (data.error) {
+                    showToast('Failed to send payload', 'alert-triangle')
+                    return;
+                }
+
+                if (data.models) {
+                    redrawModelList(data.models);
+                }
+
+            }).catch(err => {
+                showToast('Request failed\n' + err.message, 'alert-triangle');
+            }).finally(() => uiButtonBusy(reloadBtn, false));
+        }
+
+        reloadBtn.addEventListener('click', reloadModels);
+    });
+</script>

@@ -1,0 +1,258 @@
+{{> templates_header}}
+
+{{!-- the account level renders only for account-scoped templates (ui/breadcrumb skips empty levels) --}}
+{{> ui/breadcrumb parentHref="/admin/templates" parentLabel="Templates" midHref=(when account accountTemplatesLink) midLabel=account.name current=template.name class="mt-6 mb-6"}}
+
+
+{{#> ui/card}}
+
+        {{#> ui/detail-toolbar label="Template actions"}}
+        {{#> ui/tooltip text="Edit template contents"}}
+        {{> ui/btn variant="primary" style="outline" size="sm" href=(concat "/admin/templates/template/" template.id "/edit") icon="icon-[tabler--file-pencil]" label="Edit template"}}
+        {{/ui/tooltip}}
+
+        {{#> ui/tooltip text="Send test email using this template"}}
+        {{> ui/btn bare=true style="soft" size="sm" overlay="#sendTestModal" id="test-btn" icon="icon-[tabler--mail-forward]" label="Send test email"}}
+        {{/ui/tooltip}}
+
+        {{> ui/overflow-menu label="More template actions" deleteLabel="Delete template"}}
+        {{/ui/detail-toolbar}}
+
+        {{#if template.description}}
+        <h6 class="card-title">{{template.name}}</h6>
+        <h6 class="mb-6 text-base-content/60">{{template.description}}</h6>
+        {{else}}
+        <h6 class="card-title mb-6">{{template.name}}</h6>
+        {{/if}}
+
+        <dl class="ee-dl">
+
+            <dt>Template ID</dt>
+            <dd>
+                {{> ui/copy-field id="templateIdValue" value=template.id ariaLabel="ID" small=true join=true class="max-w-md"
+                inputClass="font-mono bg-base-200 border-0"}}
+                <span class="helper-text">Use this ID as the <em>"template"</em>
+                    property when sending email.</span>
+            </dd>
+
+            {{#if account}}
+
+            <dt>Account</dt>
+            <dd><a href="/admin/accounts/{{urlpart account.account}}" class="link link-animated">{{account.name}}</a></dd>
+
+            {{/if}}
+
+            {{#if template.content.subject}}
+            <dt>Subject</dt>
+            <dd><strong>{{template.content.subject}}</strong></dd>
+            {{/if}}
+
+            {{#if template.content.previewText}}
+            <dt>Preview text
+                {{#> ui/tooltip text="Preview text appears in the inbox after the subject line."}}<span
+                    class="icon-[tabler--help-circle] size-4 text-base-content/50 align-text-bottom"></span>{{/ui/tooltip}}
+            </dt>
+            <dd>{{template.content.previewText}}</dd>
+            {{/if}}
+
+            {{#if template.format}}
+            <dt>HTML source format</dt>
+            <dd><span class="font-mono">{{format.name}}</span></dd>
+            {{/if}}
+
+        </dl>
+
+        <div class="mt-6">
+            {{#> ui/tabs label="Template content"}}
+            {{> ui/tab target="html" label="HTML" active=true}}
+            {{> ui/tab target="text" label="Plain text"}}
+            {{/ui/tabs}}
+            <div class="mt-4">
+                <div id="html" role="tabpanel" aria-labelledby="html-tab">
+
+                    <div id="html-preview" class="code-editor">{{template.content.html}}</div>
+
+                </div>
+                <div id="text" class="hidden" role="tabpanel" aria-labelledby="text-tab">
+
+                    <div id="text-preview" class="code-editor">{{template.content.text}}</div>
+
+                </div>
+            </div>
+        </div>
+    
+{{/ui/card}}
+
+{{#> ui/confirm-modal id="deleteModal" title="Delete template" action="/admin/templates/delete"
+fieldName="template" fieldValue=template.id submitLabel="Delete template"}}
+<p>Are you sure you want to delete <strong>{{template.name}}</strong>? This action cannot be undone.</p>
+{{/ui/confirm-modal}}
+
+{{!-- no #crumb input: the layout already renders the element the script reads --}}
+<input type="hidden" id="template" value="{{template.id}}" />
+
+{{!-- staticBackdrop: a stray backdrop click must not discard the typed
+      recipient/payload (Escape still closes, matching the old behavior) --}}
+{{#> ui/modal id="sendTestModal" title="Send test email" dialogClass="max-w-3xl" staticBackdrop=true}}
+<div class="modal-body space-y-4">
+
+    {{#unless account}}
+    {{> ui/account-picker id="inputAccount" name="account" label="Account" hint="Account used to send the test email."}}
+    {{/unless}}
+
+    {{> ui/form-field id="inputTo" name="inputTo" type="email" label="Recipient's email address" required=true hint="Email address that will receive the test message."}}
+
+    {{#> ui/details id="jsonStructure" summary="Handlebars payload" class="card border border-base-content/10" summaryClass="px-4 py-2"}}
+    <div>
+        <div id="editor-json" class="code-editor h-40"></div>
+        <span class="helper-text">Enter the JSON structure for the
+            "render.params" API parameter.<br /><code>"keyName"</code> property in this JSON structure
+            becomes
+            <code>\{{params.keyName}}</code> in the template.</span>
+    </div>
+    {{/ui/details}}
+
+</div>
+<div class="modal-footer">
+    {{> ui/btn label="Cancel" variant="neutral" style="soft" overlay="#sendTestModal"}}
+    <button type="button" id="send-test-btn" class="btn btn-primary">
+        <span class="icon-[tabler--mail-forward] size-4" id="send-test-icon"></span> Send email
+    </button>
+</div>
+{{/ui/modal}}
+
+{{#> ui/modal id="alertModal" titleId="alertModalLabel" title=" "}}
+<div class="modal-body">
+    <p id="alertModalContent"></p>
+</div>
+<div class="modal-footer">
+    {{> ui/btn label="Close" variant="neutral" style="soft" overlay="#alertModal"}}
+</div>
+{{/ui/modal}}
+
+{{> ace_assets}}
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        function showAlert(title, content) {
+            document.getElementById('alertModalLabel').textContent = title;
+            document.getElementById('alertModalContent').textContent = content;
+
+            uiModal.open('#alertModal');
+        }
+
+        const editorJson = uiAceEditor("editor-json", "json", '{\n    "keyName": "key value"\n}');
+
+        let inputAccount = document.getElementById('inputAccount')
+        let inputTo = document.getElementById('inputTo')
+
+        let sendTestBtn = document.getElementById("send-test-btn");
+
+        document.getElementById('sendTestModal').addEventListener('open.overlay', () => {
+
+            editorJson.session.setValue('{\n    "keyName": "value"\n}');
+
+            if (inputAccount) {
+                uiAccountPickerClear(inputAccount);
+            }
+            inputTo.value = '';
+
+            document.getElementById('jsonStructure').open = false;
+        });
+
+        let hasValidJson = true;
+
+        function setStateUpdate() {
+            let accountValue = true;
+            if (inputAccount) {
+                accountValue = inputAccount.value.trim();
+            }
+
+            let toValue = inputTo.value.trim();
+            if (!accountValue || !toValue || !hasValidJson) {
+                sendTestBtn.disabled = true;
+            } else {
+                sendTestBtn.disabled = false;
+            }
+        }
+
+        editorJson.session.on('change', function (delta) {
+            // delta.start, delta.end, delta.lines, delta.action
+            let curval = editorJson.getValue().trim();
+            try {
+                if (curval) {
+                    let parsed = JSON.parse(curval);
+                    if (parsed && typeof parsed !== 'object') {
+                        throw new Error('Not an object')
+                    }
+                }
+                hasValidJson = true;
+            } catch (err) {
+                hasValidJson = false;
+            }
+            setStateUpdate();
+        });
+
+        if (inputAccount) {
+            // The picker fires both on the hidden input whenever the choice changes. No keyup:
+            // the field cannot be typed into.
+            inputAccount.addEventListener('input', setStateUpdate);
+            inputAccount.addEventListener('change', setStateUpdate);
+        }
+
+        inputTo.addEventListener('input', setStateUpdate);
+        inputTo.addEventListener('change', setStateUpdate);
+        inputTo.addEventListener('keyup', setStateUpdate);
+
+        setStateUpdate();
+
+
+        const sendTestPayload = async () => {
+
+            const payload = {
+                template: document.getElementById('template').value
+            }
+
+            if (inputAccount) {
+                payload.account = inputAccount.value.trim()
+            }
+
+            payload.to = inputTo.value.trim()
+
+            let templateVars = editorJson.getValue().trim();
+            if (templateVars) {
+                templateVars = JSON.parse(templateVars);
+            }
+
+            if (templateVars && typeof templateVars === 'object') {
+                payload.params = templateVars
+            }
+
+            const data = await uiPostJson('/admin/templates/test', payload);
+
+            if (data.error) {
+                throw new Error(data.error);
+            }
+
+            return data;
+        }
+
+        function sendTestEmail() {
+            uiButtonBusy(sendTestBtn, true);
+            sendTestPayload().then(info => {
+                uiModal.close('#sendTestModal');
+
+                showAlert('Message sent', `${info.response} as ${info.queueId}`)
+            }).catch(err => {
+                showAlert('Error', err.message);
+            }).finally(() => uiButtonBusy(sendTestBtn, false));
+        }
+
+        sendTestBtn.addEventListener('click', sendTestEmail);
+
+
+        const editorHtml = uiAcePreview("html-preview", "handlebars");
+        const editorText = uiAcePreview("text-preview", "handlebars");
+
+    });
+</script>

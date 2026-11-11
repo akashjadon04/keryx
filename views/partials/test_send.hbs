@@ -1,0 +1,159 @@
+{{!--
+    Delivery-test results (SPF/DKIM/DMARC). Rendered on the server by
+    POST /admin/smtp/check-test (compiledFragments.testSend in
+    lib/ui-routes/route-helpers.js) and returned as the `html` field the
+    account page drops into the results panel. Relies on the statusColor and
+    statusIcon helpers from lib/handlebars-helpers.js. Rendered without the
+    page's view context, so no inline scripts here. Native details/summary
+    panels - no JS.
+--}}
+<div class="space-y-2 mb-4">
+    <details class="group card border border-base-content/10">
+        <summary
+            class="flex cursor-pointer items-center gap-2 px-4 py-2 font-bold text-primary list-none [&::-webkit-details-marker]:hidden">
+            <span class="icon-[tabler--chevron-right] size-4 shrink-0 transition-transform duration-200 group-open:rotate-90"></span>
+            <span class="badge badge-{{statusColor spf.status.result}} badge-sm">
+                <span class="{{statusIcon spf.status.result}} size-3.5"></span>
+            </span>
+            SPF
+        </summary>
+        <div class="card-body pt-0">
+            <dl class="ee-dl">
+                <dt>Envelope address</dt>
+                <dd><small>{{spf.[envelope-from]}}</small></dd>
+
+                <dt>IP address</dt>
+                <dd><small class="font-mono">{{spf.[client-ip]}}</small></dd>
+
+                {{#if spf.rr}}
+                <dt>DNS record</dt>
+                <dd><small class="font-mono">{{spf.rr}}</small></dd>
+                {{/if}}
+
+                <dt>Result</dt>
+                <dd>
+                    <span class="badge badge-{{statusColor spf.status.result}} badge-sm">{{spf.status.result}}</span>
+                    {{#if spf.status.comment}}
+                    <small>{{spf.status.comment}}</small>
+                    {{/if}}
+                </dd>
+            </dl>
+        </div>
+    </details>
+
+    <details class="group card border border-base-content/10">
+        <summary
+            class="flex cursor-pointer items-center gap-2 px-4 py-2 font-bold text-primary list-none [&::-webkit-details-marker]:hidden">
+            <span class="icon-[tabler--chevron-right] size-4 shrink-0 transition-transform duration-200 group-open:rotate-90"></span>
+            {{#equals mainSig.status.result "pass"}}
+            <span class="badge badge-{{#if mainSig.status.aligned}}success{{else}}neutral{{/if}} badge-sm">
+                <span
+                    class="{{#if mainSig.status.aligned}}icon-[tabler--circle-check]{{else}}icon-[tabler--alert-triangle]{{/if}} size-3.5"></span>
+            </span>
+            {{else}}
+            <span class="badge badge-{{statusColor mainSig.status.result}} badge-sm">
+                <span class="{{statusIcon mainSig.status.result}} size-3.5"></span>
+            </span>
+            {{/equals}}
+            DKIM
+        </summary>
+        <div class="card-body pt-0">
+            <div class="space-y-4">
+                {{#each dkim.results}}
+                <div class="rounded-box border border-base-content/10 p-4">
+                    <div class="mb-2 text-sm font-bold">Signature #{{inc @index 1}}</div>
+
+                    <dl class="ee-dl">
+                        {{#if signingDomain}}
+                        <dt>Signed by</dt>
+                        <dd><small class="font-mono">{{signingDomain}}</small></dd>
+                        {{/if}}
+
+                        {{#if selector}}
+                        <dt>with selector</dt>
+                        <dd><small class="font-mono">{{selector}}</small></dd>
+                        {{/if}}
+
+                        <dt>Result</dt>
+                        <dd>
+                            {{#equals status.result "pass"}}
+                            {{#if status.aligned}}
+                            <span class="badge badge-success badge-sm">{{status.result}}</span>
+                            {{else}}
+                            <span class="badge badge-neutral badge-sm">{{status.result}}</span> <small>signature is
+                                valid but signing domain does not match sender address.</small>
+                            {{/if}}
+                            {{else}}
+                            <span class="badge badge-{{statusColor status.result}} badge-sm">{{status.result}}</span>
+                            {{/equals}}
+                            {{#if status.comment}}
+                            <small>{{status.comment}}</small>
+                            {{/if}}
+                        </dd>
+                    </dl>
+                </div>
+                {{/each}}
+            </div>
+        </div>
+    </details>
+
+    <details class="group card border border-base-content/10">
+        <summary
+            class="flex cursor-pointer items-center gap-2 px-4 py-2 font-bold text-primary list-none [&::-webkit-details-marker]:hidden">
+            <span class="icon-[tabler--chevron-right] size-4 shrink-0 transition-transform duration-200 group-open:rotate-90"></span>
+            <span class="badge badge-{{statusColor dmarc.status.result}} badge-sm">
+                <span class="{{statusIcon dmarc.status.result}} size-3.5"></span>
+            </span>
+            DMARC
+        </summary>
+        <div class="card-body pt-0">
+            <dl class="ee-dl">
+                <dt>Domain</dt>
+                <dd>{{dmarc.domain}}</dd>
+
+                {{#if dmarc.rr}}
+                <dt>DNS record</dt>
+                <dd><small class="font-mono">{{dmarc.rr}}</small></dd>
+                {{/if}}
+
+                {{#if dmarc.alignment.spf}}
+                <dt>SPF alignment</dt>
+                <dd>
+                    {{#if dmarc.alignment.spf.result}}
+                    <span class="badge badge-success badge-sm"><span
+                            class="icon-[tabler--circle-check] size-3.5"></span></span>
+                    <small>{{dmarc.alignment.spf.result}}</small>
+                    {{else}}
+                    <span class="badge badge-error badge-sm"><span
+                            class="icon-[tabler--alert-triangle] size-3.5"></span></span>
+                    <small>not aligned</small>
+                    {{/if}}
+                </dd>
+                {{/if}}
+
+                {{#if dmarc.alignment.dkim}}
+                <dt>DKIM alignment</dt>
+                <dd>
+                    {{#if dmarc.alignment.dkim.result}}
+                    <span class="badge badge-success badge-sm"><span
+                            class="icon-[tabler--circle-check] size-3.5"></span></span>
+                    <small>{{dmarc.alignment.dkim.result}}</small>
+                    {{else}}
+                    <span class="badge badge-error badge-sm"><span
+                            class="icon-[tabler--alert-triangle] size-3.5"></span></span>
+                    <small>not aligned</small>
+                    {{/if}}
+                </dd>
+                {{/if}}
+
+                <dt>Result</dt>
+                <dd>
+                    <span class="badge badge-{{statusColor dmarc.status.result}} badge-sm">{{dmarc.status.result}}</span>
+                    {{#if dmarc.status.comment}}
+                    <small>{{dmarc.status.comment}}</small>
+                    {{/if}}
+                </dd>
+            </dl>
+        </div>
+    </details>
+</div>

@@ -1,0 +1,449 @@
+/* global document, window, FileReader, EventSource */
+
+'use strict';
+
+// window.showToast is provided by static/js/ui.js (loaded before this file)
+
+window.browseFileContents = function (type) {
+    let iElm = document.createElement('input');
+    iElm.setAttribute('type', 'file');
+    iElm.style.width = '1px';
+    iElm.style.height = '1px';
+    iElm.style.position = 'absolute';
+    iElm.style.left = '-1000px';
+    iElm.style.top = '-1000px';
+    document.body.appendChild(iElm);
+
+    return new Promise((resolve, reject) => {
+        iElm.addEventListener('change', () => {
+            const reader = new FileReader();
+
+            reader.addEventListener('load', event => {
+                let fileContents = event.target.result;
+                document.body.removeChild(iElm);
+
+                switch (type) {
+                    case 'base64': {
+                        // extract base64 content from a Data URI
+                        fileContents = fileContents.substring(event.target.result.indexOf(',') + 1);
+                        break;
+                    }
+                    case 'arrayBuffer':
+                    case 'text':
+                    default:
+                    // do nothing
+                }
+
+                resolve(fileContents);
+            });
+
+            reader.addEventListener('error', err => {
+                console.error(err);
+                document.body.removeChild(iElm);
+                reject(new Error('Failed loading file'));
+            });
+
+            reader.addEventListener('abort', () => {
+                document.body.removeChild(iElm);
+                reject(new Error('Failed loading file'));
+            });
+
+            if (!iElm.files || !iElm.files[0]) {
+                document.body.removeChild(iElm);
+                return resolve(null);
+            }
+
+            switch (type) {
+                case 'base64':
+                    reader.readAsDataURL(iElm.files[0]);
+                    break;
+                case 'arrayBuffer':
+                    reader.readAsArrayBuffer(iElm.files[0]);
+                    break;
+                case 'text':
+                default:
+                    reader.readAsText(iElm.files[0], 'UTF-8');
+            }
+        });
+
+        iElm.click();
+    });
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    let toggleAllElements = (allElementsElm, otherElements, direction) => {
+        if (!allElementsElm || !otherElements) {
+            return;
+        }
+
+        const allSelected = allElementsElm.getAttribute('type') === 'checkbox' ? allElementsElm.checked : !allElementsElm.value.trim();
+        for (let elm of otherElements) {
+            elm.disabled = direction ? allSelected : !allSelected;
+        }
+    };
+
+    let allElementsElms = document.querySelectorAll('.or-else-all');
+    for (let allElementsElm of allElementsElms) {
+        let otherElements;
+        let direction = allElementsElm && allElementsElm.dataset.reverse === 'true' ? false : true;
+
+        if (allElementsElm && allElementsElm.dataset.target) {
+            otherElements = document.querySelectorAll(`.${allElementsElm.dataset.target.trim()}`);
+        }
+
+        if (!otherElements) {
+            continue;
+        }
+
+        for (let elm of [allElementsElm].concat(Array.from(otherElements))) {
+            // input keeps text-driven rules live per keystroke (e.g. the
+            // reveal/copy buttons of ui/secret-field)
+            for (let eventName of ['change', 'click', 'input']) {
+                elm.addEventListener(eventName, () => toggleAllElements(allElementsElm, otherElements, direction));
+            }
+        }
+
+        if (allElementsElm) {
+            toggleAllElements(allElementsElm, otherElements, direction);
+        }
+    }
+
+    const formatter = new Intl.RelativeTimeFormat(undefined, {
+        numeric: 'auto'
+    });
+
+    const DIVISIONS = [
+        { amount: 60, name: 'seconds' },
+        { amount: 60, name: 'minutes' },
+        { amount: 24, name: 'hours' },
+        { amount: 7, name: 'days' },
+        { amount: 4.34524, name: 'weeks' },
+        { amount: 12, name: 'months' },
+        { amount: Number.POSITIVE_INFINITY, name: 'years' }
+    ];
+
+    function formatTimeAgo(date) {
+        let duration = (date - new Date()) / 1000;
+
+        for (let i = 0; i <= DIVISIONS.length; i++) {
+            const division = DIVISIONS[i];
+            if (Math.abs(duration) < division.amount) {
+                return formatter.format(Math.round(duration), division.name);
+            }
+            duration /= division.amount;
+        }
+    }
+    window.formatTimeAgo = formatTimeAgo;
+
+    let updateRelativeTimes = () => {
+        document.querySelectorAll('.relative-time').forEach(entry => {
+            let time = new Date(entry.dataset.time);
+            // NaN, not falsy, is what an unparsable stamp yields - a Date object is always
+            // truthy. formatTimeAgo runs off the end of DIVISIONS for one and throws, which
+            // used to take out the .local-time and drop-target wiring set up below it.
+            if (!isNaN(time)) {
+                entry.textContent = formatTimeAgo(time);
+            }
+        });
+    };
+
+    updateRelativeTimes();
+    setInterval(updateRelativeTimes, 15 * 1000);
+
+    for (let t of document.querySelectorAll('.local-time')) {
+        if (!t.dataset.time) {
+            continue;
+        }
+        let date = new Date(t.dataset.time);
+        t.textContent = new Intl.DateTimeFormat().format(date);
+    }
+
+    for (let t of document.querySelectorAll('.local-date-time')) {
+        if (!t.dataset.time) {
+            continue;
+        }
+        let date = new Date(t.dataset.time);
+        t.textContent = new Intl.DateTimeFormat(undefined, { timeStyle: 'medium', dateStyle: 'short' }).format(date);
+    }
+
+    function dropfile(elm, file) {
+        const reader = new FileReader();
+        reader.onload = function (e) {
+            elm.value = (e.target.result || '').trim();
+            elm.focus();
+            elm.select();
+        };
+        reader.readAsText(file, 'UTF-8');
+    }
+
+    for (let elm of document.querySelectorAll('.droptxt')) {
+        elm.addEventListener('dragenter', () => {
+            elm.classList.add('dragover');
+        });
+
+        elm.addEventListener('dragleave', () => {
+            elm.classList.remove('dragover');
+        });
+
+        elm.addEventListener('drop', e => {
+            e.preventDefault();
+            elm.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            dropfile(elm, file);
+        });
+    }
+
+    for (let elm of document.querySelectorAll('.autoselect')) {
+        elm.addEventListener('click', () => {
+            elm.focus();
+            elm.select();
+        });
+    }
+
+    for (let elm of document.querySelectorAll('.cur-base-url')) {
+        let origin = elm.dataset.origin || window.location.origin;
+        if (elm.getAttribute('type') === 'text') {
+            elm.value = origin;
+        } else {
+            elm.textContent = origin;
+        }
+    }
+
+    // topbar search: the clear button (rendered only while a query is active)
+    // resubmits the search form without the query, keeping any other filters
+    let searchClearBtn = document.getElementById('topbar-search-clear');
+    if (searchClearBtn) {
+        searchClearBtn.addEventListener('click', () => {
+            let form = searchClearBtn.closest('form');
+            let queryElm = form.querySelector('input[name="query"]');
+            // disabled fields are not submitted, so the query parameter is dropped
+            queryElm.disabled = true;
+            form.submit();
+        });
+    }
+
+    // Secondary navigation column (views/layout/app.hbs): a full column beside the content
+    // from lg up, a disclosure below that. aria-expanded on the button is the whole state -
+    // the panel derives its visibility from it in CSS (peer-aria-expanded:block), so there is
+    // no second flag to keep in step. Above lg the button is display:none and lg:block on the
+    // panel outranks the peer rule, so the writes below are inert rather than wrong there.
+    let secondaryNavToggle = document.getElementById('secondary-nav-toggle');
+    let secondaryNavPanel = document.getElementById('secondary-nav-panel');
+    if (secondaryNavToggle && secondaryNavPanel) {
+        let setSecondaryNav = expanded => secondaryNavToggle.setAttribute('aria-expanded', String(expanded));
+
+        secondaryNavToggle.addEventListener('click', () => setSecondaryNav(secondaryNavToggle.getAttribute('aria-expanded') !== 'true'));
+
+        // Closing takes focus with it when the caret is inside the panel: the subtree becomes
+        // display:none, and focus would fall back to <body> - the reader's next Tab would
+        // restart from the top of the page. Hand it back to the control they came from.
+        let closeSecondaryNav = () => {
+            let focused = document.activeElement;
+            setSecondaryNav(false);
+            if (focused && secondaryNavPanel.contains(focused)) {
+                secondaryNavToggle.focus();
+            }
+        };
+
+        // Page scripts have business with this too - the reference's filter shortcut has to
+        // open the panel before it can focus the field inside it, and its group rows behave
+        // differently depending on which mode the column is in. Publishing the facts they need
+        // keeps the toggle's id, and the fact that a click is what opens it, in this file.
+        // `collapsible` reads the button's own box: it is lg:hidden, so being laid out at all
+        // is the answer, and the breakpoint stays in the stylesheet.
+        window.uiSecondaryNav = {
+            // the elements too: the toggle so a page script can watch its box for the mode
+            // change, the panel because below lg it is the scroller the nav lives in
+            toggle: secondaryNavToggle,
+            panel: secondaryNavPanel,
+            collapsible: () => !!secondaryNavToggle.offsetParent,
+            open: () => setSecondaryNav(true),
+            close: closeSecondaryNav
+        };
+
+        secondaryNavPanel.addEventListener('click', event => {
+            // A link to another page reloads and closes this anyway, but an in-page anchor
+            // does not - it would leave the panel expanded over the section just jumped to.
+            // Closing before the browser acts on the fragment also keeps the landing position
+            // right: the page shrinks first and the scroll is measured after.
+            //
+            // Two links are left alone: one something else already handled (defaultPrevented -
+            // the reference's group rows open their own list in place), and one opened
+            // elsewhere by a modifier, which leaves this page exactly where it was.
+            if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+                return;
+            }
+
+            if (event.target.closest('a')) {
+                closeSecondaryNav();
+            }
+        });
+
+        // Escape is the way out of any disclosure. Without it the only way to put the panel
+        // away is to find the row that opened it, which by then may be a screen above. Same
+        // rule as the click handler: a keystroke something else has already acted on is not
+        // ours - the reference's filter takes Escape to clear its query, and clearing a query
+        // should not also close the panel it was being typed into.
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && !event.defaultPrevented && secondaryNavToggle.getAttribute('aria-expanded') === 'true') {
+                closeSecondaryNav();
+            }
+        });
+    }
+
+    // show or hide the error tooltip attached to a state badge (the badge sits
+    // inside a ui/state-badge tooltip wrapper). The empty state is gated with
+    // ee-tooltip-empty on the wrapper, not with hidden on the content -
+    // HSTooltip's show() strips the hidden class on hover.
+    function setStateTooltip(stateInfoElm, error) {
+        let tooltipElm = stateInfoElm.closest('.tooltip');
+        let tooltipContentElm = tooltipElm && tooltipElm.querySelector('.tooltip-content');
+        if (!tooltipContentElm) {
+            return;
+        }
+        tooltipElm.classList.toggle('ee-tooltip-empty', !error);
+        tooltipContentElm.querySelector('.tooltip-body').textContent = error || '';
+    }
+
+    // repaint a ui/state-badge from a state label: badge color, spinner/text
+    // content and the error tooltip
+    function repaintStateBadge(stateInfoElm, stateLabel) {
+        for (let val of stateInfoElm.classList.values()) {
+            if (/^badge-/.test(val)) {
+                stateInfoElm.classList.remove(val);
+            }
+        }
+
+        stateInfoElm.classList.add(`badge-${stateLabel.type === 'danger' ? 'error' : stateLabel.type || 'neutral'}`);
+
+        stateInfoElm.innerHTML = '';
+        if (stateLabel.spinner) {
+            let spinnerElm = document.createElement('span');
+            spinnerElm.classList.add('icon-[tabler--loader-2]', 'animate-spin', 'size-3.5', 'align-text-bottom');
+            let textElm = document.createElement('span');
+            textElm.textContent = ' ' + stateLabel.name;
+            stateInfoElm.appendChild(spinnerElm);
+            stateInfoElm.appendChild(textElm);
+        } else {
+            stateInfoElm.textContent = stateLabel.name;
+        }
+
+        setStateTooltip(stateInfoElm, stateLabel.error);
+    }
+
+    // the SSE payload carries the server-formatted badge descriptor (stateLabel,
+    // attached in publishChangeEvent), so the client only repaints - the mapping
+    // itself lives in lib/ui-routes/route-helpers.js
+    function updateStateIndicators(data) {
+        let { account, stateLabel } = data;
+        if (!stateLabel) {
+            return;
+        }
+
+        // an account id is any string up to 256 characters, so it is escaped rather than trusted to form a selector
+        for (let stateInfoElm of document.querySelectorAll(`.state-info[data-account="${CSS.escape(account)}"]`)) {
+            repaintStateBadge(stateInfoElm, stateLabel);
+        }
+    }
+
+    function updateServerStateIndicators(type, data) {
+        let { stateLabel } = data;
+        if (!stateLabel) {
+            return;
+        }
+
+        for (let stateInfoElm of document.querySelectorAll(`.state-info[data-type="${type}"]`)) {
+            repaintStateBadge(stateInfoElm, stateLabel);
+        }
+    }
+
+    // live account/SMTP state updates; only layouts that mark themselves opt in
+    // (the login and public layouts must not open an authenticated SSE stream)
+    if (document.body.dataset.sseChanges === 'true') {
+        const evtSource = new EventSource('/admin/changes');
+        evtSource.onmessage = function (e) {
+            let data;
+            try {
+                data = JSON.parse(e.data);
+            } catch (err) {
+                // ignore?
+                console.error('Failed to process event', e.data, err);
+            }
+            switch (data && data.type) {
+                case 'state':
+                    updateStateIndicators(data);
+                    break;
+                case 'smtpServerState':
+                    updateServerStateIndicators('smtp', data);
+                    break;
+                case 'imapProxyServerState':
+                    updateServerStateIndicators('imapProxy', data);
+                    break;
+            }
+
+            // Page-scoped listeners (the TLS page follows certificate provisioning this way) get
+            // every event, including the ones this switch does not paint a badge for. One stream
+            // per page: a second EventSource would be a second authenticated connection for the
+            // same feed.
+            if (data) {
+                document.dispatchEvent(new CustomEvent('ee:change', { detail: data }));
+            }
+        };
+
+        evtSource.onerror = function (e) {
+            console.log('EventSource failed.', e);
+        };
+    }
+
+    let crumbElm = document.getElementById('crumb');
+    if (crumbElm) {
+        // dismissable error alerts: the close button removes the alert and
+        // clears the stored error server-side (replaces the old Bootstrap
+        // data-dismiss="alert" + closed.bs.alert contract)
+        for (let alertElm of document.querySelectorAll('.clear-alert-btn')) {
+            let closeBtn = alertElm.querySelector('.clear-alert-close');
+            if (!closeBtn) {
+                continue;
+            }
+            closeBtn.addEventListener('click', () => {
+                alertElm.remove();
+                fetch('/admin/config/clear-error', {
+                    method: 'post',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({
+                        crumb: document.getElementById('crumb').value,
+                        alert: alertElm.dataset.clearAlert,
+                        entry: alertElm.dataset.clearEntry || ''
+                    })
+                }).catch(err => console.error(err));
+            });
+        }
+    }
+
+});
+
+// "Choose file" buttons: a .file-picker-btn with data-file-target="#selector" reads the picked
+// file as text into that control (a PEM certificate into its textarea). Delegated, so a page
+// needs no script of its own for it; the .droptxt class on the same control adds drag and drop.
+document.addEventListener('click', e => {
+    let btn = e.target.closest('.file-picker-btn');
+    if (!btn) {
+        return;
+    }
+    e.preventDefault();
+
+    let target = btn.dataset.fileTarget ? document.querySelector(btn.dataset.fileTarget) : null;
+    if (!target) {
+        return;
+    }
+
+    window
+        .browseFileContents('text')
+        .then(contents => {
+            if (contents) {
+                target.value = contents.toString().trim();
+                target.focus();
+            }
+        })
+        .catch(err => window.showToast('Could not read the file\n' + err.message, 'alert-triangle'));
+});

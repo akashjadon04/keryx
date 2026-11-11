@@ -1,0 +1,116 @@
+{{> oauth_config_header badgeLabel=total}}
+
+{{> oauth_tabs}}
+
+{{#if apps}}
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="overflow-x-auto">
+        <table class="table ee-table-stack">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Project ID</th>
+                    <th>Topic</th>
+                    <th>Subscription</th>
+                    <th>Expiration</th>
+                    <th>Status</th>
+                    <th class="w-12"><span class="sr-only">Actions</span></th>
+                </tr>
+            </thead>
+
+            <tbody>
+                {{#each apps}}
+                <tr class="hover:bg-base-200/60">
+                    <td class="relative">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id) label="Open OAuth2 app"}}
+                        <div><strong>{{name}}</strong></div>
+                        {{> ui/entity-id id=id prefix="Provider ID"}}
+                    </td>
+
+                    <td class="relative" data-label="Project ID">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}{{googleProjectId}}
+                    </td>
+
+                    <td class="relative" data-label="Topic">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}
+                        {{#if pubSubTopic}}
+                        {{> ui/badge label="Created" variant="success"}}
+                        {{else}}
+                        {{> ui/badge label="Not set" variant="warning"}}
+                        {{/if}}
+                    </td>
+
+                    <td class="relative" data-label="Subscription">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}
+                        {{#if pubSubSubscription}}
+                        {{> ui/badge label="Created" variant="success"}}
+                        {{else}}
+                        {{> ui/badge label="Not set" variant="warning"}}
+                        {{/if}}
+                    </td>
+
+                    <td class="relative" data-label="Expiration">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}
+                        {{#if expirationLabel}}
+                        {{expirationLabel}}
+                        {{else}}
+                        <span class="text-base-content/60">-</span>
+                        {{/if}}
+                    </td>
+
+                    <td class="relative" data-label="Status">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}
+                        {{!-- relative z-[1] on the tooltip lifts the badge above the
+                              row-overlay link so the error tooltip stays hoverable --}}
+                        {{#if meta.pubSubFlag}}
+                        {{#> ui/tooltip text=meta.pubSubFlag.message class="relative z-[1]"}}{{> ui/badge label="Error" variant="error"}}{{/ui/tooltip}}
+                        {{else if meta.authFlag}}
+                        {{#> ui/tooltip text=meta.authFlag.message class="relative z-[1]"}}{{> ui/badge label="Setup Failed" variant="warning"}}{{/ui/tooltip}}
+                        {{else if meta.ttlWarning}}
+                        {{#> ui/tooltip text=meta.ttlWarning.message class="relative z-[1]"}}{{> ui/badge label="TTL Update Failed" variant="warning"}}{{/ui/tooltip}}
+                        {{else if pubSubSubscription}}
+                        {{> ui/badge label="OK" variant="success"}}
+                        {{else}}
+                        {{> ui/badge label="Pending" variant="warning"}}
+                        {{/if}}
+                    </td>
+
+                    <td class="ee-stack-actions relative text-end">
+                        {{> ui/row-actions openHref=(concat "/admin/config/oauth/app/" id) label="OAuth2 app actions"}}
+                    </td>
+                </tr>
+                {{/each}}
+            </tbody>
+        </table>
+    </div>
+
+    {{> ui/pagination showPaging=showPaging prevPage=prevPage nextPage=nextPage pageLinks=pageLinks}}
+</div>
+{{else}}
+{{> ui/list-empty noun="Gmail Pub/Sub apps" firstPage=firstPage}}
+{{/if}}
+
+{{#> ui/card title="Subscription Settings"}}
+        <form method="post" action="/admin/config/oauth/subscriptions" class="space-y-4">
+            <input type="hidden" name="crumb" value="{{crumb}}" />
+            {{#> ui/form-field id="gmailSubscriptionTtl" label="Subscription TTL"}}
+            <input type="number" class="input" id="gmailSubscriptionTtl" name="gmailSubscriptionTtl"
+                value="{{values.gmailSubscriptionTtl}}" placeholder="31" min="0" max="365" />
+            <span class="helper-text">
+                Inactivity expiration in days. Leave empty for Google's default (31 days). Set to 0 to disable
+                expiration.
+            </span>
+            {{/ui/form-field}}
+            {{> ui/btn label="Update" type="submit" icon="icon-[tabler--device-floppy]"}}
+        </form>
+
+        <div class="alert alert-soft alert-info mt-4 mb-0 block">
+            <strong>Note:</strong> Google automatically deletes Pub/Sub subscriptions that receive no activity
+            for a set period. This setting controls that period for both new and existing subscriptions.
+            Changes take effect the next time an OAuth app is created, updated, or its subscription is recovered.
+            If a subscription does expire, EmailEngine detects this and recreates it automatically.
+            EmailEngine also polls the Gmail API about every 10 minutes and uses the History API to catch up
+        on missed changes while notifications are unavailable.
+        </div>
+    
+{{/ui/card}}

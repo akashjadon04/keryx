@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="description" content="EmailEngine Application page; The Ultimate Email API for Developers" />
+    <meta name="author" content="Postal Systems OÜ">
+
+    <title>{{#if pageTitleFull}}{{pageTitleFull}}{{else}}{{pageBrandName}}{{#if pageTitle}} -
+        {{pageTitle}}{{/if}}{{/if}}</title>
+
+    {{!-- The forced-SSO hand-off starts its navigation here, above the stylesheets, rather than
+          from the page body. An inline script cannot run until the stylesheets declared before it
+          have loaded, and this layout pulls in the font sheet plus a 236 KB flyonui.css, so a
+          script placed after them only runs once the card has already painted - which is a visible
+          flash of login chrome on every forced-SSO sign-in. Nothing has painted this early.
+
+          Only views/account/login-redirect.hbs sets ssoRedirectUrl, and it is a fixed path chosen
+          in lib/ui-routes/auth-routes.js rather than anything a request carries, so the ordinary
+          login form never emits this and no user input reaches the string. Why that page navigates
+          itself instead of the server answering a redirect is the whole story in the view. --}}
+    {{#if ssoRedirectUrl}}
+    <meta name="ee-sso-redirect" content="{{ssoRedirectUrl}}">
+    <script data-cfasync="false" nonce="{{cspNonce}}">window.location.replace(document.querySelector('meta[name="ee-sso-redirect"]').content);</script>
+    {{/if}}
+
+    {{> head_assets}}
+
+    <link href="/static/css/flyonui.css" rel="stylesheet">
+
+</head>
+
+<body class="from-primary to-secondary min-h-screen bg-gradient-to-br">
+
+    {{!-- centered in the viewport, not pinned to the top: the card is short and the page is
+          otherwise a full screen of gradient under it. min-h-screen on the flex container
+          rather than a fixed height, so a card taller than the screen grows the page instead
+          of having its top cut off. --}}
+    <div class="container mx-auto flex min-h-screen items-center justify-center px-4 py-12">
+
+        <div class="w-full max-w-4xl">
+
+            <div class="card bg-base-100 overflow-hidden shadow-lg">
+                <div class="grid grid-cols-1 lg:grid-cols-2">
+                    <div class="bg-login-page-image hidden lg:block"></div>
+                    <div class="alert-margin">
+                        {{> alerts}}
+
+                        <div class="p-12">
+
+                            {{{content}}}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script data-cfasync="false" src="/static/js/flyonui.js"></script>
+    <script data-cfasync="false" src="/static/js/ui.js"></script>
+
+    <script data-cfasync="false" src="/static/js/app.js"></script>
+
+    {{#if passkeysAvailable}}
+    <script data-cfasync="false" src="/static/vendor/simplewebauthn/browser.min.js"></script>
+    <script data-cfasync="false" src="/static/js/login-passkey.js"></script>
+    {{/if}}
+
+</body>
+
+</html>

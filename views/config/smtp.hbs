@@ -1,0 +1,214 @@
+{{!-- live state badge: app.js updates the badge-{type} class, text and error
+      tooltip through the /admin/changes SSE feed (targets .state-info[data-type]) --}}
+{{> ui/page-header title="SMTP Server" icon="icon-[tabler--server]" stateLabel=serverState.label stateType="smtp" class="mb-1"}}
+
+<p>Let applications submit email through EmailEngine using SMTP. You can also send email with the <a
+        href="/admin/reference/submit#postV1AccountAccountSubmit" target="_blank" rel="noopener noreferrer"
+        referrerpolicy="no-referrer" class="link link-animated">submission API</a>.</p>
+<p class="mb-6">Set the address, authentication, and TLS options for the SMTP server.</p>
+
+{{> ui/env-managed-alert}}
+
+<form method="post" action="/admin/config/smtp">
+    {{!-- no id: the layout already renders the #crumb element the script reads --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">Server Configuration</h6>
+        </div>
+
+        <div class="px-6 py-4 border-b border-base-content/10 ee-toggle-row flex items-start justify-between gap-4">
+            {{> ui/checkbox id="smtpServerEnabled" name="smtpServerEnabled" label="Enable SMTP Server"
+            checked=values.smtpServerEnabled error=errors.smtpServerEnabled
+            hint="Start the SMTP server to accept email submissions."}}
+
+            <div class="text-end">
+                {{> ui/setting-ref name="smtpServerEnabled" class="whitespace-nowrap"}}
+            </div>
+        </div>
+
+        <div class="card-body space-y-4">
+
+
+            <div>
+                {{> ui/setting-ref name="smtpServerPort"}}
+                {{#> ui/form-field id="smtpServerPort" label="Port" error=errors.smtpServerPort}}
+                <input type="number" class="input trigger-example-render{{#if errors.smtpServerPort}} is-invalid{{/if}}"
+                    id="smtpServerPort" name="smtpServerPort" value="{{values.smtpServerPort}}" />
+                <span class="helper-text">TCP port for SMTP connections. Ports below 1024 may require elevated
+                    privileges.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="smtpServerHost"}}
+                {{#> ui/form-field id="smtpServerHost" label="Listen Address" error=errors.smtpServerHost}}
+                <input type="text"
+                    class="input basicAutoComplete trigger-example-render{{#if errors.smtpServerHost}} is-invalid{{/if}}"
+                    id="smtpServerHost" name="smtpServerHost" value="{{values.smtpServerHost}}" data-lpignore="true"
+                    autocomplete="off" />
+                <span class="helper-text">IP address the server listens on. Use "0.0.0.0" or leave blank to listen on all IPv4 interfaces.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="smtpServerProxy"}}
+                {{> ui/checkbox id="smtpServerProxy" name="smtpServerProxy" label="Enable PROXY Protocol"
+                checked=values.smtpServerProxy error=errors.smtpServerProxy}}
+                <span class="helper-text">Required when using HAProxy with <code>send-proxy</code>. The PROXY header is trusted from any peer, so only enable this when the port is reachable through the load balancer alone.</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">Authentication</h6>
+        </div>
+        <div class="card-body space-y-4">
+            <div>
+                {{> ui/setting-ref name="smtpServerAuthEnabled"}}
+                {{> ui/checkbox id="smtpServerAuthEnabled" name="smtpServerAuthEnabled" label="Require Authentication"
+                class="trigger-example-render" checked=values.smtpServerAuthEnabled
+                error=errors.smtpServerAuthEnabled}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="smtpServerPassword"}}
+                {{#> ui/form-field id="smtpServerPassword" label="Global Password" error=errors.smtpServerPassword}}
+                {{> ui/secret-field id="smtpServerPassword" value=values.smtpServerPassword
+                error=errors.smtpServerPassword placeholder="No global password set"
+                inputClass="trigger-example-render" toggleId="showPassword"}}
+                <span class="helper-text">Optional shared password for all accounts. Leave empty to use only access
+                    tokens.</span>
+                {{/ui/form-field}}
+            </div>
+        </div>
+
+        <div class="card-footer border-base-content/10 border-t px-6 py-4">
+            <small class="text-base-content/60">
+                <span class="icon-[tabler--info-circle] size-4 align-text-bottom"></span>
+
+                <strong>How to authenticate:</strong> Use account IDs as usernames. For passwords, use either the global
+                password above or <a href="/admin/tokens" class="link link-animated">access tokens</a> with SMTP scope.
+            </small>
+        </div>
+
+    </div>
+
+    {{> tls_security_card field="smtpServerTLSEnabled"}}
+
+    {{#> ui/details summary="Integration Examples" class="card bg-base-100 shadow-md mb-6"}}
+
+    <p><strong>With authentication enabled:</strong> Use the account ID as the username. Use an access token with
+        SMTP scope or the global password as the password.</p>
+
+    <p class="mb-4"><strong>With authentication disabled:</strong> Include the <code>X-EE-Account</code> header
+        with the account ID in your messages.</p>
+
+    {{#> ui/tabs label="Integration examples" elId="code-examples"}}
+    {{> ui/tab target="example-nodemailer" label="Node.js (Nodemailer)" active=true}}
+    {{> ui/tab target="example-phpmailer" label="PHP (PHPMailer)"}}
+    {{/ui/tabs}}
+
+    <div class="mt-4 mb-4">
+        <div id="example-nodemailer" role="tabpanel" aria-labelledby="example-nodemailer-tab">
+
+            <pre class="ee-code-block"><code id="example-nodemailer-code"></code></pre>
+
+        </div>
+
+        <div id="example-phpmailer" class="hidden" role="tabpanel" aria-labelledby="example-phpmailer-tab">
+
+            <pre class="ee-code-block"><code id="example-phpmailer-code"></code></pre>
+
+        </div>
+    </div>
+
+    <div>
+        {{> ui/checkbox id="exampleShowPassword" noName=true label="Show password in examples" class="trigger-example-render"}}
+    </div>
+
+    {{/ui/details}}
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--settings]"}}
+    </div>
+
+</form>
+
+
+<input type="hidden" id="availableAddresses" value="{{availableAddresses}}">
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        let availableAddresses = document.getElementById('availableAddresses').value.split(',').map(e => e.trim()).filter(e => e);
+        uiDatalist('available-addresses-list', availableAddresses, document.querySelectorAll('.basicAutoComplete'));
+
+
+        let renderExamples = uiCodeExamples({
+            header: `// Replace "USERNAME" with the account id of a registered user you want to send mail as
+// Replace "HOST" with the hostname or IP address of the SMTP interface
+// NB! Make sure that firewall settings allow accessing the SMTP interface
+
+`,
+            portField: 'smtpServerPort',
+            passwordField: 'smtpServerPassword',
+            passwordFallback: '<smtp-access-token>',
+            authField: 'smtpServerAuthEnabled',
+            replacements: {
+                NODEMAILER_TLS: () => document.getElementById('smtpServerTLSEnabled').checked ? 'true' : 'false',
+                PHPMAILER_TLS: () => document.getElementById('smtpServerTLSEnabled').checked ? 'tls' : ''
+            },
+            templates: {
+                nodemailer: {
+                    lang: 'javascript',
+                    target: 'example-nodemailer-code',
+                    codeAuth: `const transporter = nodemailer.createTransport({
+    host: 'HOST',
+    port: PORT,
+    secure: NODEMAILER_TLS,
+    auth: {
+        user: 'USERNAME',
+        pass: 'PASSWORD'
+    }
+}});`,
+                    codeNoAuth: `const transporter = nodemailer.createTransport({
+    host: 'HOST',
+    port: PORT,
+    secure: NODEMAILER_TLS,
+    auth: false
+}}, {
+    // default message fields
+    headers: {
+        // provide sending account id via this header
+        'X-EE-Account': 'USERNAME'
+    }
+});`},
+
+                phpmailer: {
+                    lang: 'php',
+                    target: 'example-phpmailer-code',
+                    codeAuth: `$mail = new PHPMailer(true);
+$mail->isSMTP();
+$mail->Host = 'HOST';
+$mail->SMTPAuth = true;
+$mail->Username = 'USERNAME';
+$mail->Password = 'PASSWORD';
+$mail->SMTPSecure = 'PHPMAILER_TLS';
+$mail->Port = PORT;`,
+                    codeNoAuth: `$mail = new PHPMailer(true);
+$mail->isSMTP();
+$mail->Host = 'HOST';
+$mail->SMTPAuth = false;
+$mail->SMTPSecure = 'PHPMAILER_TLS';
+$mail->Port = PORT;
+
+// provide sending account id via this header
+$mail->addCustomHeader('X-EE-Account', 'USERNAME');
+`}
+            }
+        });
+    });
+</script>

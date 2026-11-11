@@ -1,0 +1,459 @@
+{{> oauth_config_header}}
+
+{{> ui/breadcrumb parentHref="/admin/config/oauth" parentLabel="OAuth2 Apps" current=app.name class="mt-6 mb-6"}}
+
+{{#> ui/stat-card variant="info" icon="icon-[tabler--info-circle]" class="mb-6"}}
+{{>scope_info}}
+{{/ui/stat-card}}
+
+{{#> ui/card}}
+
+        {{#> ui/detail-toolbar label="OAuth2 app actions"}}
+
+        {{#if canAddServiceAccount}}
+        {{!-- registering an account is the primary action for a service application --}}
+        {{#> ui/tooltip text="Register an email account that authenticates through this service application"}}
+        <button type="button" class="btn btn-primary btn-sm" data-overlay="#addServiceAccountModal"
+            id="add-service-account-btn">
+            <span class="icon-[tabler--user-plus] size-4"></span> Add account
+        </button>
+        {{/ui/tooltip}}
+        {{/if}}
+
+        {{#> ui/tooltip text="Edit OAuth2 application"}}
+        {{> ui/btn variant="primary" style="outline" size="sm" href=(concat "/admin/config/oauth/edit/" app.id) icon="icon-[tabler--user-edit]" label="Edit app"}}
+        {{/ui/tooltip}}
+
+        {{#> ui/tooltip text="Run live checks against the provider"}}
+        {{> ui/btn bare=true style="soft" size="sm" overlay="#verifySetupModal" id="verify-btn" icon="icon-[tabler--clipboard-check]" label="Verify setup"}}
+        {{/ui/tooltip}}
+
+        {{> ui/overflow-menu label="More OAuth2 app actions" deleteLabel="Delete app"}}
+        {{/ui/detail-toolbar}}
+
+        {{#*inline "appStatusBadge"}}
+        {{#if app.enabled}}
+        {{#if app.meta.authFlag}}
+        {{> ui/badge label="Failing" variant="error"}}
+        {{else}}
+        {{> ui/badge label="Enabled" variant="success"}}
+        {{/if}}
+        {{else}}
+        {{> ui/badge label="Disabled" variant="warning"}}
+        {{/if}}
+        {{/inline}}
+        <h6 class="card-title{{#unless app.description}} mb-6{{/unless}}">{{app.name}} {{> appStatusBadge}}</h6>
+        {{#if app.description}}
+        <h6 class="mb-6 text-base-content/60">{{app.description}}</h6>
+        {{/if}}
+
+        {{#if app.meta.authFlag}}
+        <div class="alert alert-soft alert-error mb-6 block">{{app.meta.authFlag.message}}
+
+            {{#if app.meta.authFlag.description}}
+            <hr class="my-2">
+            <p class="mb-0">
+                <small>{{app.meta.authFlag.description}}</small>
+            </p>
+            {{/if}}
+
+        </div>
+        {{/if}}
+
+        {{#if app.meta.ttlWarning}}
+        <div class="alert alert-soft alert-warning mb-6 block">{{app.meta.ttlWarning.message}}
+            {{#if app.meta.ttlWarning.description}}
+            <hr class="my-2">
+            <p class="mb-0">
+                <small>{{app.meta.ttlWarning.description}}</small>
+            </p>
+            {{/if}}
+        </div>
+        {{/if}}
+
+        <dl class="ee-dl">
+            <dt>Provider ID</dt>
+            <dd>
+                {{> ui/copy-field id="appIdValue" value=app.id ariaLabel="ID" small=true join=true
+                class="w-full max-w-md" inputClass="bg-base-200 border-0"}}
+                <span class="helper-text" id="inputDescriptionHelp">Use this ID as the
+                    <em>"provider"</em> property in the account's OAuth2 options.</span>
+            </dd>
+
+            <dt>Type</dt>
+            <dd>{{providerData.comment}} {{#if providerData.icon}}
+                <span class="{{providerData.icon}} size-4 align-text-bottom"></span>
+                {{/if}}
+            </dd>
+
+            {{#if app.cloudData}}
+            <dt>Cloud environment</dt>
+            <dd>{{app.cloudData.name}} <em>-
+                    {{app.cloudData.description}}</em></dd>
+            {{/if}}
+
+            <dt>Accounts</dt>
+            <dd class="font-mono"><small>{{app.accounts}}</small></dd>
+
+            {{#if app.clientId}}
+            <dt>Client ID</dt>
+            <dd class="font-mono"><small>{{app.clientId}}</small></dd>
+            {{/if}}
+
+            {{#if app.serviceClient}}
+            <dt>Service client</dt>
+            <dd class="font-mono"><small>{{app.serviceClient}}</small></dd>
+            {{/if}}
+
+            {{#if app.googleProjectId}}
+            <dt>Google Cloud Project ID</dt>
+            <dd class="font-mono"><small>{{app.googleProjectId}}</small></dd>
+            {{/if}}
+
+            {{#if app.serviceClientEmail}}
+            <dt>Service account email</dt>
+            <dd class="font-mono"><small>{{app.serviceClientEmail}}</small></dd>
+            {{/if}}
+
+            {{#if app.clientSecret}}
+            <dt>Client Secret</dt>
+            <dd class="font-mono"><small>*****</small></dd>
+            {{/if}}
+
+            {{#if app.serviceKey}}
+            <dt>Private key</dt>
+            <dd class="font-mono"><small>*****</small></dd>
+            {{/if}}
+
+            {{#if appShowAuthMethod}}
+            <dt>Authentication method</dt>
+            <dd>
+                {{#if authMethodIsExternalAccount}}
+                Workload Identity Federation
+                {{else if authMethodIsMetadataServer}}
+                Attached service account (metadata server)
+                {{else}}
+                Service account key
+                {{/if}}
+            </dd>
+            {{/if}}
+
+            {{#if app.externalAccount}}
+            <dt>External account config</dt>
+            <dd class="font-mono"><small>***** (set)</small></dd>
+            {{/if}}
+
+            {{#if app.redirectUrl}}
+            <dt>Redirect URL</dt>
+            <dd class="font-mono"><small>{{app.redirectUrl}}</small></dd>
+            {{/if}}
+
+            <dt>Base scopes</dt>
+            <dd>
+
+                {{#if baseScopesImap}}
+                IMAP and SMTP
+                {{/if}}
+
+                {{#if baseScopesApi}}
+                API
+                {{/if}}
+
+                {{#if baseScopesPubsub}}
+                Cloud Pub/Sub
+                {{/if}}
+
+            </dd>
+
+            {{#if app.pubSubApp}}
+            <dt>Cloud Pub/Sub app for webhooks</dt>
+            <dd>
+
+                {{#if app.pubSubAppData}}
+                <a href="/admin/config/oauth/app/{{app.pubSubAppData.id}}"
+                    class="link link-animated">{{app.pubSubAppData.name}}{{#if
+                    app.pubSubAppData.description}} - <em>{{app.pubSubAppData.description}}</em>{{/if}}</a>
+                {{else}}
+                <em>App set but not found</em>
+                {{/if}}
+
+            </dd>
+            {{/if}}
+
+            {{#if app.extraScopes}}
+            <dt>Custom OAuth2 scopes</dt>
+            <dd>
+                <ul class="list-disc ps-6">
+                    {{#each app.extraScopes}}
+                    <li class="font-mono"><small>{{ this }}</small></li>
+                    {{/each}}
+                </ul>
+            </dd>
+            {{/if}}
+
+            {{#if app.skipScopes}}
+            <dt>Disabled OAuth2 scopes</dt>
+            <dd>
+                <ul class="list-disc ps-6">
+                    {{#each app.skipScopes}}
+                    <li class="font-mono"><small>{{ this }}</small></li>
+                    {{/each}}
+                </ul>
+            </dd>
+            {{/if}}
+
+        </dl>
+
+    
+{{/ui/card}}
+
+{{#if isServiceAccount}}
+{{#> ui/card title="API usage example"}}
+        <p class="text-base-content/60 text-sm mb-2">This application uses service credentials, so accounts cannot be
+            added through the hosted authentication form. Use the API to register email accounts instead.</p>
+        <pre
+            class="ee-code-block mb-0 whitespace-pre-wrap break-words"><code>curl -XPOST "{{serviceUrl}}/v1/account" \
+  -H "Authorization: Bearer <span class="text-error">YOUR_ACCESS_TOKEN</span>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account": "<span class="text-error">ACCOUNT_ID</span>",
+    "email": "<span class="text-error">user@example.com</span>",
+    "oauth2": {
+        "provider": "{{app.id}}",
+        "auth": {
+            "user": "<span class="text-error">user@example.com</span>"
+        }
+    }
+}'</code></pre>
+        <span class="helper-text mt-2">Replace <span class="text-error">highlighted values</span> with your own. The
+            access token is an API token generated in <a href="/admin/tokens" class="link link-animated">access
+                tokens</a>.</span>
+    
+{{/ui/card}}
+{{/if}}
+
+{{#if baseScopesPubsub}}
+{{#> ui/card title="Cloud Pub/Sub configuration"}}
+
+        {{#if app.meta.pubSubFlag}}
+        <div class="alert alert-soft alert-error mb-6 block">{{app.meta.pubSubFlag.message}}
+
+            {{#if app.meta.pubSubFlag.description}}
+            <hr class="my-2">
+            <p class="mb-0">
+                <small>{{app.meta.pubSubFlag.description}}</small>
+            </p>
+            {{/if}}
+
+        </div>
+        {{/if}}
+
+        <dl class="ee-dl">
+            <dt>Pub/Sub topic</dt>
+            <dd>
+                {{#if app.pubSubTopic}}
+                {{#> ui/tooltip text=app.pubSubTopic}}
+                {{> ui/badge label="Created" variant="success"}}
+                {{/ui/tooltip}}
+                <small class="font-mono">{{lastVal app.pubSubTopic "/"}}</small>
+                {{else}}
+                {{> ui/badge label="Not set" variant="warning"}}
+                {{/if}}
+            </dd>
+
+            <dt>Pub/Sub subscription</dt>
+            <dd>
+                {{#if app.pubSubSubscription}}
+                {{#> ui/tooltip text=app.pubSubSubscription}}
+                {{> ui/badge label="Created" variant="success"}}
+                {{/ui/tooltip}}
+                <small class="font-mono">{{lastVal app.pubSubSubscription "/"}}</small>
+                {{else}}
+                {{> ui/badge label="Not set" variant="warning"}}
+                {{/if}}
+            </dd>
+
+            <dt>Gmail publishing bindings</dt>
+            <dd>
+                {{#if app.pubSubIamPolicy}}
+                {{#> ui/tooltip text=(concat app.pubSubIamPolicy.members.[0] ": " app.pubSubIamPolicy.role)}}
+                {{> ui/badge label="Created" variant="success"}}
+                {{/ui/tooltip}}
+                {{else}}
+                {{> ui/badge label="Not set" variant="warning"}}
+                {{/if}}
+            </dd>
+        </dl>
+    
+{{/ui/card}}
+{{/if}}
+
+
+{{#> ui/confirm-modal id="deleteModal" title="Delete OAuth2 app" action="/admin/config/oauth/delete"
+fieldName="app" fieldValue=app.id submitLabel="Delete app" submitIcon="icon-[tabler--trash]"}}
+<p>Delete the OAuth2 app "{{app.name}}"? Accounts using this app will stop working until reconfigured. This action cannot be undone.</p>
+{{/ui/confirm-modal}}
+
+{{#> ui/modal id="verifySetupModal" title="Verify OAuth2 setup" titleId="verifySetupModalLabel" dialogClass="max-w-3xl"}}
+<div class="modal-body">
+    <input type="hidden" id="verify-crumb" value="{{crumb}}" />
+    <p class="mb-2"><small class="text-base-content/60">Runs the provider authentication chain step by step and reports
+            what passes or fails.{{#if appShowAuthMethod}} Enter a mailbox address in your Workspace domain to also
+            verify domain-wide delegation and live mailbox access.{{/if}}</small></p>
+
+    <div class="mb-4">
+        <div class="join w-full">
+            <input type="email" class="input join-item grow" id="verify-account"
+                placeholder="mailbox@example.com (optional)" autocomplete="off" />
+            <button type="button" class="btn btn-primary join-item" id="verify-run-btn">
+                <span class="icon-[tabler--player-play] size-4"></span> Run test
+            </button>
+        </div>
+        <span class="helper-text">Leave empty to check configuration and signing only.</span>
+    </div>
+
+    <div id="verify-pending" class="hidden">
+        <p><span class="loading loading-spinner loading-sm align-middle"></span> Running checks, please wait&mldr;</p>
+    </div>
+    <div id="verify-error" class="hidden">
+        <small class="alert alert-soft alert-error font-mono error-message block"></small>
+    </div>
+    <div id="verify-verdict" class="hidden mb-4"></div>
+    <ul id="verify-steps" class="border-base-content/10 divide-base-content/10 rounded-box divide-y border empty:hidden">
+    </ul>
+</div>
+<div class="modal-footer">
+    {{> ui/btn label="Close" variant="neutral" style="soft" overlay="#verifySetupModal"}}
+</div>
+{{/ui/modal}}
+
+{{#if canAddServiceAccount}}
+{{#> ui/modal id="addServiceAccountModal" title="Add an account" titleId="addServiceAccountLabel"}}
+<form method="post" action="/admin/config/oauth/app/{{app.id}}/add-account">
+    <input type="hidden" name="crumb" value="{{crumb}}">
+    <div class="modal-body space-y-4">
+        <p><small class="text-base-content/60">This service application authenticates without an interactive consent
+                screen, so the account is registered directly. The mailbox must be reachable with the
+                application's service credentials.</small></p>
+        <div>
+            {{> ui/form-field id="service-account-name" name="name" label="Full name" placeholder="e.g., John Smith"}}
+        </div>
+        <div>
+            {{#> ui/form-field id="service-account-email" label="Email address"}}
+            <input type="email" class="input" id="service-account-email" name="email"
+                placeholder="e.g., user@example.com" required>
+            {{/ui/form-field}}
+        </div>
+        <div>
+            {{> ui/form-field id="service-account-id" name="account" label="Account ID (optional)"
+            placeholder="e.g., account_123"
+            hint="Leave blank to generate an ID. Using an existing ID updates that account."}}
+        </div>
+    </div>
+    <div class="modal-footer">
+        {{> ui/btn label="Cancel" variant="neutral" style="soft" overlay="#addServiceAccountModal"}}
+        {{> ui/btn label="Add account" type="submit" icon="icon-[tabler--user-plus]"}}
+    </div>
+</form>
+{{/ui/modal}}
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+        document.getElementById('addServiceAccountModal').addEventListener('open.overlay', () => {
+            document.getElementById('service-account-name').focus();
+        });
+    });
+</script>
+{{/if}}
+
+<input type="hidden" id="verify-app-id" value="{{app.id}}">
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+        const appId = document.getElementById('verify-app-id').value;
+        const stepsElm = document.getElementById('verify-steps');
+        const pendingElm = document.getElementById('verify-pending');
+        const errorElm = document.getElementById('verify-error');
+        const verdictElm = document.getElementById('verify-verdict');
+        const runBtn = document.getElementById('verify-run-btn');
+        const accountInput = document.getElementById('verify-account');
+
+        const ICONS = {
+            ok: '<span class="icon-[tabler--circle-check] text-success size-4 align-text-bottom"></span>',
+            fail: '<span class="icon-[tabler--circle-x] text-error size-4 align-text-bottom"></span>',
+            skip: '<span class="icon-[tabler--circle-minus] text-base-content/50 size-4 align-text-bottom"></span>'
+        };
+
+        const esc = str => {
+            let div = document.createElement('div');
+            div.textContent = str == null ? '' : String(str);
+            return div.innerHTML;
+        };
+
+        const renderResult = data => {
+            stepsElm.innerHTML = '';
+            (data.steps || []).forEach(step => {
+                let li = document.createElement('li');
+                li.className = 'p-4';
+                let html = `${ICONS[step.status] || ''} <strong>${esc(step.label)}</strong>`;
+                if (step.message) {
+                    html += `<div class="text-sm text-base-content/60 ms-6">${esc(step.message)}</div>`;
+                }
+                if (step.hint) {
+                    html += `<div class="text-sm text-info ms-6"><span class="icon-[tabler--bulb] size-4 align-text-bottom"></span> ${esc(step.hint)}</div>`;
+                }
+                li.innerHTML = html;
+                stepsElm.appendChild(li);
+            });
+
+            let failed = (data.steps || []).some(s => s.status === 'fail');
+            verdictElm.className = 'mb-4 alert alert-soft ' + (failed ? 'alert-error' : 'alert-success');
+            verdictElm.textContent = failed
+                ? 'Setup has problems - review the failing step(s) below.'
+                : 'Setup verified - all checks passed.';
+            verdictElm.classList.remove('hidden');
+        };
+
+        const runVerify = async account => {
+            errorElm.classList.add('hidden');
+            verdictElm.classList.add('hidden');
+            stepsElm.innerHTML = '';
+            pendingElm.classList.remove('hidden');
+            runBtn.disabled = true;
+            try {
+                let res = await fetch(`/admin/config/oauth/verify/${encodeURIComponent(appId)}`, {
+                    method: 'post',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({
+                        crumb: document.getElementById('verify-crumb').value,
+                        account: account || '',
+                        testConnection: true
+                    })
+                });
+                let data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.error || `HTTP ${res.status}`);
+                }
+                renderResult(data);
+            } catch (err) {
+                errorElm.querySelector('.error-message').textContent = err.message;
+                errorElm.classList.remove('hidden');
+            } finally {
+                pendingElm.classList.add('hidden');
+                runBtn.disabled = false;
+            }
+        };
+
+        document.getElementById('verifySetupModal').addEventListener('open.overlay', () => {
+            // Auto-run the no-mailbox checks (config + signing chain) on open.
+            runVerify(accountInput.value.trim());
+        });
+
+        runBtn.addEventListener('click', () => runVerify(accountInput.value.trim()));
+        accountInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                runVerify(accountInput.value.trim());
+            }
+        });
+    });
+</script>

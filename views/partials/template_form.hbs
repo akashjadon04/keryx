@@ -1,0 +1,82 @@
+<input type="hidden" id="contentHtmlJson" value="{{contentHtmlJson}}">
+<input type="hidden" id="contentTextJson" value="{{contentTextJson}}">
+
+<input type="hidden" id="contentHtml" name="contentHtml" value="">
+<input type="hidden" id="contentText" name="contentText" value="">
+
+{{#> ui/card bodyClass="space-y-4"}}
+
+        {{> ui/form-field id="inputName" name="name" label="Name" value=values.name error=errors.name required=true hint="Name shown in the template list."}}
+
+        {{> ui/form-field id="inputDescription" name="description" label="Description" value=values.description error=errors.description hint="Describe when to use this template."}}
+
+        {{> ui/form-field id="inputSubject" name="subject" label="Subject" value=values.subject error=errors.subject hint="Subject line for the sent email. Handlebars syntax is allowed."}}
+
+        {{> ui/form-field id="inputPreviewText" name="previewText" label="Preview text" value=values.previewText error=errors.previewText hint="Preview text appears in the inbox after the subject line. Handlebars syntax is allowed."}}
+
+        {{#> ui/form-field id="inputFormat" label="HTML source format" error=errors.format hint="Choose whether to write the email body in HTML or Markdown."}}
+        <select class="select{{#if errors.format}} is-invalid{{/if}}" id="inputFormat" name="format">
+            {{#each formats}}
+            <option value="{{format}}" {{#if selected}}selected{{/if}}>{{name}}</option>
+            {{/each}}
+        </select>
+        {{/ui/form-field}}
+
+        <div>
+            {{#> ui/tabs label="Template content"}}
+            {{> ui/tab target="html" label="HTML" active=true}}
+            {{> ui/tab target="text" label="Plain text"}}
+            {{/ui/tabs}}
+            <div class="mt-4">
+                <div id="html" role="tabpanel" aria-labelledby="html-tab">
+
+                    {{#> ui/code-editor id="editor-html" title="HTML content"}}
+                    <div class="editor-embed-content editor-embed-content-right">
+                        <a href="https://learn.emailengine.app/docs/sending/templates#template-syntax" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">Variables syntax
+                            help</a>
+                    </div>
+
+                    
+                    {{/ui/code-editor}}
+
+                </div>
+                <div id="text" class="hidden" role="tabpanel" aria-labelledby="text-tab">
+
+                    {{#> ui/code-editor id="editor-text" title="Text content"}}
+                    <div class="editor-embed-content editor-embed-content-right">
+                        <a href="https://learn.emailengine.app/docs/sending/templates#template-syntax" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">Variables syntax
+                            help</a>
+                    </div>
+                    
+                    {{/ui/code-editor}}
+
+                </div>
+            </div>
+        </div>
+
+    
+{{/ui/card}}
+
+{{!-- Shared by templates/new and templates/edit: both render this exact form
+      (ids included), so the ACE editor bootstrap lives here instead of per page. --}}
+{{> ace_assets}}
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        const editors = new Map();
+
+        const editorHtml = uiAceEditor("editor-html", "handlebars", JSON.parse(document.getElementById('contentHtmlJson').value || '""'));
+        editors.set("editor-html", editorHtml);
+
+        const editorText = uiAceEditor("editor-text", "handlebars", JSON.parse(document.getElementById('contentTextJson').value || '""'));
+        editors.set("editor-text", editorText);
+
+        document.getElementById('edit-form').addEventListener('submit', () => {
+            document.getElementById('contentHtml').value = editorHtml.getValue();
+            document.getElementById('contentText').value = editorText.getValue();
+        });
+
+        uiEditorFullscreen(editors);
+    });
+</script>

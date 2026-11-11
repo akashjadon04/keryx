@@ -1,0 +1,1522 @@
+'use strict';
+
+require('dotenv').config({ quiet: true });
+
+const config = require('@zone-eu/wild-config');
+const testConfig = require('./test-config');
+const supertest = require('supertest');
+const test = require('node:test');
+const assert = require('node:assert').strict;
+const nodemailer = require('nodemailer');
+const Redis = require('ioredis');
+const redis = new Redis(config.dbs.redis);
+const webhooksServer = require('./webhooks-server');
+const { skipUnlessEnv } = require('./helpers');
+
+const { fetch: fetchCmd } = require('undici');
+
+const accessToken = '2aa97ad0456d6624a55d30780aa2ff61bfb7edc6fa00935b40814b271e718660';
+
+const server = supertest.agent(`http://127.0.0.1:${config.api.port}`).auth(accessToken, { type: 'bearer' });
+
+// The IMAP section runs against an Ethereal account and needs no secrets; every provider section is
+// skipped when its credentials are missing (Dependabot and fork pull requests, a fresh checkout).
+// Subtests within a section depend on each other, so each section is gated as a whole.
+const gmailSkip = skipUnlessEnv(
+    'GMAIL_API_PROJECT_ID',
+    'GMAIL_API_CLIENT_ID',
+    'GMAIL_API_CLIENT_SECRET',
+    'GMAIL_API_ACCOUNT_EMAIL_1',
+    'GMAIL_API_ACCOUNT_REFRESH_1',
+    'GMAIL_API_ACCOUNT_EMAIL_2',
+    'GMAIL_API_ACCOUNT_REFRESH_2',
+    'GMAIL_API_SERVICE_CLIENT',
+    'GMAIL_API_SERVICE_EMAIL',
+    'GMAIL_API_SERVICE_KEY'
+);
+// The send-only section reads a message the Gmail section received and sends to Gmail account 2
+const gmailSendOnlySkip =
+    gmailSkip ||
+    skipUnlessEnv(
+        'GMAIL_SENDONLY_PROJECT_ID',
+        'GMAIL_SENDONLY_CLIENT_ID',
+        'GMAIL_SENDONLY_CLIENT_SECRET',
+        'GMAIL_SENDONLY_ACCOUNT_EMAIL',
+        'GMAIL_SENDONLY_ACCOUNT_REFRESH'
+    );
+const outlookSkip = skipUnlessEnv('OUTLOOK_SERVICE_CLIENT_ID', 'OUTLOOK_SERVICE_CLIENT_SECRET', 'OUTLOOK_SERVICE_TENANT_ID', 'OUTLOOK_SERVICE_ACCOUNT_EMAIL');
+const gmailServiceSkip = skipUnlessEnv(
+    'GMAIL_SERVICE_POSTALSYS_CLIENT',
+    'GMAIL_SERVICE_POSTALSYS_SERVICE_EMAIL',
+    'GMAIL_SERVICE_POSTALSYS_KEY',
+    'GMAIL_SERVICE_POSTALSYS_ACCOUNT_EMAIL'
+);
+
+let testAccount;
+const defaultAccountId = 'main-account';
+const gmailAccountId1 = 'gmail-account1';
+const gmailAccountId2 = 'gmail-account2';
+const gmailSendOnlyAccountId = 'gmail-sendonly-account';
+const outlookServiceAccountId = 'outlook-service-account';
+const gmailServiceAccountId = 'gmail-service-account';
+
+// Helper: acquire MS Graph token using client_credentials flow
+async function getGraphToken() {
+    let tokenRes = await fetchCmd(`https://login.microsoftonline.com/${process.env.OUTLOOK_SERVICE_TENANT_ID}/oauth2/v2.0/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            client_id: process.env.OUTLOOK_SERVICE_CLIENT_ID,
+            client_secret: process.env.OUTLOOK_SERVICE_CLIENT_SECRET,
+            scope: 'https://graph.microsoft.com/.default',
+            grant_type: 'client_credentials'
+        })
+    });
+    let tokenData = await tokenRes.json();
+    return tokenData.access_token;
+}
+
+// Provision an Ethereal test account whose SMTP AUTH actually works. Ethereal
+// occasionally hands out an account that authenticates over IMAP but is rejected
+// over SMTP with "535 Authentication failed"; such an account breaks the message
+// submission tests with an opaque webhook timeout. Verify SMTP up front and pick
+// another account if the first one is not usable.
+async function createUsableTestAccount(attempts = 5) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+        const acct = await nodemailer.createTestAccount();
+        const transport = nodemailer.createTransport({
+            host: acct.smtp.host,
+            port: acct.smtp.port,
+            secure: acct.smtp.secure,
+            auth: { user: acct.user, pass: acct.pass }
+        });
+        try {
+            await transport.verify();
+            return acct;
+        } catch (err) {
+            lastErr = err;
+        } finally {
+            transport.close();
+        }
+    }
+    throw new Error(`Could not provision a usable Ethereal test account: ${lastErr && lastErr.message}`);
+}
+
+// Helper function for polling with timeout
+async function waitForCondition(checkFn, options = {}) {
+    const { interval = testConfig.POLL_INTERVAL, timeout = testConfig.DEFAULT_TIMEOUT, message = 'Condition not met within timeout' } = options;
+
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeout) {
+        const result = await checkFn();
+        if (result) {
+            return result;
+        }
+        await new Promise(r => setTimeout(r, interval));
+    }
+
+    throw new Error(`Timeout: ${typeof message === 'function' ? message() : message}`);
+}
+
+// Poll until all expected account-lifecycle webhooks have been delivered to the shared receiver.
+// Webhooks are delivered ASYNCHRONOUSLY via the notify queue, so they lag the account reaching
+// 'connected' state by a few ms (accountInitialized in particular fires right around the state
+// change). Reading webhooksServer.webhooks.get(account) synchronously the instant the account
+// connects therefore raced that delivery and flaked. Poll instead, the same way every other webhook
+// assertion in this file does. (.get() can also be undefined before the first webhook lands, hence
+// the `|| []`.)
+async function waitForAccountWebhooks(account, events = ['accountAdded', 'authenticationSuccess', 'accountInitialized']) {
+    await waitForCondition(
+        async () => {
+            const webhooks = webhooksServer.webhooks.get(account) || [];
+            return events.every(event => webhooks.some(wh => wh.event === event));
+        },
+        { timeout: testConfig.WEBHOOK_TIMEOUT, message: `expected account webhooks [${events.join(', ')}] not received for ${account}` }
+    );
+}
+
+test('API tests', async t => {
+    let message2;
+    let oauth2PubsubId;
+    let oauth2AppId;
+
+    let gmailReceivedEmailId;
+    let gmailReceivedMessageId;
+
+    let oauth2SendOnlyAppId;
+
+    let outlookServiceAppId;
+    let outlookReceivedEmailId;
+
+    let gmailServiceAppId;
+
+    t.before(async () => {
+        testAccount = await createUsableTestAccount();
+        await webhooksServer.init();
+    });
+
+    t.after(async () => {
+        redis.quit();
+        await webhooksServer.quit();
+    });
+
+    await t.test('list existing users (empty list)', async () => {
+        const response = await server.get(`/v1/accounts`).expect(200);
+
+        assert.strictEqual(response.body.accounts.length, 0);
+    });
+
+    await t.test('Verify IMAP account', async () => {
+        const response = await server
+            .post(`/v1/verifyAccount`)
+            .send({
+                mailboxes: true,
+                imap: {
+                    host: testAccount.imap.host,
+                    port: testAccount.imap.port,
+                    secure: testAccount.imap.secure,
+                    auth: {
+                        user: testAccount.user,
+                        pass: testAccount.pass
+                    }
+                },
+                smtp: {
+                    host: testAccount.smtp.host,
+                    port: testAccount.smtp.port,
+                    secure: testAccount.smtp.secure,
+                    auth: {
+                        user: testAccount.user,
+                        pass: testAccount.pass
+                    }
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.imap.success, true);
+        assert.strictEqual(response.body.smtp.success, true);
+        // Check if Inbox folder exists
+        assert.ok(response.body.mailboxes.some(mb => mb.specialUse === '\\Inbox'));
+    });
+
+    await t.test('Register new IMAP account', async () => {
+        const response = await server
+            .post(`/v1/account`)
+            .send({
+                account: defaultAccountId,
+                name: 'Test User 🫥',
+                email: testAccount.user,
+                imap: {
+                    host: testAccount.imap.host,
+                    port: testAccount.imap.port,
+                    secure: testAccount.imap.secure,
+                    auth: {
+                        user: testAccount.user,
+                        pass: testAccount.pass
+                    },
+                    resyncDelay: 60 * 1000
+                },
+                smtp: {
+                    host: testAccount.smtp.host,
+                    port: testAccount.smtp.port,
+                    secure: testAccount.smtp.secure,
+                    auth: {
+                        user: testAccount.user,
+                        pass: testAccount.pass
+                    }
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.state, 'new');
+    });
+
+    await t.test('wait until added account is available', { timeout: 60000 }, async () => {
+        // wait until connected with timeout
+
+        await waitForCondition(
+            async () => {
+                const response = await server.get(`/v1/account/${defaultAccountId}`).expect(200);
+                switch (response.body.state) {
+                    case 'authenticationError':
+                    case 'connectError':
+                        throw new Error('Invalid account state ' + response.body.state);
+                    case 'connected':
+                        return true;
+                }
+                return false;
+            },
+            { timeout: testConfig.CONNECTION_TIMEOUT, message: 'Account connection timeout' }
+        );
+
+        // Wait for the expected account-lifecycle webhooks (delivered asynchronously - see
+        // waitForAccountWebhooks) rather than reading the receiver synchronously right after connect.
+        await waitForAccountWebhooks(defaultAccountId);
+    });
+
+    await t.test('list existing users (1 account)', async () => {
+        const response = await server.get(`/v1/accounts`).expect(200);
+
+        assert.strictEqual(response.body.accounts.length, 1);
+    });
+
+    await t.test('check if account credentials are encrypted', async () => {
+        let accountData = await redis.hgetall(`iad:${defaultAccountId}`);
+        let imapData = JSON.parse(accountData.imap);
+        let smtpData = JSON.parse(accountData.smtp);
+
+        assert.ok(imapData.auth.pass.indexOf('$wd02$') === 0);
+        assert.ok(smtpData.auth.pass.indexOf('$wd02$') === 0);
+    });
+
+    await t.test('list mailboxes for an account', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/mailboxes`).expect(200);
+
+        assert.ok(response.body.mailboxes.some(mb => mb.specialUse === '\\Inbox'));
+    });
+
+    await t.test('list inbox messages (empty)', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/messages?path=INBOX`).expect(200);
+
+        assert.strictEqual(response.body.total, 0);
+    });
+
+    await t.test('upload email to Inbox and wait for a messageNew webhook', { timeout: 60000 }, async () => {
+        const response1 = await server
+            .post(`/v1/account/${defaultAccountId}/message`)
+            .send({
+                path: 'Inbox',
+                flags: ['\\Seen'],
+                from: {
+                    name: 'Test Sender',
+                    address: 'test.sender@example.com'
+                },
+                to: [
+                    {
+                        name: 'Test Received',
+                        address: 'test.received@example.com'
+                    }
+                ],
+                subject: 'Test message 🤣',
+                text: 'Hello world! 🙃',
+                html: '<b>Hello world! 🙃</b>',
+                messageId: '<test1@example.com>'
+            })
+            .expect(200);
+        assert.ok(response1.body.id);
+
+        const response2 = await server
+            .post(`/v1/account/${defaultAccountId}/message`)
+            .send({
+                path: 'Inbox',
+                flags: [],
+                from: {
+                    name: 'Test Sender',
+                    address: 'test.sender@example.com'
+                },
+                to: [
+                    {
+                        name: 'Test Received',
+                        address: 'test.received@example.com'
+                    }
+                ],
+                subject: 'Test message 🤣',
+                text: 'Hello world! 🙃',
+                html: '<b>Hello world! 🙃</b>',
+                messageId: '<test2@example.com>',
+                attachments: [
+                    {
+                        filename: 'transparent.gif',
+                        content: 'R0lGODlhAQABAIAAAP///wAAACwAAAAAAQABAAACAkQBADs=',
+                        contentType: 'image/gif',
+                        contentDisposition: 'inline',
+                        encoding: 'base64'
+                    }
+                ]
+            })
+            .expect(200);
+
+        assert.ok(response2.body.id);
+
+        const { messageNewWebhook1, messageNewWebhook2 } = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(defaultAccountId);
+                const webhook1 = webhooks.find(wh => wh.path === 'INBOX' && wh.event === 'messageNew' && wh.data.messageId === '<test1@example.com>');
+                const webhook2 = webhooks.find(wh => wh.path === 'INBOX' && wh.event === 'messageNew' && wh.data.messageId === '<test2@example.com>');
+                if (webhook1 && webhook2) {
+                    return { messageNewWebhook1: webhook1, messageNewWebhook2: webhook2 };
+                }
+                return false;
+            },
+            { timeout: testConfig.WEBHOOK_TIMEOUT, message: 'Webhook notification timeout' }
+        );
+
+        message2 = messageNewWebhook2.data;
+
+        assert.equal(messageNewWebhook1.data.subject, 'Test message 🤣');
+    });
+
+    await t.test('list inbox messages (2 messages)', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/messages?path=INBOX`).expect(200);
+
+        assert.strictEqual(response.body.total, 2);
+        assert.equal(response.body.messages[0].messageId, '<test2@example.com>');
+    });
+
+    await t.test('list mailboxes with counters', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/mailboxes?counters=true`).expect(200);
+        assert.ok(response.body.mailboxes.some(mb => mb.specialUse === '\\Inbox' && mb.status.messages === 2 && mb.status.unseen === 1));
+    });
+
+    await t.test('retrieve message text', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/text/${message2.text.id}?textType=*`).expect(200);
+        assert.deepEqual(response.body, { plain: 'Hello world! 🙃', html: '<b>Hello world! 🙃</b>', hasMore: false });
+    });
+
+    await t.test('download attachment', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/attachment/${message2.attachments[0].id}`).expect(200);
+
+        assert.strictEqual(response.headers['content-type'], `image/gif`);
+        assert.strictEqual(response.headers['content-disposition'], `attachment; filename="transparent.gif"; filename*=utf-8''transparent.gif`);
+
+        let attachment = response._body.toString('base64');
+
+        assert.strictEqual(attachment, 'R0lGODlhAQABAIAAAP///wAAACwAAAAAAQABAAACAkQBADs=');
+    });
+
+    await t.test('get message information', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/message/${message2.id}?textType=*`).expect(200);
+
+        let message = response.body;
+
+        assert.strictEqual(message.id, message2.id);
+        assert.strictEqual(message.subject, 'Test message 🤣');
+        assert.strictEqual(message.messageSpecialUse, '\\Inbox');
+        assert.strictEqual(message.text.plain, 'Hello world! 🙃');
+        assert.strictEqual(message.text.html, '<b>Hello world! 🙃</b>');
+        assert.ok(!message.text.webSafe);
+    });
+
+    await t.test('get message information, websafe', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/message/${message2.id}?webSafeHtml=true`).expect(200);
+
+        let message = response.body;
+
+        assert.strictEqual(message.id, message2.id);
+        assert.strictEqual(message.subject, 'Test message 🤣');
+        assert.strictEqual(message.messageSpecialUse, '\\Inbox');
+        assert.strictEqual(message.text.plain, 'Hello world! 🙃');
+        assert.strictEqual(message.text.html, '<div style="overflow: auto; contain: paint;"><div><b>Hello world! 🙃</b></div></div>');
+        assert.strictEqual(message.text.webSafe, true);
+    });
+
+    await t.test('download raw message', async () => {
+        const response = await server.get(`/v1/account/${defaultAccountId}/message/${message2.id}/source`).expect(200);
+
+        assert.strictEqual(response.headers['content-type'], `message/rfc822`);
+        assert.strictEqual(response.headers['content-disposition'], `attachment; filename=message.eml`);
+
+        let eml = response.text;
+
+        assert.ok(/^Message-ID:/im.test(eml));
+    });
+
+    await t.test('search unseen messages', async () => {
+        const response = await server
+            .post(`/v1/account/${defaultAccountId}/search?path=INBOX`)
+            .send({
+                search: {
+                    unseen: true
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.total, 1);
+        assert.strictEqual(response.body.messages[0].messageId, '<test2@example.com>');
+    });
+
+    await t.test('mark message as seen', { timeout: 60000 }, async () => {
+        const response = await server
+            .put(`/v1/account/${defaultAccountId}/message/${message2.id}`)
+            .send({
+                flags: {
+                    add: ['\\Seen']
+                }
+            })
+            .expect(200);
+
+        assert.ok(response.body.flags.add);
+
+        const messageUpdatedWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(defaultAccountId);
+                return webhooks.find(wh => wh.path === 'INBOX' && wh.event === 'messageUpdated' && wh.data.id === message2.id);
+            },
+            { timeout: testConfig.WEBHOOK_TIMEOUT, message: 'Message update webhook timeout' }
+        );
+
+        assert.deepEqual(messageUpdatedWebhook.data.changes.flags.added, ['\\Seen']);
+    });
+
+    await t.test('upload by reference', { timeout: 60000 }, async () => {
+        await server
+            .post(`/v1/account/${defaultAccountId}/message`)
+            .send({
+                path: 'Inbox',
+                reference: {
+                    message: message2.id,
+                    action: 'forward',
+                    inline: true,
+                    forwardAttachments: true,
+                    messageId: '<invalid@value>'
+                },
+                to: [
+                    {
+                        name: 'Test Received',
+                        address: 'test.received@example.com'
+                    }
+                ],
+                text: 'Hallo hallo! 🙃',
+                html: '<b>Hallo hallo! 🙃</b>',
+                messageId: '<test3@example.com>'
+            })
+            // fails message-id test
+            .expect(404);
+
+        const response = await server
+            .post(`/v1/account/${defaultAccountId}/message`)
+            .send({
+                path: 'Inbox',
+                reference: {
+                    message: message2.id,
+                    action: 'forward',
+                    inline: true,
+                    forwardAttachments: true,
+                    messageId: '<test2@example.com>'
+                },
+                to: [
+                    {
+                        name: 'Test Received',
+                        address: 'test.received@example.com'
+                    }
+                ],
+                text: 'Hallo hallo! 🙃',
+                html: '<b>Hallo hallo! 🙃</b>',
+                messageId: '<test3@example.com>'
+            })
+            .expect(200);
+
+        assert.ok(response.body.id);
+
+        const messageNewWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(defaultAccountId);
+                return webhooks.find(wh => wh.path === 'INBOX' && wh.event === 'messageNew' && wh.data.messageId === '<test3@example.com>');
+            },
+            { timeout: testConfig.WEBHOOK_TIMEOUT, message: 'Message upload webhook timeout' }
+        );
+
+        assert.ok(/Begin forwarded message/.test(messageNewWebhook.data.text.plain));
+        assert.strictEqual(messageNewWebhook.data.attachments[0].filename, 'transparent.gif');
+        assert.strictEqual(messageNewWebhook.data.subject, 'Fwd: Test message 🤣');
+    });
+
+    await t.test('submit by reference', { timeout: 60000 }, async () => {
+        const response = await server
+            .post(`/v1/account/${defaultAccountId}/submit`)
+            .send({
+                reference: {
+                    message: message2.id,
+                    action: 'forward',
+                    inline: true,
+                    forwardAttachments: true,
+                    messageId: '<test2@example.com>'
+                },
+                to: [
+                    {
+                        name: 'Test Received',
+                        address: 'test.received@example.com'
+                    }
+                ],
+                text: 'Hallo hallo! 🙃',
+                html: '<b>Hallo hallo! 🙃</b>',
+                messageId: '<test4@example.com>'
+            })
+            .expect(200);
+
+        assert.ok(response.body.messageId);
+        assert.ok(response.body.queueId);
+
+        const messageNewWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(defaultAccountId);
+                return webhooks.find(wh => wh.path === 'INBOX' && wh.event === 'messageNew' && wh.data.messageId === '<test4@example.com>');
+            },
+            { timeout: testConfig.WEBHOOK_TIMEOUT, message: 'Submit webhook timeout' }
+        );
+
+        assert.ok(/Begin forwarded message/.test(messageNewWebhook.data.text.plain));
+        assert.strictEqual(messageNewWebhook.data.attachments[0].filename, 'transparent.gif');
+        assert.strictEqual(messageNewWebhook.data.subject, 'Fwd: Test message 🤣');
+    });
+
+    await t.test('create a mailbox', { timeout: 60000 }, async () => {
+        const response = await server
+            .post(`/v1/account/${defaultAccountId}/mailbox`)
+            .send({
+                path: ['My Target Folder 😇']
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.path, 'My Target Folder 😇');
+        assert.ok(response.body.created);
+
+        const mailboxNewWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(defaultAccountId);
+                return webhooks.find(wh => wh.path === 'My Target Folder 😇' && wh.event === 'mailboxNew');
+            },
+            { timeout: testConfig.WEBHOOK_TIMEOUT, message: 'Mailbox creation webhook timeout' }
+        );
+
+        assert.ok(mailboxNewWebhook);
+    });
+
+    await t.test('modify mailbox - rename only', { timeout: 60000 }, async () => {
+        const response = await server
+            .put(`/v1/account/${defaultAccountId}/mailbox`)
+            .send({
+                path: 'My Target Folder 😇',
+                newPath: 'My Renamed Folder'
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.path, 'My Target Folder 😇');
+        assert.strictEqual(response.body.newPath, 'My Renamed Folder');
+        assert.strictEqual(response.body.renamed, true);
+
+        const mailboxListResponse = await server.get(`/v1/account/${defaultAccountId}/mailboxes`).expect(200);
+        const renamedMailbox = mailboxListResponse.body.mailboxes.find(mb => mb.path === 'My Renamed Folder');
+        assert.ok(renamedMailbox, 'Renamed mailbox should exist');
+    });
+
+    await t.test('modify mailbox - subscription only', { timeout: 60000 }, async () => {
+        const response = await server
+            .put(`/v1/account/${defaultAccountId}/mailbox`)
+            .send({
+                path: 'My Renamed Folder',
+                subscribed: false
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.path, 'My Renamed Folder');
+        assert.strictEqual(response.body.subscribed, false);
+    });
+
+    await t.test('modify mailbox - both rename and subscription', { timeout: 60000 }, async () => {
+        const response = await server
+            .put(`/v1/account/${defaultAccountId}/mailbox`)
+            .send({
+                path: 'My Renamed Folder',
+                newPath: 'My Final Folder',
+                subscribed: true
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.path, 'My Renamed Folder');
+        assert.strictEqual(response.body.newPath, 'My Final Folder');
+        assert.strictEqual(response.body.renamed, true);
+        assert.strictEqual(response.body.subscribed, true);
+
+        const mailboxListResponse = await server.get(`/v1/account/${defaultAccountId}/mailboxes`).expect(200);
+        const finalMailbox = mailboxListResponse.body.mailboxes.find(mb => mb.path === 'My Final Folder');
+        assert.ok(finalMailbox, 'Final mailbox should exist');
+    });
+
+    await t.test('move message to another folder', { timeout: 60000 }, async () => {
+        const response = await server
+            .put(`/v1/account/${defaultAccountId}/message/${message2.id}/move`)
+            .send({
+                path: 'My Final Folder'
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.path, 'My Final Folder');
+
+        assert.strictEqual(response.body.uid, 1);
+
+        // The move and the search may run on different IMAP connections (the move falls back to
+        // the secondary connection whenever the primary is still seeding the just-renamed
+        // folder), and a search on a connection that already had the target folder selected can
+        // miss a message moved through the other connection until the server syncs the session
+        // state. Poll briefly instead of assuming immediate cross-connection visibility.
+        let responseSearchTarget;
+        for (let attempt = 0; attempt < 20; attempt++) {
+            responseSearchTarget = await server
+                .post(`/v1/account/${defaultAccountId}/search?path=${encodeURIComponent('My Final Folder')}`)
+                .send({
+                    search: {
+                        uid: '1'
+                    }
+                })
+                .expect(200);
+
+            if (responseSearchTarget.body.total === 1) {
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        assert.strictEqual(responseSearchTarget.body.total, 1);
+        assert.strictEqual(responseSearchTarget.body.messages[0].messageId, '<test2@example.com>');
+    });
+
+    await t.test('Create Gmail API OAuth2 service project', { skip: gmailSkip, timeout: 30000 }, async () => {
+        let gmailServiceData = {
+            name: 'Gmail API Pub/Sub',
+            provider: 'gmailService',
+            baseScopes: 'pubsub',
+            googleProjectId: process.env.GMAIL_API_PROJECT_ID,
+            serviceClient: process.env.GMAIL_API_SERVICE_CLIENT,
+            serviceClientEmail: process.env.GMAIL_API_SERVICE_EMAIL,
+            serviceKey: process.env.GMAIL_API_SERVICE_KEY
+        };
+
+        const response = await server.post(`/v1/oauth2`).send(gmailServiceData).expect(200);
+
+        oauth2PubsubId = response.body.id;
+        assert.ok(oauth2PubsubId);
+    });
+
+    await t.test('Create Gmail API OAuth2 client project', { skip: gmailSkip, timeout: 30000 }, async () => {
+        let gmailClientData = {
+            name: 'Gmail API Client',
+            provider: 'gmail',
+            baseScopes: 'api',
+            googleProjectId: process.env.GMAIL_API_PROJECT_ID,
+            clientId: process.env.GMAIL_API_CLIENT_ID,
+            clientSecret: process.env.GMAIL_API_CLIENT_SECRET,
+            pubSubApp: oauth2PubsubId,
+            redirectUrl: 'http://127.0.0.1:7003/oauth'
+        };
+
+        const response = await server.post(`/v1/oauth2`).send(gmailClientData).expect(200);
+
+        oauth2AppId = response.body.id;
+        assert.ok(oauth2AppId);
+    });
+
+    await t.test('Register Gmail account 1', { skip: gmailSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/account`)
+            .send({
+                account: gmailAccountId1,
+                name: 'Gmail User 1 🫥',
+                email: process.env.GMAIL_API_ACCOUNT_EMAIL_1,
+                oauth2: {
+                    provider: oauth2AppId,
+                    auth: {
+                        user: process.env.GMAIL_API_ACCOUNT_EMAIL_1
+                    },
+                    refreshToken: process.env.GMAIL_API_ACCOUNT_REFRESH_1
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.state, 'new');
+    });
+
+    await t.test('Register Gmail account 2', { skip: gmailSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/account`)
+            .send({
+                account: gmailAccountId2,
+                name: 'Gmail User 2 🫥',
+                email: process.env.GMAIL_API_ACCOUNT_EMAIL_2,
+                oauth2: {
+                    provider: oauth2AppId,
+                    auth: {
+                        user: process.env.GMAIL_API_ACCOUNT_EMAIL_2
+                    },
+                    refreshToken: process.env.GMAIL_API_ACCOUNT_REFRESH_2
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.state, 'new');
+    });
+
+    await t.test('wait until Gmail accounts are available', { skip: gmailSkip, timeout: 120000 }, async () => {
+        for (let account of [gmailAccountId1, gmailAccountId2]) {
+            // wait until connected with longer timeout for Gmail
+            await waitForCondition(
+                async () => {
+                    const response = await server.get(`/v1/account/${account}`).expect(200);
+                    switch (response.body.state) {
+                        case 'authenticationError':
+                        case 'connectError':
+                            throw new Error('Invalid account state ' + response.body.state);
+                        case 'connected':
+                            return true;
+                    }
+                    return false;
+                },
+                { timeout: testConfig.GMAIL_TIMEOUT, message: `Gmail account ${account} connection timeout` }
+            );
+
+            // Wait for the expected account-lifecycle webhooks (delivered asynchronously).
+            await waitForAccountWebhooks(account);
+        }
+    });
+
+    await t.test('list mailboxes for Gmail account 1', { skip: gmailSkip, timeout: 30000 }, async () => {
+        const response = await server.get(`/v1/account/${gmailAccountId1}/mailboxes`).expect(200);
+
+        assert.ok(response.body.mailboxes.some(mb => mb.specialUse === '\\Inbox'));
+    });
+
+    await t.test('list inbox messages for Gmail account 1 (greeting emails)', { skip: gmailSkip, timeout: 30000 }, async () => {
+        const response = await server.get(`/v1/account/${gmailAccountId1}/messages?path=INBOX`).expect(200);
+
+        assert.ok(response.body.total > 0);
+    });
+
+    await t.test('submit by API', { skip: gmailSkip, timeout: 120000 }, async () => {
+        let messageId = `<test-${Date.now()}@example.com>`;
+
+        const response = await server
+            .post(`/v1/account/${gmailAccountId2}/submit`)
+            .send({
+                to: [
+                    {
+                        name: 'Test Account 1',
+                        address: process.env.GMAIL_API_ACCOUNT_EMAIL_1
+                    }
+                ],
+                subject: 'Hallo hallo 🤣',
+                text: 'Hallo hallo! 🙃',
+                html: '<b>Hallo hallo! 🙃</b>',
+                messageId
+            })
+            .expect(200);
+
+        assert.ok(response.body.messageId);
+        assert.ok(response.body.queueId);
+
+        const messageSentWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(gmailAccountId2);
+                return webhooks.find(wh => wh.event === 'messageSent' && wh.data.originalMessageId === messageId);
+            },
+            { timeout: testConfig.GMAIL_TIMEOUT, message: 'Gmail message sent webhook timeout' }
+        );
+
+        gmailReceivedMessageId = messageSentWebhook.data.messageId;
+
+        const messageNewWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(gmailAccountId1);
+                return webhooks.find(wh => wh.event === 'messageNew' && wh.data.messageId === gmailReceivedMessageId);
+            },
+            { timeout: testConfig.GMAIL_TIMEOUT, message: 'Gmail message receive webhook timeout' }
+        );
+
+        // * is added by gmail
+        assert.strictEqual(messageNewWebhook.data.text.plain.trim(), '*Hallo hallo! 🙃*');
+        assert.strictEqual(messageNewWebhook.data.messageId, gmailReceivedMessageId);
+        assert.strictEqual(messageNewWebhook.data.subject.trim(), 'Hallo hallo 🤣');
+
+        gmailReceivedEmailId = messageNewWebhook.data.id;
+        assert.ok(gmailReceivedEmailId);
+    });
+
+    await t.test('reply by reference by API', { skip: gmailSkip, timeout: 120000 }, async () => {
+        let messageId = `<test-${Date.now()}@example.com>`;
+
+        const response = await server
+            .post(`/v1/account/${gmailAccountId1}/submit`)
+            .send({
+                reference: {
+                    message: gmailReceivedEmailId,
+                    action: 'reply',
+                    inline: true
+                },
+                text: 'Keedu kartul! 🍟',
+                html: '<b>Keedu kartul! 🍟</b>',
+                messageId
+            })
+            .expect(200);
+
+        assert.ok(response.body.messageId);
+        assert.ok(response.body.queueId);
+
+        let finalMessageId;
+
+        const messageSentWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(gmailAccountId1);
+                return webhooks.find(wh => wh.event === 'messageSent' && wh.data.originalMessageId === messageId);
+            },
+            { timeout: testConfig.GMAIL_TIMEOUT, message: 'Gmail reply sent webhook timeout' }
+        );
+
+        finalMessageId = messageSentWebhook.data.messageId;
+
+        const messageNewWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(gmailAccountId2);
+                return webhooks.find(wh => wh.event === 'messageNew' && wh.data.messageId === finalMessageId);
+            },
+            { timeout: testConfig.GMAIL_TIMEOUT, message: 'Gmail reply receive webhook timeout' }
+        );
+
+        assert.strictEqual(messageNewWebhook.data.subject.trim(), 'Re: Hallo hallo 🤣');
+        assert.strictEqual(messageNewWebhook.data.inReplyTo, gmailReceivedMessageId);
+
+        assert.ok(messageNewWebhook);
+    });
+
+    await t.test('Create Gmail send-only OAuth2 client project', { skip: gmailSendOnlySkip, timeout: 30000 }, async () => {
+        let gmailSendOnlyClientData = {
+            name: 'Gmail API Send-Only Client',
+            provider: 'gmail',
+            baseScopes: 'api',
+            googleProjectId: process.env.GMAIL_SENDONLY_PROJECT_ID,
+            clientId: process.env.GMAIL_SENDONLY_CLIENT_ID,
+            clientSecret: process.env.GMAIL_SENDONLY_CLIENT_SECRET,
+            extraScopes: ['gmail.send'],
+            skipScopes: ['gmail.modify'],
+            redirectUrl: 'http://127.0.0.1:3000/oauth'
+        };
+
+        const response = await server.post(`/v1/oauth2`).send(gmailSendOnlyClientData).expect(200);
+
+        oauth2SendOnlyAppId = response.body.id;
+        assert.ok(oauth2SendOnlyAppId);
+    });
+
+    await t.test('Register Gmail send-only account', { skip: gmailSendOnlySkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/account`)
+            .send({
+                account: gmailSendOnlyAccountId,
+                name: 'Gmail Send-Only User',
+                email: process.env.GMAIL_SENDONLY_ACCOUNT_EMAIL,
+                oauth2: {
+                    provider: oauth2SendOnlyAppId,
+                    auth: {
+                        user: process.env.GMAIL_SENDONLY_ACCOUNT_EMAIL
+                    },
+                    refreshToken: process.env.GMAIL_SENDONLY_ACCOUNT_REFRESH
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.state, 'new');
+    });
+
+    await t.test('wait until Gmail send-only account is available', { skip: gmailSendOnlySkip, timeout: 180000 }, async () => {
+        // wait until connected with longer timeout for Gmail
+        await waitForCondition(
+            async () => {
+                const response = await server.get(`/v1/account/${gmailSendOnlyAccountId}`).expect(200);
+                switch (response.body.state) {
+                    case 'authenticationError':
+                    case 'connectError':
+                        throw new Error('Invalid account state ' + response.body.state);
+                    case 'connected':
+                        return true;
+                }
+                return false;
+            },
+            { timeout: testConfig.GMAIL_TIMEOUT, message: `Gmail send-only account connection timeout` }
+        );
+
+        // check account type
+        const response = await server.get(`/v1/account/${gmailSendOnlyAccountId}`).expect(200);
+        assert.strictEqual(response.body.sendOnly, true, 'Account should be detected as send-only');
+
+        // Wait for the expected account-lifecycle webhooks (delivered asynchronously).
+        await waitForAccountWebhooks(gmailSendOnlyAccountId);
+    });
+
+    await t.test('send-only account - list mailboxes should fail', { skip: gmailSendOnlySkip, timeout: 30000 }, async () => {
+        const response = await server.get(`/v1/account/${gmailSendOnlyAccountId}/mailboxes`).expect(403);
+
+        // Gmail API will reject the request due to insufficient scopes
+        assert.ok(response.body.error);
+    });
+
+    await t.test('send-only account - list messages should fail', { skip: gmailSendOnlySkip, timeout: 30000 }, async () => {
+        const response = await server.get(`/v1/account/${gmailSendOnlyAccountId}/messages?path=INBOX`).expect(403);
+
+        // Gmail API will reject the request due to insufficient scopes
+        assert.ok(response.body.error);
+    });
+
+    await t.test('send-only account - get message should fail', { skip: gmailSendOnlySkip, timeout: 30000 }, async () => {
+        // Use a message ID from gmailAccountId2 to try to access it
+        if (!gmailReceivedEmailId) {
+            throw new Error('No message ID available for testing');
+        }
+
+        const response = await server.get(`/v1/account/${gmailSendOnlyAccountId}/message/${gmailReceivedEmailId}`).expect(403);
+
+        // Gmail API will reject the request due to insufficient scopes
+        assert.ok(response.body.error);
+    });
+
+    await t.test('send-only account - submit email successfully', { skip: gmailSendOnlySkip, timeout: 180000 }, async () => {
+        let messageId = `<sendonly-test-${Date.now()}@example.com>`;
+
+        const response = await server
+            .post(`/v1/account/${gmailSendOnlyAccountId}/submit`)
+            .send({
+                to: [
+                    {
+                        name: 'Test Account 2',
+                        address: process.env.GMAIL_API_ACCOUNT_EMAIL_2
+                    }
+                ],
+                subject: 'Send-only test message',
+                text: 'This message was sent from a send-only account',
+                html: '<p>This message was sent from a <strong>send-only</strong> account</p>',
+                messageId
+            })
+            .expect(200);
+
+        assert.ok(response.body.messageId);
+        assert.ok(response.body.queueId);
+
+        // Wait for messageSent webhook on send-only account
+        const messageSentWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(gmailSendOnlyAccountId);
+                return webhooks.find(wh => wh.event === 'messageSent' && wh.data.originalMessageId === messageId);
+            },
+            { timeout: testConfig.GMAIL_TIMEOUT, message: 'Gmail send-only message sent webhook timeout' }
+        );
+        assert.ok(messageSentWebhook);
+
+        // Cannot verify the final Gmail-assigned message ID because send-only accounts
+        // lack read permissions for the Sent Mail folder. Gmail assigns a new message ID
+        // that differs from the original messageId sent in the request.
+    });
+
+    // --- Outlook Service (client_credentials) tests ---
+
+    await t.test('Create Outlook Service OAuth2 app', { skip: outlookSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/oauth2`)
+            .send({
+                name: 'Outlook Service Test App',
+                provider: 'outlookService',
+                baseScopes: 'api',
+                clientId: process.env.OUTLOOK_SERVICE_CLIENT_ID,
+                clientSecret: process.env.OUTLOOK_SERVICE_CLIENT_SECRET,
+                authority: process.env.OUTLOOK_SERVICE_TENANT_ID
+            })
+            .expect(200);
+
+        outlookServiceAppId = response.body.id;
+        assert.ok(outlookServiceAppId);
+    });
+
+    await t.test('Register Outlook Service account', { skip: outlookSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/account`)
+            .send({
+                account: outlookServiceAccountId,
+                name: 'Outlook Service Test',
+                email: process.env.OUTLOOK_SERVICE_ACCOUNT_EMAIL,
+                oauth2: {
+                    provider: outlookServiceAppId,
+                    auth: {
+                        user: process.env.OUTLOOK_SERVICE_ACCOUNT_EMAIL
+                    }
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.state, 'new');
+    });
+
+    await t.test('wait until Outlook Service account is connected', { skip: outlookSkip, timeout: 120000 }, async () => {
+        await waitForCondition(
+            async () => {
+                const response = await server.get(`/v1/account/${outlookServiceAccountId}`).expect(200);
+                switch (response.body.state) {
+                    case 'authenticationError':
+                    case 'connectError':
+                        throw new Error('Invalid account state ' + response.body.state);
+                    case 'connected':
+                        return true;
+                }
+                return false;
+            },
+            { timeout: testConfig.OUTLOOK_TIMEOUT, message: 'Outlook Service account connection timeout' }
+        );
+    });
+
+    await t.test('list mailboxes for Outlook Service account', { skip: outlookSkip, timeout: 30000 }, async () => {
+        const response = await server.get(`/v1/account/${outlookServiceAccountId}/mailboxes`).expect(200);
+
+        assert.ok(response.body.mailboxes.some(mb => mb.specialUse === '\\Inbox'));
+    });
+
+    await t.test('list inbox messages for Outlook Service account', { skip: outlookSkip, timeout: 30000 }, async () => {
+        const response = await server.get(`/v1/account/${outlookServiceAccountId}/messages?path=INBOX`).expect(200);
+
+        assert.ok(typeof response.body.total === 'number');
+    });
+
+    await t.test('send email via Outlook Service account', { skip: outlookSkip, timeout: 120000 }, async () => {
+        let messageId = `<outlook-test-${Date.now()}@example.com>`;
+
+        const response = await server
+            .post(`/v1/account/${outlookServiceAccountId}/submit`)
+            .send({
+                to: [
+                    {
+                        name: 'Outlook Service Test',
+                        address: process.env.OUTLOOK_SERVICE_ACCOUNT_EMAIL
+                    }
+                ],
+                subject: 'Outlook Service test message',
+                text: 'This is a test from Outlook Service account',
+                html: '<p>This is a test from <strong>Outlook Service</strong> account</p>',
+                messageId
+            })
+            .expect(200);
+
+        assert.ok(response.body.messageId);
+        assert.ok(response.body.queueId);
+
+        // Wait for messageSent webhook (internal EmailEngine webhook, always works)
+        const messageSentWebhook = await waitForCondition(
+            async () => {
+                let webhooks = webhooksServer.webhooks.get(outlookServiceAccountId);
+                return webhooks.find(wh => wh.event === 'messageSent' && wh.data.originalMessageId === messageId);
+            },
+            { timeout: testConfig.OUTLOOK_TIMEOUT, message: 'Outlook Service message sent webhook timeout' }
+        );
+
+        assert.ok(messageSentWebhook);
+
+        // MS Graph push notifications require HTTPS and a publicly reachable URL,
+        // so messageNew webhooks won't arrive in the test environment.
+        // Instead, poll the inbox API directly until the sent message appears.
+        const receivedMessage = await waitForCondition(
+            async () => {
+                const messagesRes = await server.get(`/v1/account/${outlookServiceAccountId}/messages?path=INBOX`).expect(200);
+                return messagesRes.body.messages.find(msg => msg.subject === 'Outlook Service test message');
+            },
+            { timeout: testConfig.OUTLOOK_TIMEOUT, message: 'Outlook Service message receive timeout' }
+        );
+
+        assert.ok(receivedMessage);
+        outlookReceivedEmailId = receivedMessage.id;
+        assert.ok(outlookReceivedEmailId);
+    });
+
+    await t.test('get Outlook Service message details', { skip: outlookSkip, timeout: 30000 }, async () => {
+        assert.ok(outlookReceivedEmailId, 'Need received email ID from previous test');
+
+        const response = await server.get(`/v1/account/${outlookServiceAccountId}/message/${outlookReceivedEmailId}`).expect(200);
+
+        assert.strictEqual(response.body.subject, 'Outlook Service test message');
+        assert.ok(response.body.from);
+    });
+
+    await t.test('get Outlook Service message text', { skip: outlookSkip, timeout: 30000 }, async () => {
+        assert.ok(outlookReceivedEmailId, 'Need received email ID from previous test');
+
+        const response = await server.get(`/v1/account/${outlookServiceAccountId}/text/${outlookReceivedEmailId}`).expect(200);
+
+        assert.ok(response.body.plain || response.body.html);
+    });
+
+    await t.test('download Outlook Service raw message', { skip: outlookSkip, timeout: 30000 }, async () => {
+        assert.ok(outlookReceivedEmailId, 'Need received email ID from previous test');
+
+        const response = await server.get(`/v1/account/${outlookServiceAccountId}/message/${outlookReceivedEmailId}/source`).expect(200);
+
+        assert.ok(response.text.length > 0);
+    });
+
+    await t.test('search messages in Outlook Service account', { skip: outlookSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/account/${outlookServiceAccountId}/search?path=INBOX`)
+            .send({
+                search: {
+                    unseen: true
+                }
+            })
+            .expect(200);
+
+        assert.ok(Array.isArray(response.body.messages));
+    });
+
+    await t.test('update message flags in Outlook Service account', { skip: outlookSkip, timeout: 60000 }, async () => {
+        assert.ok(outlookReceivedEmailId, 'Need received email ID from previous test');
+
+        const response = await server
+            .put(`/v1/account/${outlookServiceAccountId}/message/${outlookReceivedEmailId}`)
+            .send({
+                flags: {
+                    add: ['\\Seen']
+                }
+            })
+            .expect(200);
+
+        assert.ok(response.body.flags);
+    });
+
+    await t.test('delete message in Outlook Service account', { skip: outlookSkip, timeout: 30000 }, async () => {
+        assert.ok(outlookReceivedEmailId, 'Need received email ID from previous test');
+
+        const response = await server.delete(`/v1/account/${outlookServiceAccountId}/message/${outlookReceivedEmailId}`).expect(200);
+
+        assert.ok(response.body.deleted);
+    });
+
+    // --- Outlook Graph API behavior tests (verify the Graph behavior syncMissedMessages relies on) ---
+
+    await t.test(
+        'Graph API message query returns messages from all folders with parentFolderId',
+        { skip: outlookSkip, timeout: testConfig.OUTLOOK_TIMEOUT },
+        async () => {
+            let graphToken = await getGraphToken();
+            assert.ok(graphToken, 'Should receive access token');
+            let email = process.env.OUTLOOK_SERVICE_ACCOUNT_EMAIL;
+
+            // Query recent messages with parentFolderId, the listing syncMissedMessages pages through
+            let sinceTime = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+            let queryParams = new URLSearchParams({
+                $filter: `receivedDateTime gt ${sinceTime}`,
+                $select: 'id,parentFolderId',
+                $top: '10',
+                $orderby: 'receivedDateTime desc'
+            });
+
+            let messagesRes = await fetchCmd(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}/messages?${queryParams}`, {
+                headers: {
+                    Authorization: `Bearer ${graphToken}`,
+                    Prefer: 'IdType="ImmutableId"'
+                }
+            });
+            assert.equal(messagesRes.status, 200, 'Should return 200');
+
+            let messagesData = await messagesRes.json();
+            assert.ok(Array.isArray(messagesData.value), 'Should return value array');
+            assert.ok(messagesData.value.length > 0, 'Should have at least one recent message');
+
+            // Every message should have both id and parentFolderId
+            for (let msg of messagesData.value) {
+                assert.ok(msg.id, 'Message should have id');
+                assert.ok(msg.parentFolderId, 'Message should have parentFolderId');
+            }
+
+            // Recent messages typically span multiple folders (Inbox + Sent Items) once the
+            // test has both received and sent. The actual API contract being tested is that
+            // each message carries parentFolderId - covered by the per-message asserts above.
+            // The folder spread is data-dependent (quiet test mailboxes can have single-folder
+            // activity in the time window), so log instead of failing when only one folder
+            // shows up.
+            let distinctFolders = new Set(messagesData.value.map(m => m.parentFolderId));
+            if (distinctFolders.size < 2) {
+                console.warn(`Graph query returned messages from only ${distinctFolders.size} folder(s); cross-folder spread not asserted`);
+            }
+        }
+    );
+
+    await t.test('Graph API pagination returns @odata.nextLink', { skip: outlookSkip, timeout: testConfig.OUTLOOK_TIMEOUT }, async t => {
+        let graphToken = await getGraphToken();
+        let email = process.env.OUTLOOK_SERVICE_ACCOUNT_EMAIL;
+        let messagesUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}/messages`;
+        let headers = {
+            Authorization: `Bearer ${graphToken}`,
+            Prefer: 'IdType="ImmutableId"'
+        };
+
+        // The same filtered, ordered listing syncMissedMessages pages through, over a window wide
+        // enough to always hold several messages. It used to be the last 30 minutes, which in a run
+        // with no other run shortly before held a single message: the run sends one message to this
+        // mailbox and the delete test above removes the Inbox copy, leaving only the Sent Items
+        // copy. Graph still attaches a nextLink to a full page whether or not anything follows, so
+        // the second page came back empty and the test failed, and passed again on a re-run made
+        // within the half hour, which found the previous run's copy as well.
+        //
+        // The window also ends where the test starts. Graph pages newest first by offset, so a
+        // message arriving between the two requests (another CI run on the same mailbox) shifted
+        // every entry down by one and the second page began with the first page's message
+        let untilTime = new Date().toISOString();
+        let sinceTime = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
+        let listing = top =>
+            new URLSearchParams({
+                $filter: `receivedDateTime gt ${sinceTime} and receivedDateTime le ${untilTime}`,
+                $select: 'id',
+                $top: String(top),
+                $orderby: 'receivedDateTime desc'
+            });
+
+        // Pagination can only be shown with at least two messages; say so rather than fail on an
+        // emptied mailbox
+        let precheck = await (await fetchCmd(`${messagesUrl}?${listing(2)}`, { headers })).json();
+        if (!Array.isArray(precheck.value) || precheck.value.length < 2) {
+            t.skip(`the test mailbox holds ${precheck.value ? precheck.value.length : 0} message(s) from the last 90 days, pagination needs two`);
+            return;
+        }
+
+        // Query with $top=1 to force pagination
+        let page1Res = await fetchCmd(`${messagesUrl}?${listing(1)}`, { headers });
+        assert.equal(page1Res.status, 200);
+
+        let page1Data = await page1Res.json();
+        assert.ok(Array.isArray(page1Data.value), 'First page should have value array');
+        assert.equal(page1Data.value.length, 1, 'First page should have exactly 1 message');
+        assert.ok(page1Data['@odata.nextLink'], 'Should have @odata.nextLink for more results');
+
+        // Follow the nextLink
+        let page2Res = await fetchCmd(page1Data['@odata.nextLink'], { headers });
+        assert.equal(page2Res.status, 200);
+
+        let page2Data = await page2Res.json();
+        assert.ok(Array.isArray(page2Data.value), 'Second page should have value array');
+        assert.ok(page2Data.value.length > 0, 'Second page should have at least one message');
+
+        // First page and second page should have different message IDs
+        assert.notEqual(page1Data.value[0].id, page2Data.value[0].id, 'Pages should return different messages');
+    });
+
+    // --- Gmail Service Account (IMAP XOAUTH2) tests ---
+
+    await t.test('Create gmailService OAuth2 app', { skip: gmailServiceSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/oauth2`)
+            .send({
+                name: 'Gmail Service Account (IMAP XOAUTH2)',
+                provider: 'gmailService',
+                serviceClient: process.env.GMAIL_SERVICE_POSTALSYS_CLIENT,
+                serviceClientEmail: process.env.GMAIL_SERVICE_POSTALSYS_SERVICE_EMAIL,
+                serviceKey: process.env.GMAIL_SERVICE_POSTALSYS_KEY
+            })
+            .expect(200);
+
+        gmailServiceAppId = response.body.id;
+        assert.ok(gmailServiceAppId);
+    });
+
+    await t.test('Register gmailService account', { skip: gmailServiceSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/account`)
+            .send({
+                account: gmailServiceAccountId,
+                name: 'Gmail Service User',
+                email: process.env.GMAIL_SERVICE_POSTALSYS_ACCOUNT_EMAIL,
+                oauth2: {
+                    provider: gmailServiceAppId,
+                    auth: {
+                        user: process.env.GMAIL_SERVICE_POSTALSYS_ACCOUNT_EMAIL
+                    }
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.state, 'new');
+    });
+
+    await t.test('wait until gmailService account connects via IMAP XOAUTH2', { skip: gmailServiceSkip, timeout: 170000 }, async () => {
+        let lastResponse;
+        await waitForCondition(
+            async () => {
+                lastResponse = await server.get(`/v1/account/${gmailServiceAccountId}`).expect(200);
+                switch (lastResponse.body.state) {
+                    case 'authenticationError':
+                    case 'connectError':
+                        throw new Error('Invalid account state ' + lastResponse.body.state);
+                    case 'connected':
+                        return true;
+                }
+                return false;
+            },
+            {
+                timeout: testConfig.GMAIL_IMAP_CONNECT_TIMEOUT,
+                // the state tells a slow provider (still connecting) from an account that never started
+                message: () => `Gmail Service account connection timeout, state ${lastResponse?.body?.state}`
+            }
+        );
+
+        assert.notStrictEqual(lastResponse.body.isApi, true, 'gmailService should use IMAP XOAUTH2, not the API path');
+    });
+
+    await t.test('list mailboxes for gmailService account', { skip: gmailServiceSkip, timeout: 60000 }, async () => {
+        const response = await server.get(`/v1/account/${gmailServiceAccountId}/mailboxes`).expect(200);
+
+        assert.ok(response.body.mailboxes.some(mb => mb.specialUse === '\\Inbox'));
+    });
+
+    await t.test('delete gmailService account', { skip: gmailServiceSkip, timeout: 30000 }, async () => {
+        const response = await server.delete(`/v1/account/${gmailServiceAccountId}`).expect(200);
+
+        assert.ok(response.body.deleted);
+    });
+
+    await t.test('delete gmailService OAuth2 app', { skip: gmailServiceSkip, timeout: 30000 }, async () => {
+        const response = await server.delete(`/v1/oauth2/${gmailServiceAppId}`).expect(200);
+
+        assert.ok(response.body.deleted);
+    });
+
+    // --- Gmail Service Account via Workload Identity Federation (keyless, IMAP XOAUTH2) ---
+
+    const wifSaKeyB64 = process.env.GMAIL_WIF_SA_KEY;
+    const wifAudience = process.env.GMAIL_WIF_AUDIENCE;
+    const wifAccountEmail = process.env.GMAIL_WIF_ACCOUNT_EMAIL;
+    const wifSkip = wifSaKeyB64 && wifAudience && wifAccountEmail ? false : 'GMAIL_WIF_* environment variables are not set';
+    const wifKey = wifSkip ? null : JSON.parse(Buffer.from(wifSaKeyB64, 'base64').toString('utf8'));
+    const wifAccountId = 'gmail-wif-account';
+    let wifAppId;
+    let wifTokenFile;
+
+    await t.test('WIF: mint OIDC subject token for the service account', { skip: wifSkip, timeout: 30000 }, async () => {
+        const crypto = require('node:crypto');
+        const fs = require('node:fs');
+        const os = require('node:os');
+        const path = require('node:path');
+
+        // Simulate a workload's projected OIDC token: a Google-issued ID token for the
+        // service account whose audience is the Workload Identity Pool provider. The
+        // service-account key is used only here, to bootstrap the subject token - it is
+        // never given to EmailEngine, which exercises the real keyless WIF chain.
+        const targetAudience = wifAudience.replace(/^\/\//, 'https://');
+        const b64url = b => Buffer.from(b).toString('base64url');
+        const now = Math.floor(Date.now() / 1000);
+        const header = { alg: 'RS256', typ: 'JWT', kid: wifKey.private_key_id };
+        const payload = {
+            iss: wifKey.client_email,
+            sub: wifKey.client_email,
+            aud: 'https://oauth2.googleapis.com/token',
+            iat: now,
+            exp: now + 3600,
+            target_audience: targetAudience
+        };
+        const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+        const signature = crypto.createSign('RSA-SHA256').update(signingInput).sign(wifKey.private_key);
+        const assertion = `${signingInput}.${b64url(signature)}`;
+
+        const res = await fetchCmd('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }).toString()
+        });
+        const data = await res.json();
+        assert.ok(data.id_token, 'expected a Google-issued ID token');
+
+        wifTokenFile = path.join(os.tmpdir(), `ee-wif-subject-token-${process.pid}`);
+        fs.writeFileSync(wifTokenFile, data.id_token, 'utf8');
+    });
+
+    await t.test('WIF: create gmailService OAuth2 app (externalAccount)', { skip: wifSkip, timeout: 30000 }, async () => {
+        const externalAccount = JSON.stringify({
+            type: 'external_account',
+            audience: wifAudience,
+            subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+            token_url: 'https://sts.googleapis.com/v1/token',
+            service_account_impersonation_url: `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${wifKey.client_email}:generateAccessToken`,
+            credential_source: { file: wifTokenFile, format: { type: 'text' } }
+        });
+
+        const response = await server
+            .post(`/v1/oauth2`)
+            .send({
+                name: 'Gmail Service Account (Workload Identity Federation)',
+                provider: 'gmailService',
+                authMethod: 'externalAccount',
+                baseScopes: 'imap',
+                googleProjectId: wifKey.project_id,
+                serviceClient: wifKey.client_id,
+                serviceClientEmail: wifKey.client_email,
+                externalAccount
+            })
+            .expect(200);
+
+        wifAppId = response.body.id;
+        assert.ok(wifAppId);
+    });
+
+    await t.test('WIF: register gmailService account', { skip: wifSkip, timeout: 30000 }, async () => {
+        const response = await server
+            .post(`/v1/account`)
+            .send({
+                account: wifAccountId,
+                name: 'Gmail WIF User',
+                email: wifAccountEmail,
+                oauth2: {
+                    provider: wifAppId,
+                    auth: { user: wifAccountEmail }
+                }
+            })
+            .expect(200);
+
+        assert.strictEqual(response.body.state, 'new');
+    });
+
+    await t.test('WIF: wait until account connects via IMAP XOAUTH2', { skip: wifSkip, timeout: 170000 }, async () => {
+        let lastResponse;
+        await waitForCondition(
+            async () => {
+                lastResponse = await server.get(`/v1/account/${wifAccountId}`).expect(200);
+                switch (lastResponse.body.state) {
+                    case 'authenticationError':
+                    case 'connectError':
+                        throw new Error('Invalid account state ' + lastResponse.body.state);
+                    case 'connected':
+                        return true;
+                }
+                return false;
+            },
+            {
+                timeout: testConfig.GMAIL_IMAP_CONNECT_TIMEOUT,
+                message: () => `Gmail WIF account connection timeout, state ${lastResponse?.body?.state}`
+            }
+        );
+
+        assert.notStrictEqual(lastResponse.body.isApi, true, 'gmailService (WIF) should use IMAP XOAUTH2, not the API path');
+    });
+
+    await t.test('WIF: list mailboxes for the account', { skip: wifSkip, timeout: 60000 }, async () => {
+        const response = await server.get(`/v1/account/${wifAccountId}/mailboxes`).expect(200);
+
+        assert.ok(response.body.mailboxes.some(mb => mb.specialUse === '\\Inbox'));
+    });
+
+    await t.test('WIF: verify setup endpoint reports all checks pass', { skip: wifSkip, timeout: 60000 }, async () => {
+        const response = await server.post(`/v1/oauth2/${wifAppId}/verify`).send({ account: wifAccountEmail }).expect(200);
+
+        assert.strictEqual(response.body.ok, true, JSON.stringify(response.body.steps));
+        assert.ok(response.body.steps.some(s => s.id === 'signJwt' && s.status === 'ok'));
+        assert.ok(response.body.steps.some(s => s.id === 'mailbox' && s.status === 'ok'));
+    });
+
+    await t.test('WIF: delete account', { skip: wifSkip, timeout: 30000 }, async () => {
+        const response = await server.delete(`/v1/account/${wifAccountId}`).expect(200);
+
+        assert.ok(response.body.deleted);
+    });
+
+    await t.test('WIF: delete OAuth2 app', { skip: wifSkip, timeout: 30000 }, async () => {
+        const response = await server.delete(`/v1/oauth2/${wifAppId}`).expect(200);
+
+        assert.ok(response.body.deleted);
+
+        if (wifTokenFile) {
+            try {
+                require('node:fs').unlinkSync(wifTokenFile);
+            } catch (err) {
+                // ignore cleanup failure
+            }
+        }
+    });
+});

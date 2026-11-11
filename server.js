@@ -1,0 +1,4235 @@
+'use strict';
+
+/**
+ * EmailEngine Main Server Module
+ *
+ * This is the main entry point for EmailEngine - a self-hosted email automation platform.
+ * It manages worker threads for IMAP connections, webhooks, email submission, and various
+ * proxy servers (SMTP, IMAP).
+ *
+ * @module server
+ * @requires dotenv
+ * @requires worker_threads
+ * @requires @zone-eu/wild-config
+ * @see {@link https://emailengine.app}
+ */
+
+// No native addons (CLAUDE.md "Pure JavaScript only"). bullmq depends on msgpackr, whose optional
+// dependency msgpackr-extract is a node-gyp addon that npm and Docker installs pick up and load
+// when present, while the pkg binary decodes in JavaScript. This makes every install decode the
+// same way. Set before anything can require bullmq; worker threads share this environment.
+process.env.MSGPACKR_NATIVE_ACCELERATION_DISABLED = 'true';
+
+// Attempt to change working directory to script location. Before anything reads a file by a
+// relative path: `.env` below and the `config/` directory wild-config loads (including executable
+// `.js` configuration files, run with the real require) are both resolved against the working
+// directory, and the directory the operator happened to start from is not where this instance's
+// configuration lives
+try {
+    process.chdir(__dirname);
+} catch (err) {
+    // ignore - may fail in some containerized environments
+}
+
+// Load environment variables if not already loaded
+if (!process.env.EE_ENV_LOADED) {
+    require('dotenv').config({ quiet: true });
+    process.env.EE_ENV_LOADED = 'true';
+}
+
+// Set process title for easier identification in process lists
+process.title = 'emailengine';
+
+// Every EENGINE_*_FILE is read now: a file the operator named and the process can not read stops
+// the boot here, once and by name, rather than resolving to an empty value (which every reader
+// takes for "not configured") or crashing each worker thread that reads it later.
+try {
+    require('./lib/read-env-value').resolveEnvFiles();
+} catch (err) {
+    console.error(err.message);
+    process.exit(1);
+}
+
+// EmailEngine and its dependencies need Node 20 or newer. Checked before anything is required, so an
+// older runtime gets this line instead of a syntax error from a dependency. The check used to be a
+// structuredClone probe, which only caught Node 16 and older.
+if (Number(process.versions.node.split('.')[0]) < 20) {
+    console.error(`Node.js version ${process.version} is not supported. Please upgrade to Node.js 20 or later.`);
+    process.exit(1);
+}
+
+// Within Node 20 the dependency tree itself asks for 20.19.0 (html-to-text 10, the entities release
+// node-html-parser pulls in) or 20.18.1 (undici 7), which is what the engines field declares. npm
+// treats that field as advice, and an older 20.x starts and then fails somewhere in a dependency at
+// runtime, so it is named here. Only a warning: one-click DigitalOcean images upgrade EmailEngine on
+// their own but not the Node they run on, and an instance that works today must not stop at its next
+// self-upgrade over a minor version it may never exercise.
+const { accountDataKey } = require('./lib/redis-keys');
+const { importPreparedPassword } = require('./lib/prepared-password');
+const { MIN_SUPPORTED_NODE, isBelowSupportedNode } = require('./lib/node-version');
+if (isBelowSupportedNode(process.versions.node)) {
+    console.error(
+        `Node.js version ${process.version} is older than ${MIN_SUPPORTED_NODE}, the oldest release EmailEngine's dependencies support. Some features may fail at runtime. Please upgrade Node.js.`
+    );
+}
+
+const os = require('os');
+
+// Set UV thread pool size for better async I/O performance
+// Defaults to number of CPU cores (minimum 4)
+process.env.UV_THREADPOOL_SIZE =
+    process.env.UV_THREADPOOL_SIZE && !isNaN(process.env.UV_THREADPOOL_SIZE) ? Number(process.env.UV_THREADPOOL_SIZE) : Math.max(os.cpus().length, 4);
+
+// Disable Tensorflow warnings
+process.env.TF_CPP_MIN_LOG_LEVEL = '2';
+
+// Cache command line arguments before @zone-eu/wild-config processes them
+const argv = process.argv.slice(2);
+
+const { Worker: WorkerThread, SHARE_ENV } = require('worker_threads');
+const packageData = require('./package.json');
+const config = require('@zone-eu/wild-config');
+const logger = require('./lib/logger');
+
+// Import utility functions
+const {
+    readEnvValue,
+    hasEnvValue,
+    download,
+    getDuration,
+    getByteSize,
+    getBoolean,
+    workerPoolSize,
+    selectRendezvousNode,
+    checkLicense,
+    checkForUpgrade,
+    setLicense,
+    getRedisStats,
+    threadStats,
+    httpAgent,
+    reloadHttpProxyAgent,
+    maybeReloadHttpProxyAgent,
+    redactValidationError
+} = require('./lib/tools');
+const { apiPort, apiHost } = require('./lib/api-listener');
+const MetricsCollector = require('./lib/metrics-collector');
+
+// Import constants
+const {
+    MAX_DAYS_STATS,
+    MESSAGE_NEW_NOTIFY,
+    MESSAGE_DELETED_NOTIFY,
+    CONNECT_ERROR_NOTIFY,
+    REDIS_PREFIX,
+    ACCOUNT_ADDED_NOTIFY,
+    ACCOUNT_DELETED_NOTIFY,
+    LIST_UNSUBSCRIBE_NOTIFY,
+    LIST_SUBSCRIBE_NOTIFY,
+    LAST_DOCUMENT_STORE_VERSION,
+    AI_REQUEST_TIMEOUT,
+    AI_SETTING_KEYS
+} = require('./lib/consts');
+
+// Import core modules
+const { webhooks: Webhooks } = require('./lib/webhooks');
+const { generateSummary, listModels: openAiListModels, DEFAULT_MODEL: openAiDefaultModel } = require('@postalsys/email-ai-tools');
+const { fetch: fetchCmd } = require('undici');
+
+const bounceClassifier = require('@postalsys/bounce-classifier');
+
+const v8 = require('node:v8');
+
+// Initialize Sentry error tracking if a DSN is provided
+const { initSentry } = require('./lib/sentry');
+initSentry('main');
+
+// Import additional dependencies
+const pathlib = require('path');
+const { redis, notifyQueue, submitQueue, exportQueue } = require('./lib/db');
+const { queueStats } = require('./lib/queue-stats');
+const { pruneFailedContent } = require('./lib/outbox');
+const { queueCleanAges } = require('./lib/queue-retention');
+const { getFailedJobRetention } = require('./lib/env-setting-overrides');
+const { packRpcError, unpackRpcError } = require('./lib/worker-rpc-error');
+const promClient = require('prom-client');
+const fs = require('fs').promises;
+const crypto = require('crypto');
+const { compareVersions, parseVersion } = require('./lib/utils/version');
+const Joi = require('joi');
+const { settingsSchema } = require('./lib/schemas');
+const settings = require('./lib/settings');
+const { oauth2Apps } = require('./lib/oauth2-apps');
+const { backfillAuthFailureDisabled } = require('./lib/account/auth-failure-backfill');
+const { backfillExportIndex } = require('./lib/export');
+const { sweepBounceStore } = require('./lib/account/bounce-store-sweep');
+const { attachBeacon, persistBeaconMarkers } = require('./lib/license-beacon');
+const {
+    decide,
+    startupPlan,
+    expiredSuspension,
+    checkInterval,
+    subscriptionView,
+    parseSuspension,
+    isSubscriptionLicense,
+    toTime
+} = require('./lib/license-subscription');
+const tokens = require('./lib/tokens');
+
+const { checkRateLimit } = require('./lib/rate-limit');
+
+const getSecret = require('./lib/get-secret');
+
+const { rejectWorkerCalls } = require('./lib/reject-worker-calls');
+const {
+    pickLeastLoadedWorker,
+    rollbackAssignment,
+    assignRetryDelay,
+    QUICK_ASSIGN_RETRIES,
+    releaseWorkerAccounts,
+    requeueFailedAccounts,
+    forgetAccount,
+    shouldRequeueFailedAssignment,
+    planRebalance
+} = require('./lib/account-assignment');
+const { mapConcurrent } = require('./lib/utils/map-concurrent');
+const { RespawnTracker, retryWithBackoff } = require('./lib/respawn-backoff');
+const { legacySmtpOptionsInUse, REMOVAL_DATE } = require('./lib/deprecations');
+const { heartbeatDiagnostics, eventLoopDelaySeries, threadHeapSeries } = require('./lib/thread-diagnostics');
+
+const msgpack = require('./lib/msgpack');
+
+// Initialize default configuration values if not set
+config.service = config.service || {};
+
+// Default worker thread counts
+config.workers = config.workers || {
+    imap: 4, // IMAP connection handlers
+    webhooks: 1, // Webhook processors
+    submit: 1, // Email submission workers
+    imapProxy: 1 // IMAP proxy server
+};
+
+config.dbs = config.dbs || {
+    redis: 'redis://127.0.0.1:6379/8'
+};
+
+config.log = config.log || {
+    level: 'trace'
+};
+
+config.api = config.api || {
+    port: 3000,
+    host: '127.0.0.1'
+};
+
+// SMTP proxy server configuration
+config.smtp = config.smtp || {
+    enabled: false,
+    port: 2525,
+    host: '127.0.0.1',
+    secret: '',
+    proxy: false
+};
+
+// IMAP proxy server configuration
+config['imap-proxy'] = config['imap-proxy'] || {
+    enabled: false,
+    port: 2993,
+    host: '127.0.0.1',
+    secret: '',
+    proxy: false
+};
+
+// Application start timestamp
+const NOW = Date.now();
+
+// Initialize metrics collector (will be configured and started later)
+let metricsCollector = null;
+
+// Timeout configuration
+const DEFAULT_EENGINE_TIMEOUT = 10 * 1000;
+const EENGINE_TIMEOUT = getDuration(readEnvValue('EENGINE_TIMEOUT') || config.service.commandTimeout) || DEFAULT_EENGINE_TIMEOUT;
+
+// Size limits
+const DEFAULT_MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024; // 5MB
+
+// Delay between account connection setups (to avoid overwhelming the system)
+const CONNECTION_SETUP_DELAY = getDuration(readEnvValue('EENGINE_CONNECTION_SETUP_DELAY') || config.service.setupDelay) || 0;
+
+// Override configuration with environment variables
+config.api.maxSize = getByteSize(readEnvValue('EENGINE_MAX_SIZE') || config.api.maxSize) || DEFAULT_MAX_ATTACHMENT_SIZE;
+config.dbs.redis = readEnvValue('EENGINE_REDIS') || readEnvValue('REDIS_URL') || config.dbs.redis;
+
+config.workers.imap = workerPoolSize(readEnvValue('EENGINE_WORKERS'), config.workers.imap, 4);
+config.workers.webhooks = workerPoolSize(readEnvValue('EENGINE_WORKERS_WEBHOOKS'), config.workers.webhooks);
+config.workers.submit = workerPoolSize(readEnvValue('EENGINE_WORKERS_SUBMIT'), config.workers.submit);
+// The Workers page has labelled this row EENGINE_WORKERS_EXPORT since the export worker shipped, while
+// only --workers.export and [workers] export were read, so an operator who set it saw no effect
+config.workers.export = workerPoolSize(readEnvValue('EENGINE_WORKERS_EXPORT'), config.workers.export);
+// API worker count. Values >1 require SO_REUSEPORT (Linux); on unsupported platforms it falls back to 1 at startup.
+config.workers.api = workerPoolSize(readEnvValue('EENGINE_WORKERS_API'), config.workers.api);
+
+config.api.port = apiPort(config.api);
+config.api.host = apiHost(config.api);
+
+config.log.level = readEnvValue('EENGINE_LOG_LEVEL') || config.log.level;
+
+// Legacy SMTP configuration options, removed after REMOVAL_DATE (lib/deprecations.js). They only
+// seed the SMTP server settings on a first start; the admin UI and the settings API own them after that
+const SMTP_ENABLED = hasEnvValue('EENGINE_SMTP_ENABLED') ? getBoolean(readEnvValue('EENGINE_SMTP_ENABLED')) : getBoolean(config.smtp.enabled);
+const SMTP_SECRET = readEnvValue('EENGINE_SMTP_SECRET') || config.smtp.secret;
+const SMTP_PORT = (readEnvValue('EENGINE_SMTP_PORT') && Number(readEnvValue('EENGINE_SMTP_PORT'))) || Number(config.smtp.port) || 2525;
+const SMTP_HOST = readEnvValue('EENGINE_SMTP_HOST') || config.smtp.host || '127.0.0.1';
+const SMTP_PROXY = hasEnvValue('EENGINE_SMTP_PROXY') ? getBoolean(readEnvValue('EENGINE_SMTP_PROXY')) : getBoolean(config.smtp.proxy);
+
+// IMAP proxy configuration
+const IMAP_PROXY_ENABLED = hasEnvValue('EENGINE_IMAP_PROXY_ENABLED')
+    ? getBoolean(readEnvValue('EENGINE_IMAP_PROXY_ENABLED'))
+    : getBoolean(config['imap-proxy'].enabled);
+const IMAP_PROXY_SECRET = readEnvValue('EENGINE_IMAP_PROXY_SECRET') || config['imap-proxy'].secret;
+const IMAP_PROXY_PORT =
+    (readEnvValue('EENGINE_IMAP_PROXY_PORT') && Number(readEnvValue('EENGINE_IMAP_PROXY_PORT'))) || Number(config['imap-proxy'].port) || 2993;
+const IMAP_PROXY_HOST = readEnvValue('EENGINE_IMAP_PROXY_HOST') || config['imap-proxy'].host || '127.0.0.1';
+const IMAP_PROXY_PROXY = hasEnvValue('EENGINE_IMAP_PROXY_PROXY')
+    ? getBoolean(readEnvValue('EENGINE_IMAP_PROXY_PROXY'))
+    : getBoolean(config['imap-proxy'].proxy);
+
+// Metrics collection interval - consider connections recent if started within 10 minutes
+const METRIC_RECENT = 10 * 60 * 1000; // 10min
+
+// API proxy configuration
+const HAS_API_PROXY_SET = hasEnvValue('EENGINE_API_PROXY') || typeof config.api.proxy !== 'undefined';
+const API_PROXY = hasEnvValue('EENGINE_API_PROXY') ? getBoolean(readEnvValue('EENGINE_API_PROXY')) : getBoolean(config.api.proxy);
+
+// API authentication requirement configuration (default: true)
+const REQUIRE_API_AUTH = hasEnvValue('EENGINE_REQUIRE_API_AUTH') ? getBoolean(readEnvValue('EENGINE_REQUIRE_API_AUTH')) : null;
+
+// Opt-out for the license-validation feature beacon (telemetry rides on the existing license call)
+const BEACON_DISABLED = hasEnvValue('EENGINE_BEACON_DISABLED') ? getBoolean(readEnvValue('EENGINE_BEACON_DISABLED')) : false;
+
+// Opt-out for the GitHub releases update check, the only background network
+// call that is not tied to a subscription license. With this and a perpetual
+// license an instance makes no background calls at all (strict-egress and
+// air-gapped deployments).
+const UPDATE_CHECK_DISABLED = hasEnvValue('EENGINE_UPDATE_CHECK_DISABLED') ? getBoolean(readEnvValue('EENGINE_UPDATE_CHECK_DISABLED')) : false;
+
+// OAuth2 token access configuration
+const ENABLE_OAUTH_TOKENS_API = hasEnvValue('EENGINE_ENABLE_OAUTH_TOKENS_API') ? getBoolean(readEnvValue('EENGINE_ENABLE_OAUTH_TOKENS_API')) : null;
+
+// Log startup information
+logger.info({
+    msg: 'EmailEngine starting up',
+    version: packageData.version,
+    node: process.versions.node,
+    uvThreadpoolSize: Number(process.env.UV_THREADPOOL_SIZE),
+    workersImap: config.workers.imap,
+    workersWebhooks: config.workers.webhooks,
+    workersSubmission: config.workers.submit
+});
+
+const legacySmtpOptions = legacySmtpOptionsInUse({ hasEnvValue, smtpConfig: config.smtp });
+if (legacySmtpOptions.length) {
+    logger.warn({
+        msg: 'Deprecated SMTP server options are set, configure the SMTP server in the admin UI or through the settings API instead',
+        options: legacySmtpOptions,
+        removal: REMOVAL_DATE
+    });
+}
+
+// Standard response for when no active worker is available
+const NO_ACTIVE_HANDLER_RESP_ERR = new Error('No active handler for requested account. Try again later.');
+NO_ACTIVE_HANDLER_RESP_ERR.statusCode = 503;
+NO_ACTIVE_HANDLER_RESP_ERR.code = 'WorkerNotAvailable';
+
+// Shared rejection for in-flight calls whose target worker terminated mid-request.
+// Reused across concurrent rejections - never attach per-call fields to this instance.
+const WORKER_DIED_RESP_ERR = new Error('Worker handling the request terminated before completion. Try again.');
+WORKER_DIED_RESP_ERR.statusCode = 503;
+WORKER_DIED_RESP_ERR.code = 'WorkerNotAvailable';
+
+// Update check intervals
+const UPGRADE_CHECK_TIMEOUT = 1 * 24 * 3600 * 1000; // 24 hours
+const LICENSE_CHECK_TIMEOUT = 20 * 60 * 1000; // 20 minutes
+
+/**
+ * License information object
+ * @typedef {Object} LicenseInfo
+ * @property {boolean} active - Whether license is active
+ * @property {Object|boolean} details - License details or false if no license
+ * @property {string} type - License type description
+ */
+const licenseInfo = {
+    active: false,
+    details: false,
+    type: packageData.license
+};
+
+/**
+ * Copy of license details that is safe for logging (the raw license key is removed)
+ * @param {Object|boolean} license - License details object
+ * @returns {Object|boolean} Redacted copy
+ */
+const redactLicense = license => {
+    if (!license || typeof license !== 'object') {
+        return license;
+    }
+    let copy = Object.assign({}, license);
+    delete copy.key;
+    return copy;
+};
+
+/**
+ * Human-readable thread type names for display
+ * @const {Object<string, string>}
+ */
+const THREAD_NAMES = {
+    main: 'Main thread',
+    imap: 'Email worker',
+    webhooks: 'Webhook worker',
+    api: 'HTTP and API server',
+    submit: 'Email sending worker',
+    export: 'Export worker',
+    imapProxy: 'IMAP proxy server',
+    smtp: 'SMTP proxy server'
+};
+
+/**
+ * Configuration key-value mappings for different thread types
+ * @const {Object<string, {key: string, value: number}>}
+ */
+const THREAD_CONFIG_VALUES = {
+    imap: { key: 'EENGINE_WORKERS', value: config.workers.imap },
+    api: { key: 'EENGINE_WORKERS_API', value: config.workers.api },
+    submit: { key: 'EENGINE_WORKERS_SUBMIT', value: config.workers.submit },
+    webhooks: { key: 'EENGINE_WORKERS_WEBHOOKS', value: config.workers.webhooks },
+    export: { key: 'EENGINE_WORKERS_EXPORT', value: config.workers.export }
+};
+
+// Unique run index for this server instance
+let runIndex;
+
+// Whether multiple API workers may share the listen port via SO_REUSEPORT.
+// Determined once at startup by probeReusePort(); false means a single API worker.
+let apiWorkerReusePort = false;
+
+// Requested API worker count (EENGINE_WORKERS_API), surfaced on /admin/internals so operators can
+// see when more workers were requested than could be started. Whether we fell back to a single
+// worker is derived: `apiWorkersRequested > 1 && !apiWorkerReusePort`.
+let apiWorkersRequested = 1;
+
+// Why a multi-worker request fell back to a single API worker, surfaced on /admin/internals so the
+// banner can state the real cause. Set during probeReusePort():
+//  - 'platform': SO_REUSEPORT is unsupported on this OS/Node build (Linux with Node < 23.1, macOS, Windows)
+//  - 'port': the probe could not test the port (transient conflict / permission), so support is unknown
+// Stays null when SO_REUSEPORT is supported or only one worker was requested.
+let apiWorkerReusePortFallbackReason = null;
+
+/**
+ * Probe whether SO_REUSEPORT can load-balance across multiple sockets on this
+ * platform. Binds two listeners to the same host:port with reusePort enabled;
+ * both must succeed for load balancing to work. It is unsupported on macOS,
+ * Windows, and Node < 23.1, where either the first bind fails outright (e.g.
+ * ENOTSUP) or - when the reusePort option is silently ignored (Node < 23.1) -
+ * the first bind succeeds as a plain bind and the second fails with EADDRINUSE.
+ * The `stage` field tells the caller where the probe failed so it can separate a
+ * genuine platform/capability limitation from a transient port conflict:
+ *   - 'probe': the first bind failed, so the port could not even be tested. An
+ *     EADDRINUSE/EACCES code here means the port is unavailable (transient); any
+ *     other code means the platform rejected reusePort.
+ *   - 'reuse': the first bind succeeded but the second did not, so reusePort is
+ *     not honored on this platform/Node - a capability limitation, even though
+ *     the failing code is EADDRINUSE.
+ *   - null: SO_REUSEPORT is supported.
+ * @param {string} host - Bind address
+ * @param {number} port - Listen port
+ * @returns {Promise<{supported: boolean, code: (string|null), stage: (string|null)}>}
+ *   Whether SO_REUSEPORT load balancing works, the failing bind's error code (or
+ *   null), and which bind failed ('probe', 'reuse', or null when supported)
+ */
+async function probeReusePort(host, port) {
+    const net = require('net');
+
+    const open = () =>
+        new Promise(resolve => {
+            let srv = net.createServer();
+            srv.once('error', err => resolve({ srv: null, code: (err && err.code) || null }));
+            try {
+                srv.listen({ host, port, reusePort: true }, () => resolve({ srv, code: null }));
+            } catch (err) {
+                resolve({ srv: null, code: (err && err.code) || null });
+            }
+        });
+
+    const close = srv =>
+        new Promise(resolve => {
+            if (!srv) {
+                return resolve();
+            }
+            srv.close(() => resolve());
+        });
+
+    let first = await open();
+    if (!first.srv) {
+        // Could not even bind the first probe socket, so the port itself could not be tested.
+        return { supported: false, code: first.code, stage: 'probe' };
+    }
+
+    let second = await open();
+    await close(first.srv);
+    await close(second.srv);
+
+    if (second.srv) {
+        return { supported: true, code: null, stage: null };
+    }
+
+    // The first bind succeeded but a second listener on the same host:port did not, so the kernel is
+    // not load-balancing via SO_REUSEPORT - the option was accepted/ignored but not honored (e.g.
+    // Linux with Node < 23.1, where reusePort is an unrecognized listen() option). This is a platform
+    // limitation, not a port conflict, even though the failing code is EADDRINUSE.
+    return { supported: false, code: second.code, stage: 'reuse' };
+}
+
+/**
+ * Compute per-worker spawn options. API workers receive their index and whether to
+ * bind with SO_REUSEPORT; other worker types need no extra workerData. Keeps the
+ * startup and respawn paths deriving spawn options from a single place.
+ * @param {string} type - Worker type
+ * @param {number} workerIndex - Zero-based index within the worker type
+ * @returns {Object|undefined} Spawn options for spawnWorker(), or undefined
+ */
+const workerSpawnOpts = (type, workerIndex) => (type === 'api' ? { workerData: { workerIndex, reusePort: apiWorkerReusePort } } : undefined);
+
+// Prepared configuration handling
+let preparedSettings = false;
+const preparedSettingsString = readEnvValue('EENGINE_SETTINGS') || config.settings;
+if (preparedSettingsString) {
+    // Parse and validate pre-configured settings
+    try {
+        const parsedSettings = JSON.parse(preparedSettingsString);
+
+        const { error, value } = Joi.object(settingsSchema).validate(parsedSettings, {
+            abortEarly: false,
+            stripUnknown: true,
+            convert: true
+        });
+
+        if (error) {
+            throw error;
+        }
+
+        // stripUnknown drops unknown keys without an error, which silently swallows both typos
+        // and keys that used to be settings - most notably the legacy gmail*/outlook*/mailRu*
+        // OAuth2 keys that moved into the OAuth2 app registry. Booting on regardless is right
+        // (an upgraded install must not be bricked by a stale env variable), but the drop has
+        // to be visible: for the legacy keys the operator has to create an OAuth2 app instead,
+        // because nothing reads these values anymore.
+        if (parsedSettings && typeof parsedSettings === 'object') {
+            const droppedKeys = Object.keys(parsedSettings).filter(key => !Object.hasOwn(settingsSchema, key));
+            if (droppedKeys.length) {
+                logger.error({
+                    msg: 'Ignoring unknown keys in the prepared settings. Settings-based OAuth2 configuration is not supported anymore - use an OAuth2 app instead',
+                    keys: droppedKeys
+                });
+            }
+        }
+
+        preparedSettings = value;
+    } catch (err) {
+        // A joi failure here carries every submitted setting - including smtpServerPassword,
+        // imapProxyServerPassword and serviceSecret - and this logger has no redaction of its own
+        logger.fatal({ msg: 'Invalid settings configuration provided', err: redactValidationError(err) });
+        logger.flush(() => process.exit(1));
+    }
+}
+
+// Prepared token handling for pre-configured API tokens
+let preparedToken = false;
+const preparedTokenString = readEnvValue('EENGINE_PREPARED_TOKEN') || config.preparedToken;
+if (preparedTokenString) {
+    try {
+        preparedToken = msgpack.decode(Buffer.from(preparedTokenString, 'base64url'));
+        if (!preparedToken || !/^[0-9a-f]{64}$/i.test(preparedToken.id)) {
+            throw new Error('Token format is invalid');
+        }
+    } catch (err) {
+        logger.fatal({ msg: 'Invalid API token provided', inputLength: preparedTokenString.length, err });
+        logger.flush(() => process.exit(1));
+    }
+}
+
+// Prepared password handling for pre-configured admin passwords
+let preparedPassword = false;
+const preparedPasswordString = readEnvValue('EENGINE_PREPARED_PASSWORD') || config.preparedPassword;
+if (preparedPasswordString) {
+    try {
+        preparedPassword = Buffer.from(preparedPasswordString, 'base64url').toString();
+        if (!preparedPassword || preparedPassword.indexOf('$pbkdf2') !== 0) {
+            throw new Error('Password format is invalid');
+        }
+    } catch (err) {
+        logger.fatal({ msg: 'Invalid password hash provided', err });
+        logger.flush(() => process.exit(1));
+    }
+}
+
+// Initialize Prometheus metrics collection
+const collectDefaultMetrics = promClient.collectDefaultMetrics;
+collectDefaultMetrics({});
+
+/**
+ * Prometheus metrics definitions for monitoring
+ * @const {Object}
+ */
+const metrics = {
+    threadStarts: new promClient.Counter({
+        name: 'thread_starts',
+        help: 'Number of started threads'
+    }),
+
+    threadStops: new promClient.Counter({
+        name: 'thread_stops',
+        help: 'Number of stopped threads'
+    }),
+
+    apiCall: new promClient.Counter({
+        name: 'api_call',
+        help: 'Number of API calls',
+        labelNames: ['method', 'statusCode', 'route']
+    }),
+
+    // Labelled by route, not by status: the counter above already splits by status, and a latency
+    // series per status code would multiply the route count for little an operator can act on
+    apiCallDuration: new promClient.Histogram({
+        name: 'api_call_duration_seconds',
+        help: 'Duration of API calls, from receiving the request to sending the response',
+        labelNames: ['method', 'route'],
+        buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]
+    }),
+
+    imapConnections: new promClient.Gauge({
+        name: 'imap_connections',
+        help: 'Current IMAP connection state',
+        labelNames: ['status']
+    }),
+
+    imapResponses: new promClient.Counter({
+        name: 'imap_responses',
+        help: 'IMAP responses',
+        labelNames: ['response', 'code']
+    }),
+
+    imapBytesSent: new promClient.Counter({
+        name: 'imap_bytes_sent',
+        help: 'IMAP bytes sent'
+    }),
+
+    imapBytesReceived: new promClient.Counter({
+        name: 'imap_bytes_received',
+        help: 'IMAP bytes received'
+    }),
+
+    oauth2TokenRefresh: new promClient.Counter({
+        name: 'oauth2_token_refresh',
+        help: 'OAuth2 access token refresh attempts',
+        labelNames: ['status', 'provider', 'statusCode']
+    }),
+
+    oauth2ApiRequest: new promClient.Counter({
+        name: 'oauth2_api_request',
+        help: 'OAuth2 API requests (MS Graph, Gmail API)',
+        labelNames: ['status', 'provider', 'statusCode']
+    }),
+
+    outlookMissedRecovery: new promClient.Counter({
+        name: 'outlook_missed_recovery',
+        help: 'MS Graph missed-notification recovery passes, by what asked for them and whether they found unannounced messages',
+        labelNames: ['reason', 'outcome']
+    }),
+
+    outlookMissedRecoveredMessages: new promClient.Counter({
+        name: 'outlook_missed_recovered_messages',
+        help: 'New messages announced by MS Graph missed-notification recovery instead of by a change notification',
+        labelNames: ['reason']
+    }),
+
+    outlookSubscriptions: new promClient.Gauge({
+        name: 'outlook_subscriptions',
+        help: 'MS Graph webhook subscription states',
+        labelNames: ['status']
+    }),
+
+    webhooks: new promClient.Counter({
+        name: 'webhooks',
+        help: 'Webhooks sent',
+        labelNames: ['status', 'event']
+    }),
+
+    events: new promClient.Counter({
+        name: 'events',
+        help: 'Events fired',
+        labelNames: ['event']
+    }),
+
+    aiRequests: new promClient.Counter({
+        name: 'ai_requests',
+        help: 'AI summary requests',
+        labelNames: ['model', 'status']
+    }),
+
+    aiTokens: new promClient.Counter({
+        name: 'ai_tokens',
+        help: 'Tokens billed for AI summary requests',
+        labelNames: ['model', 'type']
+    }),
+
+    webhookReq: new promClient.Histogram({
+        name: 'webhook_req',
+        help: 'Duration of webhook requests',
+        buckets: [100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000, 60 * 1000]
+    }),
+
+    queues: new promClient.Gauge({
+        name: 'queue_size',
+        help: 'Queue size',
+        labelNames: ['queue', 'state']
+    }),
+
+    queueFailed: new promClient.Gauge({
+        name: 'queue_failed_jobs',
+        help: 'Failed jobs a queue still retains (deliveries that were given up on)',
+        labelNames: ['queue']
+    }),
+
+    queuesProcessed: new promClient.Counter({
+        name: 'queues_processed',
+        help: 'Processed job count',
+        labelNames: ['queue', 'status']
+    }),
+
+    threads: new promClient.Gauge({
+        name: 'threads',
+        help: 'Worker Threads',
+        labelNames: ['type', 'recent']
+    }),
+
+    unresponsiveWorkers: new promClient.Gauge({
+        name: 'unresponsive_workers',
+        help: 'Number of unresponsive worker threads'
+    }),
+
+    threadEventLoopDelayMax: new promClient.Gauge({
+        name: 'thread_event_loop_delay_max_seconds',
+        help: 'Longest event loop delay of a thread over the last collection window (15s)',
+        labelNames: ['type', 'thread']
+    }),
+
+    threadEventLoopDelayP99: new promClient.Gauge({
+        name: 'thread_event_loop_delay_p99_seconds',
+        help: '99th percentile event loop delay of a thread over the last collection window (15s)',
+        labelNames: ['type', 'thread']
+    }),
+
+    threadHeapUsed: new promClient.Gauge({
+        name: 'thread_heap_used_bytes',
+        help: 'V8 heap in use by a thread, as of the last collection (15s)',
+        labelNames: ['type', 'thread']
+    }),
+
+    threadHeapTotal: new promClient.Gauge({
+        name: 'thread_heap_total_bytes',
+        help: 'V8 heap allocated by a thread, as of the last collection (15s)',
+        labelNames: ['type', 'thread']
+    }),
+
+    licenseDaysRemaining: new promClient.Gauge({
+        name: 'license_days_remaining',
+        help: 'Days until license expires (-1 for lifetime, 0 for no license)'
+    }),
+
+    emailengineConfig: new promClient.Gauge({
+        name: 'emailengine_config',
+        help: 'Configuration values',
+        labelNames: ['version', 'config']
+    }),
+
+    redisVersion: new promClient.Gauge({
+        name: 'redis_version',
+        help: 'Redis version',
+        labelNames: ['version']
+    }),
+
+    redisUptimeInSeconds: new promClient.Gauge({
+        name: 'redis_uptime_in_seconds',
+        help: 'Redis uptime in seconds'
+    }),
+
+    redisPing: new promClient.Gauge({
+        name: 'redis_latency',
+        help: 'Redis latency in nanoseconds'
+    }),
+
+    redisRejectedConnectionsTotal: new promClient.Gauge({
+        name: 'redis_rejected_connections_total',
+        help: 'Number of connections rejected by Redis'
+    }),
+
+    redisConfigMaxclients: new promClient.Gauge({
+        name: 'redis_config_maxclients',
+        help: 'Maximum client number for Redis'
+    }),
+
+    redisConnectedClients: new promClient.Gauge({
+        name: 'redis_connected_clients',
+        help: 'Number of client connections for Redis'
+    }),
+
+    redisSlowlogLength: new promClient.Gauge({
+        name: 'redis_slowlog_length',
+        help: 'Number of of entries in the Redis slow log'
+    }),
+
+    redisCommandsDurationSecondsTotal: new promClient.Gauge({
+        name: 'redis_commands_duration_seconds_total',
+        help: 'How many seconds spend on processing Redis commands'
+    }),
+
+    redisCommandsProcessedTotal: new promClient.Gauge({
+        name: 'redis_commands_processed_total',
+        help: 'How many commands processed by Redis'
+    }),
+
+    redisKeyspaceHitsTotal: new promClient.Gauge({
+        name: 'redis_keyspace_hits_total',
+        help: 'Number of successful lookup of keys in Redis'
+    }),
+
+    redisKeyspaceMissesTotal: new promClient.Gauge({
+        name: 'redis_keyspace_misses_total',
+        help: 'Number of failed lookup of keys in Redis'
+    }),
+
+    redisEvictedKeysTotal: new promClient.Gauge({
+        name: 'redis_evicted_keys_total',
+        help: 'Number of evicted keys due to maxmemory limit in Redis'
+    }),
+
+    redisMemoryUsedBytes: new promClient.Gauge({
+        name: 'redis_memory_used_bytes',
+        help: 'Total number of bytes allocated by Redis using its allocator'
+    }),
+
+    redisMemoryMaxBytes: new promClient.Gauge({
+        name: 'redis_memory_max_bytes',
+        help: 'The value of the Redis maxmemory configuration directive'
+    }),
+
+    redisMemFragmentationRatio: new promClient.Gauge({
+        name: 'redis_mem_fragmentation_ratio',
+        help: 'Ratio between used_memory_rss and used_memory in Redis'
+    }),
+
+    redisKeyCount: new promClient.Gauge({
+        name: 'redis_key_count',
+        help: 'Redis key counts',
+        labelNames: ['db']
+    }),
+
+    redisLastSaveTime: new promClient.Gauge({
+        name: 'redis_last_save_time',
+        help: 'Unix timestamp of the last RDB save time'
+    }),
+
+    redisOpsPerSec: new promClient.Gauge({
+        name: 'redis_instantaneous_ops_per_sec',
+        help: 'Throughput operations per second'
+    }),
+
+    redisCommandRuns: new promClient.Gauge({
+        name: 'redis_command_runs',
+        help: 'Redis command counts',
+        labelNames: ['command']
+    }),
+
+    redisCommandRunsFailed: new promClient.Gauge({
+        name: 'redis_command_runs_fail',
+        help: 'Redis command counts',
+        labelNames: ['command', 'status']
+    })
+};
+
+// Inter-thread communication tracking
+let callQueue = new Map(); // Tracks pending cross-thread calls
+let mids = 0; // Message ID counter
+
+// Application state flags
+let isClosing = false; // Is the application shutting down?
+let assigning = false; // Is account assignment in progress?
+// Unassign calls in flight at once while rebalanceOnto() holds the assignment lock
+const REBALANCE_CONCURRENCY = 8;
+
+// Account assignment tracking
+let unassigned = false; // Set of unassigned accounts
+let assigned = new Map(); // Map of account -> worker
+let workerAssigned = new WeakMap(); // Map of worker -> Set of accounts
+let onlineWorkers = new WeakSet(); // Set of workers that are online
+let reassignmentTimer = null; // Timer for failsafe reassignment
+let reassignmentPending = false; // Flag to track if reassignment is pending
+const REASSIGNMENT_FAILSAFE_DELAY = 10 * 1000; // How long an exited IMAP worker gets to restart before its accounts move
+let assignRetryCount = 0; // Counter for safety-net retries in assignAccounts
+let assignRetryTimer = null; // The pending safety-net retry, so passes do not stack them
+
+// Worker management
+let imapInitialWorkersLoaded = false; // Have all initial IMAP workers started?
+let workers = new Map(); // Map of type -> Set of workers
+const respawnTracker = new RespawnTracker(); // paces respawns for worker slots that keep crashing
+let spawnSlotCounter = 0; // source of respawn slot ids, see spawnWorker()
+
+// Shutdown drain budget. A worker with no in-flight job answers immediately, so this only costs
+// real time when there is genuinely something to finish - which is exactly when waiting is worth
+// it, because the alternative is a re-sent message. Kept under Docker's 10s default SIGKILL grace
+// so the drain completes rather than being cut halfway.
+const SHUTDOWN_DRAIN_TIMEOUT = 8000;
+const WORKER_DRAIN_TIMEOUT = 7000;
+let workersMeta = new WeakMap(); // Worker metadata
+let availableIMAPWorkers = new Set(); // IMAP workers ready to accept accounts
+
+// Worker health monitoring
+let workerHeartbeats = new WeakMap(); // Map of worker -> last heartbeat timestamp
+let workerHealthStatus = new WeakMap(); // Map of worker -> health status
+const HEARTBEAT_TIMEOUT = 30 * 1000; // 30 seconds before marking unhealthy
+const HEARTBEAT_RESTART_TIMEOUT = 60 * 1000; // 60 seconds before auto-restart
+
+// Suspended worker types (when no license is active)
+let suspendedWorkerTypes = new Set();
+
+/**
+ * Send a message to a worker thread with safety checks
+ * @param {Worker} worker - The worker thread to send to
+ * @param {Object} payload - Message payload
+ * @param {boolean} ignoreOffline - Whether to ignore offline status
+ * @param {Array} transferList - Transferable objects
+ * @returns {boolean} Success status
+ * @throws {Error} If worker is offline and ignoreOffline is false
+ */
+const postMessage = (worker, payload, ignoreOffline, transferList) => {
+    // Check if worker is online
+    if (!onlineWorkers.has(worker)) {
+        if (ignoreOffline) {
+            return false;
+        }
+        throw new Error('Worker thread is not available');
+    }
+
+    // Send the message
+    let result = worker.postMessage(payload, transferList);
+
+    // Update worker metadata
+    let workerMeta = workersMeta.has(worker) ? workersMeta.get(worker) : {};
+    workerMeta.called = workerMeta.called ? ++workerMeta.called : 1;
+    workersMeta.set(worker, workerMeta);
+
+    return result;
+};
+
+/**
+ * Update server state in Redis and notify API workers
+ * @param {string} type - Server type ('smtp' or 'imapProxy')
+ * @param {string} state - New state
+ * @param {Object} payload - Optional payload data
+ * @returns {Promise<void>}
+ */
+let updateServerState = async (type, state, payload) => {
+    // Store state in Redis
+    await redis.hset(`${REDIS_PREFIX}${type}`, 'state', state);
+    if (payload) {
+        await redis.hset(`${REDIS_PREFIX}${type}`, 'payload', JSON.stringify(payload));
+    }
+
+    // Notify all API workers about the state change
+    if (workers.has('api')) {
+        for (let worker of workers.get('api')) {
+            let callPayload = {
+                cmd: 'change',
+                type: `${type}ServerState`,
+                key: state,
+                payload: payload || null
+            };
+
+            try {
+                postMessage(worker, callPayload, true);
+            } catch (err) {
+                logger.error({ msg: 'Unable to notify worker about state change', worker: worker.threadId, callPayload, err });
+            }
+        }
+    }
+};
+
+/**
+ * updateServerState() as a report: never rejects. The listener state is what the admin UI shows,
+ * and a write Redis refuses (OOM, READONLY) must neither keep a worker from starting nor reach
+ * the global handler from a call nobody awaits
+ * @param {string} type - Server type ('smtp' or 'imapProxy')
+ * @param {string} state - New state
+ * @param {Object} [payload] - Optional payload data
+ * @returns {Promise<void>}
+ */
+const reportServerState = (type, state, payload) =>
+    updateServerState(type, state, payload).catch(err => logger.error({ msg: 'Unable to update server state', type, state, err }));
+
+/**
+ * Get detailed information about all threads
+ * @returns {Promise<Array>} Array of thread information objects
+ */
+async function getThreadsInfo() {
+    // Use metrics collector if available
+    if (metricsCollector) {
+        let threadsInfo = await metricsCollector.getThreadsInfo();
+
+        // Add human-readable descriptions and configuration info
+        threadsInfo.forEach(threadInfo => {
+            threadInfo.description = THREAD_NAMES[threadInfo.type];
+            if (THREAD_CONFIG_VALUES[threadInfo.type]) {
+                threadInfo.config = THREAD_CONFIG_VALUES[threadInfo.type];
+            }
+        });
+
+        return threadsInfo;
+    }
+
+    // Fallback to original implementation if collector not initialized
+    // This should only happen during startup or if collector fails
+
+    // Start with main thread info
+    let threadsInfo = [Object.assign({ type: 'main', isMain: true, threadId: 0, online: NOW }, threadStats.usage())];
+
+    // Define a short timeout for unresponsive workers (500ms)
+    const WORKER_STATS_TIMEOUT = 500;
+
+    // Collect info from all worker threads with timeout handling
+    const workerPromises = [];
+    const workerMetadata = [];
+
+    for (let [type, workerSet] of workers) {
+        if (workerSet && workerSet.size) {
+            for (let worker of workerSet) {
+                // Store metadata for later processing
+                workerMetadata.push({ type, worker });
+
+                // Use built-in timeout parameter of call function
+                const workerPromise = call(worker, {
+                    cmd: 'resource-usage',
+                    timeout: WORKER_STATS_TIMEOUT
+                }).catch(err => ({
+                    // Return error info instead of throwing
+                    resourceUsageError: {
+                        error: err.message,
+                        code: err.code || 'TIMEOUT',
+                        unresponsive: err.code === 'Timeout'
+                    }
+                }));
+
+                workerPromises.push(workerPromise);
+            }
+        }
+    }
+
+    // Wait for all workers to respond or timeout using allSettled
+    const results = await Promise.allSettled(workerPromises);
+
+    // Process results
+    results.forEach((result, index) => {
+        const { type, worker } = workerMetadata[index];
+        const resourceUsage =
+            result.status === 'fulfilled'
+                ? result.value
+                : {
+                      resourceUsageError: {
+                          error: result.reason?.message || 'Unknown error',
+                          code: 'PROMISE_REJECTED',
+                          unresponsive: true
+                      }
+                  };
+
+        let threadData = Object.assign(
+            {
+                type,
+                threadId: worker.threadId,
+                resourceLimits: worker.resourceLimits
+            },
+            resourceUsage
+        );
+
+        // Add account count for IMAP workers
+        if (workerAssigned.has(worker)) {
+            threadData.accounts = workerAssigned.get(worker).size;
+        }
+
+        // Add health status
+        threadData.healthStatus = workerHealthStatus.get(worker) || 'unknown';
+        const lastHeartbeat = workerHeartbeats.get(worker);
+        if (lastHeartbeat) {
+            threadData.lastHeartbeat = lastHeartbeat;
+            threadData.timeSinceHeartbeat = Date.now() - lastHeartbeat;
+        }
+
+        // Add worker metadata
+        let workerMeta = workersMeta.has(worker) ? workersMeta.get(worker) : {};
+        for (let key of Object.keys(workerMeta)) {
+            threadData[key] = workerMeta[key];
+        }
+
+        threadsInfo.push(threadData);
+    });
+
+    // Add human-readable descriptions and configuration info
+    threadsInfo.forEach(threadInfo => {
+        threadInfo.description = THREAD_NAMES[threadInfo.type];
+        if (THREAD_CONFIG_VALUES[threadInfo.type]) {
+            threadInfo.config = THREAD_CONFIG_VALUES[threadInfo.type];
+        }
+    });
+
+    return threadsInfo;
+}
+
+/**
+ * The heartbeat log fields for a thread, see lib/thread-diagnostics.js
+ * @param {Worker} worker - The worker thread
+ * @param {number} now - Current time in milliseconds
+ * @param {number} [lastHeartbeat] - When the thread last reported in
+ * @returns {Object} Fields to add to the log entry
+ */
+function workerHeartbeatDiagnostics(worker, now, lastHeartbeat) {
+    return heartbeatDiagnostics({
+        now,
+        lastHeartbeat,
+        accounts: workerAssigned.get(worker)?.size,
+        threadInfo: metricsCollector?.cachedThreadsInfo?.find(threadInfo => threadInfo.threadId === worker.threadId)
+    });
+}
+
+/**
+ * Handle heartbeat from worker thread
+ * @param {Worker} worker - The worker thread
+ */
+function handleWorkerHeartbeat(worker) {
+    const now = Date.now();
+    const previousHeartbeat = workerHeartbeats.get(worker);
+    workerHeartbeats.set(worker, now);
+
+    // Mark as healthy if it was previously unhealthy
+    const previousStatus = workerHealthStatus.get(worker);
+    if (previousStatus === 'unhealthy' || previousStatus === 'critical') {
+        logger.info({
+            msg: 'Worker recovered',
+            threadId: worker.threadId,
+            type: workersMeta.get(worker)?.type,
+            // timeSinceHeartbeat here is how long the thread was blocked
+            ...workerHeartbeatDiagnostics(worker, now, previousHeartbeat)
+        });
+    }
+    workerHealthStatus.set(worker, 'healthy');
+}
+
+/**
+ * Check health of all worker threads
+ * @returns {Promise<void>}
+ */
+async function checkWorkerHealth() {
+    const now = Date.now();
+
+    for (let [type, workerSet] of workers) {
+        for (let worker of workerSet) {
+            const lastHeartbeat = workerHeartbeats.get(worker);
+            const currentStatus = workerHealthStatus.get(worker) || 'unknown';
+
+            if (!lastHeartbeat) {
+                // No heartbeat recorded yet, skip
+                continue;
+            }
+
+            const timeSinceHeartbeat = now - lastHeartbeat;
+
+            if (timeSinceHeartbeat > HEARTBEAT_RESTART_TIMEOUT && currentStatus !== 'restarting') {
+                // Worker is critically unresponsive, restart it
+                logger.error({
+                    msg: 'Worker critically unresponsive, restarting',
+                    threadId: worker.threadId,
+                    type,
+                    ...workerHeartbeatDiagnostics(worker, now, lastHeartbeat)
+                });
+
+                workerHealthStatus.set(worker, 'restarting');
+
+                // Terminate the worker (this will trigger automatic restart)
+                try {
+                    await worker.terminate();
+                } catch (err) {
+                    logger.error({
+                        msg: 'Failed to terminate unresponsive worker',
+                        threadId: worker.threadId,
+                        type,
+                        err
+                    });
+                }
+            } else if (timeSinceHeartbeat > HEARTBEAT_TIMEOUT && currentStatus === 'healthy') {
+                // Worker is unhealthy but not critical yet
+                logger.warn({
+                    msg: 'Worker unhealthy - no heartbeat',
+                    threadId: worker.threadId,
+                    type,
+                    ...workerHeartbeatDiagnostics(worker, now, lastHeartbeat)
+                });
+
+                workerHealthStatus.set(worker, 'unhealthy');
+            }
+        }
+    }
+}
+
+/**
+ * Start worker health monitoring
+ */
+function startHealthMonitoring() {
+    // Check worker health every 5 seconds
+    setInterval(() => {
+        checkWorkerHealth().catch(err => {
+            logger.error({ msg: 'Worker health check failed', err });
+        });
+    }, 5000);
+}
+
+/**
+ * Send a webhook notification
+ * @param {string} account - Account ID
+ * @param {string} event - Event type
+ * @param {Object} data - Event data
+ * @returns {Promise<void>}
+ */
+async function sendWebhook(account, event, data) {
+    let serviceUrl = (await settings.get('serviceUrl')) || null;
+
+    let payload = {
+        serviceUrl,
+        account,
+        date: new Date().toISOString()
+    };
+
+    if (event) {
+        payload.event = event;
+    }
+
+    if (data) {
+        payload.data = data;
+    }
+
+    await Webhooks.enqueue(event, payload);
+}
+
+/**
+ * Spawn a new worker thread of the specified type
+ * @param {string} type - Worker type (imap, api, webhooks, submit, export, smtp, imapProxy)
+ * @param {Object} [opts] - Optional spawn options
+ * @param {Object} [opts.workerData] - Data passed to the worker thread (e.g. API worker index). The
+ *                                      proxy in effect is added for every type, see lib/tools.js
+ * @param {string} [slot] - Respawn slot this thread fills. A respawn passes its predecessor's slot
+ *                          so the crash streak is counted per slot, not per worker type
+ * @returns {Promise<number|void>} Thread ID if successful
+ */
+let spawnWorker = async (type, opts, slot) => {
+    // Don't spawn workers during shutdown
+    if (isClosing) {
+        return;
+    }
+
+    // Initialize worker set if needed
+    if (!workers.has(type)) {
+        workers.set(type, new Set());
+    }
+
+    // Check if worker type is suspended (no license)
+    if (suspendedWorkerTypes.has(type)) {
+        if (['smtp', 'imapProxy'].includes(type)) {
+            await reportServerState(type, 'suspended', {});
+        }
+        return;
+    }
+
+    // Check if server type is enabled
+    if (['smtp', 'imapProxy'].includes(type)) {
+        // Retried rather than failed: a respawn that could not read the setting (Redis refusing
+        // commands, a failover) used to end the respawn chain, and the listener stayed down until
+        // the process restarted
+        let serverEnabled = await retryWithBackoff(() => settings.get(`${type}ServerEnabled`), {
+            delayFor: attempt => respawnTracker.delayFor(attempt),
+            shouldStop: () => isClosing,
+            onError: (err, delay) => logger.error({ msg: 'Unable to read the listener setting, retrying', type, delay, err })
+        });
+        if (isClosing) {
+            return;
+        }
+        if (!serverEnabled) {
+            await reportServerState(type, 'disabled', {});
+            return;
+        }
+
+        await reportServerState(type, 'spawning');
+    }
+
+    // A fresh spawn opens its own slot. Counting the crash streak per type made every short-lived
+    // exit of ANY IMAP worker double the next respawn delay of all of them, so unrelated exits
+    // pushed a restart past the failsafe reassignment (REASSIGNMENT_FAILSAFE_DELAY).
+    if (!slot) {
+        slot = `${type}:${++spawnSlotCounter}`;
+    }
+
+    // Create new worker thread
+    let spawnedAt = Date.now();
+    let worker = new WorkerThread(pathlib.join(__dirname, 'workers', `${type.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}.js`), {
+        argv,
+        env: SHARE_ENV,
+        // every worker builds its HTTP dispatchers from the proxy in effect before its first line of
+        // code runs (lib/tools.js); this thread resolved it from settings before spawning anything
+        workerData: Object.assign({ httpProxyUrl: httpAgent.proxyUrl }, opts && opts.workerData),
+        trackUnmanagedFds: true
+    });
+    metrics.threadStarts.inc();
+
+    workers.get(type).add(worker);
+
+    return new Promise((resolve, reject) => {
+        let isOnline = false;
+        let threadId = worker.threadId;
+
+        // Capture worker crash errors for logging
+        worker.on('error', err => {
+            logger.error({
+                msg: 'Worker thread error',
+                type,
+                threadId: worker.threadId,
+                err
+            });
+        });
+
+        // Handle worker coming online
+        worker.on('online', () => {
+            if (['smtp', 'imapProxy'].includes(type)) {
+                reportServerState(type, 'initializing');
+            }
+            onlineWorkers.add(worker);
+
+            // Update worker metadata
+            let workerMeta = workersMeta.has(worker) ? workersMeta.get(worker) : {};
+            workerMeta.online = Date.now();
+            workersMeta.set(worker, workerMeta);
+
+            // Non-IMAP/API workers are ready immediately
+            if (type !== 'imap' && type !== 'api') {
+                isOnline = true;
+                resolve(threadId);
+            }
+        });
+
+        /**
+         * Handle worker exit
+         * @param {number} exitCode - Process exit code
+         */
+        let exitHandler = async exitCode => {
+            onlineWorkers.delete(worker);
+            metrics.threadStops.inc();
+
+            // One classification for the whole handler: a suspended worker type and a clean exit
+            // code are both deliberate, anything else is a worker that died.
+            const unexpectedExit = exitCode !== 0 && !suspendedWorkerTypes.has(type);
+
+            // What a worker death cost - dropped API calls and offline accounts - is only ever
+            // stated by the lines below, and they fire on deliberate exits too. The unexpected
+            // case is the one an operator has to see, and most deployments run above info, so
+            // that case logs at warn while a clean or requested stop stays at info.
+            const exitLevel = unexpectedExit && !isClosing ? 'warn' : 'info';
+
+            // Fail any in-flight calls routed to this worker right away, so callers
+            // get a fast retryable error instead of hanging until their own timeout.
+            let rejectedCalls = rejectWorkerCalls(callQueue, worker, WORKER_DIED_RESP_ERR);
+            if (rejectedCalls) {
+                logger[exitLevel]({ msg: 'Rejected in-flight calls for exited worker', type, threadId: worker.threadId, rejectedCalls });
+            }
+
+            workers.get(type).delete(worker);
+
+            // Update server state for proxy servers
+            if (['smtp', 'imapProxy'].includes(type)) {
+                // Not awaited: reportServerState() handles a Redis reply error (OOM, READONLY), which
+                // would otherwise reach the global handler and take the whole process down with it
+                reportServerState(type, suspendedWorkerTypes.has(type) ? 'suspended' : 'exited');
+            }
+
+            // Handle IMAP worker cleanup
+            if (type === 'imap') {
+                availableIMAPWorkers.delete(worker);
+
+                // Reassign accounts from dead worker
+                let accountList = releaseWorkerAccounts({ workerAssigned, assigned, unassigned }, worker);
+                if (accountList) {
+                    logger[exitLevel]({
+                        msg: 'Worker exited, moving accounts to unassigned',
+                        accounts: accountList.size,
+                        exitCode
+                    });
+                } else if (exitCode === 0) {
+                    // Worker exited cleanly (likely Redis reconnection) but we lost track of its accounts
+                    // This can happen when Redis disconnects and reconnects
+                    logger.warn({
+                        msg: 'Worker exited cleanly but had no tracked accounts, checking for orphaned accounts',
+                        exitCode,
+                        availableWorkers: availableIMAPWorkers.size
+                    });
+
+                    // Check if all workers have exited (Redis reconnection scenario)
+                    if (availableIMAPWorkers.size === 0) {
+                        // Account tracking was lost fleet-wide - the same class of event as the
+                        // warn above, and equally invisible to an operator running above info
+                        logger.warn({
+                            msg: 'All IMAP workers exited, reloading accounts from Redis for reassignment'
+                        });
+
+                        // Reload all accounts from Redis since we lost track
+                        try {
+                            let accounts = await redis.smembers(`${REDIS_PREFIX}ia:accounts`);
+                            unassigned = new Set(accounts);
+                            assigned.clear();
+                            workerAssigned = new WeakMap();
+
+                            logger.warn({
+                                msg: 'Reloaded accounts from Redis',
+                                accountCount: accounts.length
+                            });
+                        } catch (err) {
+                            logger.error({
+                                msg: 'Failed to reload accounts from Redis',
+                                err
+                            });
+                        }
+                    }
+                }
+
+                // Don't reassign immediately - wait for the worker to restart
+                if (unassigned && unassigned.size > 0) {
+                    reassignmentPending = true;
+
+                    // If the worker does not restart in time, its accounts go to the others anyway
+                    armReassignmentFailsafe();
+
+                    logger[exitLevel]({
+                        msg: 'Worker exited, waiting for restart before reassignment',
+                        accounts: unassigned.size,
+                        expectedWorkers: config.workers.imap,
+                        currentWorkers: availableIMAPWorkers.size
+                    });
+                }
+            }
+
+            if (isClosing) {
+                return;
+            }
+
+            // Log worker exit
+            if (unexpectedExit) {
+                logger.error({ msg: 'Worker unexpectedly exited', exitCode, type });
+            } else if (suspendedWorkerTypes.has(type)) {
+                logger.info({ msg: 'Worker thread terminated', exitCode, type });
+            } else {
+                // Clean exit, e.g. the deliberate exit-for-restart after a Redis reconnection
+                logger.info({ msg: 'Worker exited', exitCode, type });
+            }
+
+            // Respawn worker after delay, preserving any spawn options (e.g. API worker index).
+            // The delay grows while a worker type keeps dying on startup, so a deterministic
+            // crash no longer respawns once a second forever.
+            let respawnDelay = respawnTracker.recordExit(slot, Date.now() - spawnedAt);
+            let streak = respawnTracker.streakFor(slot);
+            if (streak > 1) {
+                logger.warn({ msg: 'Worker is crash looping, delaying respawn', type, slot, consecutiveFailures: streak, respawnDelay });
+            }
+            await new Promise(r => setTimeout(r, respawnDelay));
+            await spawnWorker(type, opts, slot);
+        };
+
+        // Handle worker exit
+        worker.on('exit', exitCode => {
+            if (!isOnline) {
+                let error = new Error(`Unable to start ${type} worker thread`);
+
+                error.workerType = type;
+                error.exitCode = exitCode;
+                error.threadId = threadId;
+
+                reject(error);
+            }
+
+            exitHandler(exitCode).catch(err => {
+                logger.error({ msg: 'Error handling worker exit', exitCode, type, worker: worker.threadId, err });
+            });
+        });
+
+        // Handle messages from worker
+        worker.on('message', message => {
+            // Update message count
+            let workerMeta = workersMeta.has(worker) ? workersMeta.get(worker) : {};
+            workerMeta.messages = workerMeta.messages ? ++workerMeta.messages : 1;
+            workersMeta.set(worker, workerMeta);
+
+            if (!message) {
+                return;
+            }
+
+            // Handle heartbeat from worker
+            if (message.cmd === 'heartbeat') {
+                handleWorkerHeartbeat(worker);
+                return;
+            }
+
+            // Handle response to a call
+            if (message.cmd === 'resp' && message.mid && callQueue.has(message.mid)) {
+                let { resolve, reject, timer } = callQueue.get(message.mid);
+                clearTimeout(timer);
+                callQueue.delete(message.mid);
+                if (message.error) {
+                    return reject(unpackRpcError(message));
+                } else {
+                    return resolve(message.response);
+                }
+            }
+
+            // Handle call from worker
+            if (message.cmd === 'call' && message.mid) {
+                return onCommand(worker, message.message)
+                    .then(response => {
+                        let transferList;
+                        // Handle transferable objects
+                        if (response && typeof response === 'object' && response._transfer === true) {
+                            if (typeof response._response === 'object' && response._response && response._response.buffer) {
+                                transferList = [response._response.buffer];
+                            }
+                            response = response._response;
+                        }
+
+                        let callPayload = {
+                            cmd: 'resp',
+                            mid: message.mid,
+                            response
+                        };
+
+                        try {
+                            postMessage(worker, callPayload, null, transferList);
+                        } catch (err) {
+                            // Log buffer info instead of full buffer
+                            if (Buffer.isBuffer(callPayload.response)) {
+                                callPayload.response = `Buffer <${callPayload.response.length}B>`;
+                            }
+
+                            logger.error({ msg: 'Unable to send response to worker', worker: worker.threadId, callPayload, err });
+                        }
+                    })
+                    .catch(err => {
+                        let callPayload = Object.assign({ cmd: 'resp', mid: message.mid }, packRpcError(err));
+
+                        try {
+                            postMessage(worker, callPayload);
+                        } catch (err) {
+                            logger.error({ msg: 'Unable to send error response to worker', worker: worker.threadId, callPayload, err });
+                        }
+                    });
+            }
+
+            // Handle metrics messages
+            switch (message.cmd) {
+                case 'metrics': {
+                    let statUpdateKey = false;
+                    let accountUpdateKey = false;
+
+                    let { account } = message.meta || {};
+
+                    // Determine which metrics to update
+                    switch (message.key) {
+                        case 'webhooks': {
+                            let { status } = message.args[0] || {};
+                            statUpdateKey = `${message.key}:${status}`;
+                            break;
+                        }
+
+                        case 'webhookReq': {
+                            break;
+                        }
+
+                        case 'events': {
+                            let { event } = message.args[0] || {};
+                            if (account) {
+                                accountUpdateKey = `${message.key}:${event}`;
+                            }
+
+                            // Track specific events
+                            switch (event) {
+                                case MESSAGE_NEW_NOTIFY:
+                                case MESSAGE_DELETED_NOTIFY:
+                                case CONNECT_ERROR_NOTIFY:
+                                    statUpdateKey = `${message.key}:${event}`;
+                                    break;
+                            }
+                            break;
+                        }
+
+                        case 'apiCall': {
+                            let { statusCode, method, route } = message.args[0] || {};
+                            let success = statusCode >= 200 && statusCode < 300;
+                            statUpdateKey = `${message.key}:${success ? 'success' : 'fail'}`;
+                            if (typeof message.duration === 'number' && Number.isFinite(message.duration)) {
+                                try {
+                                    metrics.apiCallDuration.observe({ method, route }, message.duration);
+                                } catch (err) {
+                                    logger.error({ msg: 'Unable to apply worker metric', type, key: 'apiCallDuration', err });
+                                }
+                            }
+                            break;
+                        }
+
+                        case 'queuesProcessed': {
+                            let { queue, status } = message.args[0] || {};
+                            if (['submit'].includes(queue)) {
+                                statUpdateKey = `${queue}:${status === 'completed' ? 'success' : 'fail'}`;
+                            }
+                            break;
+                        }
+                    }
+
+                    // Update Redis counters for dashboard stats
+                    if (statUpdateKey) {
+                        let now = new Date();
+
+                        // Create daily bucket
+                        let dateStr = `${now
+                            .toISOString()
+                            .substr(0, 10)
+                            .replace(/[^0-9]+/g, '')}`;
+
+                        // Create minute bucket
+                        let timeStr = `${now
+                            .toISOString()
+                            .substr(0, 16)
+                            .replace(/[^0-9]+/g, '')}`;
+
+                        let hkey = `${REDIS_PREFIX}stats:${statUpdateKey}:${dateStr}`;
+
+                        let update = redis
+                            .multi()
+                            .hincrby(hkey, timeStr, 1)
+                            .sadd(`${REDIS_PREFIX}stats:keys`, statUpdateKey)
+                            .expire(hkey, (MAX_DAYS_STATS + 1) * 24 * 3600); // Keep for configured days + 1
+
+                        if (account && accountUpdateKey) {
+                            // Update account-specific counter
+                            let accountKey = accountDataKey(account);
+                            update = update.hIncrbyExists(accountKey, `stats:count:${accountUpdateKey}`, 1);
+                        }
+
+                        update.exec().catch(() => false);
+                    } else if (account && accountUpdateKey) {
+                        // Update only account-specific counter
+                        let accountKey = accountDataKey(account);
+                        redis.hIncrbyExists(accountKey, `stats:count:${accountUpdateKey}`, 1).catch(() => false);
+                    }
+
+                    // Update Prometheus metrics. prom-client throws synchronously on an unknown
+                    // label, a negative counter increment or a non-finite value, and this runs in
+                    // an event handler on the main thread, where a throw would take every worker
+                    // down with it.
+                    if (message.key && metrics[message.key] && typeof metrics[message.key][message.method] === 'function') {
+                        try {
+                            metrics[message.key][message.method](...message.args);
+                        } catch (err) {
+                            logger.error({ msg: 'Unable to apply worker metric', type, key: message.key, method: message.method, err });
+                        }
+                    }
+
+                    return;
+                }
+
+                case 'settings':
+                    // Reload the HTTP proxy agent in the main thread when proxy settings change
+                    maybeReloadHttpProxyAgent(message.data);
+
+                    // Forward settings changes to all IMAP workers
+                    availableIMAPWorkers.forEach(worker => {
+                        try {
+                            postMessage(worker, message);
+                        } catch (err) {
+                            logger.error({
+                                msg: 'Unable to forward settings to worker',
+                                worker: worker.threadId,
+                                settingsKeys: Object.keys(message.data || {}),
+                                err
+                            });
+                        }
+                    });
+
+                    // Forward settings changes to every other worker type (the IMAP workers were
+                    // handled above); each reloads its HTTP proxy agent from the 'settings' message
+                    for (let [type, typeWorkers] of workers) {
+                        if (type === 'imap') {
+                            continue;
+                        }
+                        typeWorkers.forEach(worker => {
+                            try {
+                                postMessage(worker, message);
+                            } catch (err) {
+                                logger.error({ msg: 'Unable to forward settings to worker', type, worker: worker.threadId, err });
+                            }
+                        });
+                    }
+                    return;
+
+                case 'change':
+                    // Handle state changes
+                    switch (message.type) {
+                        case 'smtpServerState':
+                        case 'imapProxyServerState': {
+                            let type = message.type.replace(/ServerState$/, '');
+                            reportServerState(type, message.key, message.payload);
+                            break;
+                        }
+                        default:
+                            // Forward all other state changes to API workers
+                            for (let worker of workers.get('api') || []) {
+                                try {
+                                    postMessage(worker, message, true);
+                                } catch (err) {
+                                    logger.error({ msg: 'Unable to forward state change to worker', worker: worker.threadId, callPayload: message, err });
+                                }
+                            }
+                    }
+                    break;
+            }
+
+            // Handle worker type specific messages
+            switch (type) {
+                case 'imap':
+                    if (message.cmd === 'ready') {
+                        // IMAP worker is ready to accept accounts
+                        availableIMAPWorkers.add(worker);
+                        isOnline = true;
+
+                        // Initialize heartbeat tracking
+                        workerHeartbeats.set(worker, Date.now());
+                        workerHealthStatus.set(worker, 'healthy');
+
+                        resolve(worker.threadId);
+
+                        logger.info({
+                            msg: 'IMAP worker ready',
+                            threadId: worker.threadId,
+                            currentWorkers: availableIMAPWorkers.size,
+                            expectedWorkers: config.workers.imap,
+                            unassignedCount: unassigned ? unassigned.size : 0,
+                            assignedCount: assigned.size,
+                            imapInitialWorkersLoaded,
+                            reassignmentPending
+                        });
+
+                        if (imapInitialWorkersLoaded && reassignmentPending) {
+                            // Check if we now have the expected number of workers
+                            // This handles the case where a worker crashed and restarted
+                            if (availableIMAPWorkers.size === config.workers.imap) {
+                                // All workers are back - clear timer and reassign
+                                if (reassignmentTimer) {
+                                    clearTimeout(reassignmentTimer);
+                                    reassignmentTimer = null;
+                                }
+                                reassignmentPending = false;
+
+                                if (unassigned && unassigned.size > 0) {
+                                    logger.info({
+                                        msg: 'All expected workers ready, reassigning unassigned accounts',
+                                        workers: availableIMAPWorkers.size,
+                                        unassigned: unassigned.size
+                                    });
+                                    assignAccounts().catch(err => logger.error({ msg: 'Unable to assign accounts', err }));
+                                } else {
+                                    logger.warn({
+                                        msg: 'All workers ready but no unassigned accounts found',
+                                        workers: availableIMAPWorkers.size
+                                    });
+                                }
+                            } else if (unassigned && unassigned.size > 0) {
+                                // Still waiting for more workers to restart
+                                logger.info({
+                                    msg: 'Worker ready, waiting for all workers before reassignment',
+                                    currentWorkers: availableIMAPWorkers.size,
+                                    expectedWorkers: config.workers.imap,
+                                    unassignedAccounts: unassigned.size
+                                });
+                                // The failsafe found no worker at all and stopped; give the rest
+                                // of the fleet the same time to come back from here
+                                if (!reassignmentTimer) {
+                                    armReassignmentFailsafe();
+                                }
+                            }
+                        } else if (imapInitialWorkersLoaded) {
+                            // The failsafe timer already gave this worker's accounts to the
+                            // survivors (or it is an extra worker), so nothing is pending for it
+                            rebalanceOnto(worker).catch(err => logger.error({ msg: 'Unable to rebalance accounts', err }));
+                        }
+                    }
+                    break;
+
+                case 'api':
+                    if (message.cmd === 'ready') {
+                        // API worker is ready
+                        isOnline = true;
+
+                        // Initialize heartbeat tracking
+                        workerHeartbeats.set(worker, Date.now());
+                        workerHealthStatus.set(worker, 'healthy');
+
+                        resolve(worker.threadId);
+                    }
+                    break;
+
+                default:
+                    // For all other worker types
+                    if (message.cmd === 'ready') {
+                        isOnline = true;
+
+                        // Initialize heartbeat tracking
+                        workerHeartbeats.set(worker, Date.now());
+                        workerHealthStatus.set(worker, 'healthy');
+
+                        resolve(worker.threadId);
+                    }
+                    break;
+            }
+        });
+    });
+};
+
+/**
+ * Call a command on a worker thread and wait for response
+ * @param {Worker} worker - Target worker thread
+ * @param {Object} message - Message to send
+ * @param {Array} transferList - Optional transferable objects
+ * @returns {Promise<*>} Response from worker
+ * @throws {Error} Timeout or communication error
+ */
+async function call(worker, message, transferList) {
+    return new Promise((resolve, reject) => {
+        // Generate unique message ID
+        let mid = `${Date.now()}:${++mids}`;
+
+        // Calculate timeout - use explicit timeout if provided, otherwise fall back to EENGINE_TIMEOUT
+        let ttl = typeof message.timeout === 'number' && message.timeout > 0 ? message.timeout : EENGINE_TIMEOUT || 0;
+
+        // Set timeout handler
+        let timer = setTimeout(() => {
+            let err = new Error('Request timed out');
+            err.statusCode = 504;
+            err.code = 'Timeout';
+            err.ttl = ttl;
+            err.command = message;
+
+            callQueue.delete(mid);
+
+            reject(err);
+        }, ttl);
+
+        // Store callback info. `worker` lets us reject this entry immediately if
+        // the target worker terminates, instead of waiting out the timeout.
+        callQueue.set(mid, {
+            resolve: result => {
+                clearTimeout(timer);
+                resolve(result);
+            },
+            reject: err => {
+                clearTimeout(timer);
+                reject(err);
+            },
+            timer,
+            worker
+        });
+
+        try {
+            postMessage(
+                worker,
+                {
+                    cmd: 'call',
+                    mid,
+                    message
+                },
+                false,
+                transferList
+            );
+        } catch (err) {
+            // Clean up on error
+            clearTimeout(timer);
+            callQueue.delete(mid);
+            return reject(err);
+        }
+    });
+}
+
+/**
+ * Whether an account is still registered, checked before a failed assignment is retried
+ * @param {string} account
+ * @returns {Promise<boolean>}
+ */
+async function isRegisteredAccount(account) {
+    return !!(await redis.sismember(`${REDIS_PREFIX}ia:accounts`, account));
+}
+
+/**
+ * Tells an IMAP worker to close an account without deleting anything, used when the account moves
+ * to another worker. Returns whether the worker confirmed it
+ * @param {Worker} worker
+ * @param {string} account
+ * @returns {Promise<boolean>}
+ */
+async function unassignFromWorker(worker, account) {
+    if (!onlineWorkers.has(worker)) {
+        // An exited worker holds no connections
+        return true;
+    }
+    try {
+        await call(worker, { cmd: 'unassign', account });
+        return true;
+    } catch (err) {
+        logger.error({ msg: 'Failed to unassign account from worker', account, threadId: worker.threadId, err });
+        return false;
+    }
+}
+
+/**
+ * Starts (or restarts) the failsafe timer that gives the accounts an exited IMAP worker left behind
+ * to the remaining workers when it does not come back in time
+ */
+function armReassignmentFailsafe() {
+    clearTimeout(reassignmentTimer);
+
+    reassignmentTimer = setTimeout(() => {
+        reassignmentTimer = null;
+        if (!reassignmentPending || !unassigned || !unassigned.size) {
+            return;
+        }
+
+        if (!availableIMAPWorkers.size) {
+            // Every worker exited at once (the clean exit after a Redis reconnection) and none is
+            // back yet. A pass now would find no worker and clear the pending flag that makes the
+            // returning workers pick the accounts up, stranding them until a process restart. Keep
+            // it pending instead; the first worker to come back arms this timer again
+            logger.warn({
+                msg: 'Failsafe reassignment postponed - no IMAP worker is available yet',
+                unassignedAccounts: unassigned.size,
+                expectedWorkers: config.workers.imap
+            });
+            return;
+        }
+
+        logger.warn({
+            msg: 'Failsafe reassignment triggered - worker restart timeout',
+            unassignedAccounts: unassigned.size,
+            currentWorkers: availableIMAPWorkers.size,
+            expectedWorkers: config.workers.imap
+        });
+        reassignmentPending = false;
+        assignAccounts().catch(err => logger.error({ msg: 'Unable to reassign accounts (failsafe)', err }));
+    }, REASSIGNMENT_FAILSAFE_DELAY);
+}
+
+/**
+ * Moves a fair share of accounts onto an IMAP worker that became ready while the rest of the fleet
+ * already served every account. That is the normal outcome of a restart slower than the failsafe
+ * reassignment timer, and nothing else ever gives such a worker any accounts
+ * @param {Worker} worker - The worker that became ready
+ * @returns {Promise<void>}
+ */
+async function rebalanceOnto(worker) {
+    if (isClosing || !availableIMAPWorkers.has(worker)) {
+        return;
+    }
+    if (assigning) {
+        // A pass is running (typically the failsafe one); look again once it has settled
+        setTimeout(() => rebalanceOnto(worker).catch(err => logger.error({ msg: 'Unable to rebalance accounts', err })), 5000).unref();
+        return;
+    }
+
+    let moves = planRebalance({ workerAssigned, availableWorkers: availableIMAPWorkers }, worker);
+
+    assigning = true;
+    let moved = 0;
+    try {
+        // Every other assignment pass waits on the lock held here, and a fair share of a large
+        // fleet is hundreds of round trips, so the unassign calls run a few at a time rather than
+        // one after the other
+        await mapConcurrent(moves, REBALANCE_CONCURRENCY, async ({ account, worker: donor }) => {
+            // The donor may have lost the account (deleted, donor exited) while we awaited
+            if (assigned.get(account) !== donor) {
+                return;
+            }
+            // Only an account the donor has let go of can move, or it would sync in two workers
+            if (!(await unassignFromWorker(donor, account))) {
+                return;
+            }
+            if (assigned.get(account) !== donor) {
+                return;
+            }
+            forgetAccount({ workerAssigned, assigned, unassigned }, account);
+            unassigned.add(account);
+            moved++;
+        });
+    } finally {
+        assigning = false;
+    }
+
+    if (moved) {
+        logger.info({ msg: 'Rebalancing accounts onto a restarted IMAP worker', threadId: worker.threadId, accounts: moved });
+    }
+    // Also run when nothing moved: an account added while this held the assignment lock found the
+    // pass refused and is waiting in unassigned, or nothing was there to move because every worker
+    // had exited and the accounts are all waiting. The pass picks the least loaded worker, which
+    // is the newcomer.
+    if (moved || unassigned.size) {
+        await assignAccounts();
+    }
+}
+
+/**
+ * Assign unassigned accounts to available IMAP workers
+ * Uses load-aware distribution with round-robin for initial assignment
+ * and rendezvous hashing for reassignments after worker failures
+ * @returns {Promise<boolean>} Success status
+ */
+async function assignAccounts() {
+    // Prevent concurrent assignment
+    if (assigning) {
+        return false;
+    }
+
+    assigning = true;
+    // Collect accounts that fail assignment so we do not re-insert into
+    // the Set we are iterating (re-insertion during for..of would cause
+    // the same account to be visited again in the same pass). Returned to
+    // unassigned in the finally block, so no throw can strand them.
+    let failedAccounts = [];
+    try {
+        if (!unassigned) {
+            // First run - load all accounts from Redis
+            let accounts = await redis.smembers(`${REDIS_PREFIX}ia:accounts`);
+            unassigned = new Set(accounts);
+        }
+
+        if (!availableIMAPWorkers.size || !unassigned.size) {
+            // Nothing to do
+            return;
+        }
+
+        logger.info({
+            msg: 'Starting account assignment',
+            unassigned: unassigned.size,
+            workersAvailable: availableIMAPWorkers.size,
+            setupDelay: CONNECTION_SETUP_DELAY
+        });
+
+        // Create a sorted list of workers by current load (number of assigned accounts)
+        let workerLoadMap = new Map();
+        for (let worker of availableIMAPWorkers) {
+            let accountCount = workerAssigned.has(worker) ? workerAssigned.get(worker).size : 0;
+            workerLoadMap.set(worker, accountCount);
+        }
+
+        // Calculate target accounts per worker for even distribution
+        let totalAccounts = assigned.size + unassigned.size;
+        let targetPerWorker = Math.ceil(totalAccounts / availableIMAPWorkers.size);
+
+        // Assign each unassigned account
+        for (let account of unassigned) {
+            if (!availableIMAPWorkers.size) {
+                // No more workers available
+                break;
+            }
+
+            let worker;
+
+            // Check if this is a reassignment after worker failure
+            // This happens when we have fewer available workers than configured
+            // or when reassignmentPending flag is set
+            let isReassignment = reassignmentPending || (assigned.size > 0 && availableIMAPWorkers.size < config.workers.imap);
+
+            if (isReassignment) {
+                // Use rendezvous hashing for consistent reassignment after failures
+                worker = selectRendezvousNode(account, Array.from(availableIMAPWorkers));
+            } else {
+                // Use load-aware round-robin for initial assignment: the least loaded running
+                // worker that hasn't reached the target, else the least loaded one
+                worker = pickLeastLoadedWorker(availableIMAPWorkers, workerLoadMap, targetPerWorker);
+
+                // Update the load map for next iteration
+                workerLoadMap.set(worker, (workerLoadMap.get(worker) || 0) + 1);
+            }
+
+            // Track assignment
+            if (!workerAssigned.has(worker)) {
+                workerAssigned.set(worker, new Set());
+            }
+
+            workerAssigned.get(worker).add(account);
+            assigned.set(account, worker);
+            unassigned.delete(account);
+
+            // Notify worker of assignment
+            try {
+                await call(worker, {
+                    cmd: 'assign',
+                    account,
+                    runIndex
+                });
+            } catch (err) {
+                // Roll back -- account was never actually assigned. Also reverts the load map so
+                // subsequent iterations see accurate counts
+                rollbackAssignment({ workerAssigned, assigned, workerLoadMap }, account, worker, !isReassignment);
+
+                if (err.code === 'Timeout') {
+                    // A timed-out assign is still running in the worker and would connect the
+                    // account there after this pass has handed it to another worker, so the same
+                    // account would sync twice. Cancel it; the worker also drops an assignment
+                    // superseded this way, see assignConnection().
+                    unassignFromWorker(worker, account);
+                }
+
+                logger.error({ msg: 'Failed to assign account to worker', account, threadId: worker.threadId, err });
+
+                if (await shouldRequeueFailedAssignment(err, account, isRegisteredAccount)) {
+                    failedAccounts.push(account);
+                } else {
+                    logger.info({ msg: 'Dropped assignment of an account that no longer exists', account });
+                }
+                continue;
+            }
+
+            // Add delay between assignments to avoid overwhelming the system
+            if (CONNECTION_SETUP_DELAY) {
+                await new Promise(r => setTimeout(r, CONNECTION_SETUP_DELAY));
+            }
+        }
+
+        // Log final distribution for monitoring
+        let distribution = [];
+        for (let worker of availableIMAPWorkers) {
+            let count = workerAssigned.has(worker) ? workerAssigned.get(worker).size : 0;
+            distribution.push({ threadId: worker.threadId, accounts: count });
+        }
+        logger.info({
+            msg: 'Account assignment completed',
+            distribution,
+            totalAssigned: assigned.size
+        });
+    } finally {
+        // Re-add failed accounts after iteration completes
+        requeueFailedAccounts({ assigned, unassigned }, failedAccounts);
+
+        assigning = false;
+
+        // Safety net: if accounts remain unassigned, schedule a retry with backoff, and keep
+        // retrying slowly after the quick ones, see assignRetryDelay()
+        if (unassigned && unassigned.size > 0 && availableIMAPWorkers.size > 0 && !isClosing) {
+            assignRetryCount++;
+            let delay = assignRetryDelay(assignRetryCount);
+            logger[assignRetryCount <= QUICK_ASSIGN_RETRIES ? 'warn' : 'error']({
+                msg: 'Accounts remain unassigned after assignment pass, scheduling retry',
+                remaining: unassigned.size,
+                retry: assignRetryCount,
+                delayMs: delay
+            });
+            clearTimeout(assignRetryTimer);
+            assignRetryTimer = setTimeout(() => {
+                assignRetryTimer = null;
+                if (isClosing) {
+                    return;
+                }
+                assignAccounts().catch(err => logger.error({ msg: 'Retry assignment failed', err }));
+            }, delay);
+        } else {
+            assignRetryCount = 0;
+        }
+    }
+}
+
+// License checking state
+let licenseCheckTimer = false;
+let checkingLicense = false;
+// set by startApplication: the stored subscription state asks for an online check at startup
+let startupLicenseCheck = false;
+
+// The worker types that run only under a valid license; everything but the API server
+const LICENSED_WORKER_TYPES = ['imap', 'submit', 'smtp', 'webhooks', 'imapProxy'];
+
+// The stored subscription deadline (`subexp`, ms) as last written by this thread, so the license
+// command answering every request does not read Redis for it
+let subscriptionDeadline = null;
+
+/**
+ * Records a subscription license as suspended, or no longer suspended. The workers follow at the
+ * end of the next license check (licenseCheckHandler)
+ * @param {Object|null} suspension - the subsusp record, or null to lift a suspension
+ * @returns {void}
+ */
+const setSuspension = suspension => {
+    if (suspension) {
+        licenseInfo.active = false;
+        licenseInfo.suspension = suspension;
+    } else {
+        licenseInfo.active = true;
+        delete licenseInfo.suspension;
+    }
+};
+
+/**
+ * Forgets the registered license in this thread, after settings.removeLicense()
+ * @returns {void}
+ */
+const clearLicenseInfo = () => {
+    licenseInfo.active = false;
+    licenseInfo.details = false;
+    delete licenseInfo.suspension;
+    subscriptionDeadline = null;
+    licenseInfo.type = packageData.license;
+};
+
+/**
+ * Applies one decision of lib/license-subscription.js to the stored state and to licenseInfo
+ * @param {Object} decision - decide() output
+ * @param {Object} data - the license server's answer
+ * @returns {Promise<void>}
+ */
+const applySubscriptionDecision = async (decision, data) => {
+    const settingsKey = `${REDIS_PREFIX}settings`;
+
+    if (decision.removeLicense) {
+        // what a license server that names no deadline and does not ask to keep the key gets
+        logger.warn({ msg: 'License validation failed', license: redactLicense(licenseInfo.details), data });
+        await settings.removeLicense();
+        clearLicenseInfo();
+        return;
+    }
+
+    let multi = redis.multi();
+    if (decision.clear) {
+        multi = multi.hdel(settingsKey, 'subexp', 'subsusp');
+        subscriptionDeadline = null;
+    } else if (decision.resume) {
+        multi = multi.hdel(settingsKey, 'subsusp');
+    }
+    if (decision.subexp) {
+        multi = multi.hset(settingsKey, 'subexp', decision.subexp.toString());
+        subscriptionDeadline = decision.subexp;
+    }
+    if (decision.suspend) {
+        multi = multi.hset(settingsKey, 'subsusp', JSON.stringify(decision.suspend));
+    }
+    if (decision.nextCheck) {
+        multi = multi.hset(settingsKey, 'ks', new Date(decision.nextCheck).getTime().toString(16));
+    }
+    await multi.exec();
+
+    if (decision.resume && licenseInfo.suspension) {
+        logger.info({
+            msg: decision.clear ? 'Subscription in good standing again, resuming' : 'Subscription inside its payment window again, resuming',
+            license: redactLicense(licenseInfo.details)
+        });
+        setSuspension(null);
+    }
+
+    if (decision.suspend) {
+        if (!licenseInfo.suspension) {
+            logger.warn({ msg: 'Subscription not in good standing, suspending until it is', license: redactLicense(licenseInfo.details), data });
+        }
+        setSuspension(decision.suspend);
+    }
+};
+
+/**
+ * Tells the API workers to run their prechecks again, so the REST API follows a suspension or a
+ * resume at once instead of at the next ten-minute tick
+ * @returns {void}
+ */
+const notifyApiLicenseState = () => {
+    for (let worker of workers.get('api') || []) {
+        try {
+            postMessage(worker, { cmd: 'licenseState' }, true);
+        } catch (err) {
+            logger.error({ msg: 'Unable to notify worker about the license state', worker: worker.threadId, err });
+        }
+    }
+};
+
+/**
+ * Check and validate license status
+ * @param {Object} opts - Options
+ * @param {number} opts.subscriptionCheckTimeout - Minimum time since the last online check
+ * @param {boolean} opts.force - Check online now, whatever the schedule says
+ * @returns {Promise<Object>} { outcome }: ok, refused, error, unreachable, skipped or busy
+ */
+let licenseCheckHandler = async opts => {
+    if (checkingLicense) {
+        return { outcome: 'busy' };
+    }
+    checkingLicense = true;
+    clearTimeout(licenseCheckTimer);
+
+    let outcome = 'skipped';
+    let wasActive = licenseInfo.active;
+
+    try {
+        opts = opts || {};
+        let now = Date.now();
+        let [subexp, subsusp, kv, ks] = await redis.hmget(`${REDIS_PREFIX}settings`, 'subexp', 'subsusp', 'kv', 'ks');
+        // daily, and hourly while the subscription is not in good standing
+        let subscriptionCheckTimeout = opts.subscriptionCheckTimeout || checkInterval({ subexp, subsusp });
+
+        // Check if we need to validate the license
+        let checkKv = true;
+        // an unreadable record means checking again, which also rewrites it
+        let validatedVersion = kv && typeof kv === 'string' ? Buffer.from(kv, 'hex').toString() : null;
+        if (parseVersion(validatedVersion) && compareVersions(packageData.version, validatedVersion) <= 0) {
+            checkKv = false;
+        }
+
+        if (ks && typeof ks === 'string') {
+            let ksDate = new Date(parseInt(ks, 16));
+            if (ksDate < now) {
+                checkKv = true;
+            }
+        } else {
+            checkKv = true;
+        }
+
+        // Clean up for lifetime licenses
+        if (licenseInfo.details && licenseInfo.details.lt) {
+            await redis.hdel(`${REDIS_PREFIX}settings`, 'subexp', 'subsusp');
+            subscriptionDeadline = null;
+        }
+
+        // A suspended license is still registered and still checked, which is how it resumes
+        let subscriptionLicense = (licenseInfo.active || !!licenseInfo.suspension) && isSubscriptionLicense(licenseInfo.details);
+
+        // A stored deadline that has passed suspends on its own, whether or not the license server
+        // can be reached to say so; its next answer decides what happens after that
+        let localSuspension = subscriptionLicense && !licenseInfo.suspension ? expiredSuspension(subexp, subsusp, now) : null;
+        if (localSuspension) {
+            await redis.hset(`${REDIS_PREFIX}settings`, 'subsusp', JSON.stringify(localSuspension));
+            logger.warn({
+                msg: 'Subscription deadline passed, suspending until the license server says otherwise',
+                license: redactLicense(licenseInfo.details)
+            });
+            setSuspension(localSuspension);
+        }
+        let due = false;
+        if (subscriptionLicense && opts.force) {
+            await redis.hset(`${REDIS_PREFIX}settings`, 'subcheck', now.toString());
+            due = true;
+        } else if (subscriptionLicense && checkKv) {
+            due = !!(await redis.hUpdateBigger(`${REDIS_PREFIX}settings`, 'subcheck', now - subscriptionCheckTimeout, now));
+        }
+
+        // Validate subscription license
+        if (due) {
+            try {
+                let body = {
+                    key: licenseInfo.details.key,
+                    version: packageData.version,
+                    app: '@postalsys/emailengine-app',
+                    instance: (await settings.get('serviceId')) || ''
+                };
+
+                // Best-effort feature beacon: enrich the existing call with a compact, anonymized
+                // feature snapshot. Time-boxed and fully isolated (attachBeacon never throws) so it
+                // can never block, delay, or alter license validation. The full snapshot is only sent
+                // when its digest changes or once every 30 days; otherwise just the digest rides along.
+                if (!BEACON_DISABLED) {
+                    await attachBeacon(body, { redis, logger, now });
+                }
+
+                // Call license validation API
+                let res = await fetchCmd(`https://postalsys.com/licenses/validate`, {
+                    method: 'post',
+                    headers: {
+                        'User-Agent': `${packageData.name}/${packageData.version} (+${packageData.homepage})`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(body),
+                    dispatcher: httpAgent.retry
+                });
+
+                let data = await res.json();
+
+                await applySubscriptionDecision(decide({ ok: res.ok, data, now, subexp }), data);
+                outcome = res.ok ? 'ok' : data && data.invalidate ? 'refused' : 'error';
+
+                if (res.ok) {
+                    await redis.hset(`${REDIS_PREFIX}settings`, 'kv', Buffer.from(packageData.version).toString('hex'));
+
+                    // Persist beacon markers so the full snapshot is only resent when it changes.
+                    if (!BEACON_DISABLED) {
+                        await persistBeaconMarkers({ redis, logger, body, now, needFull: data.needFull });
+                    }
+                }
+            } catch (err) {
+                // never a reason to stop: an unreachable license server leaves the stored state as it was
+                outcome = 'unreachable';
+                logger.warn({ msg: 'License validation error', err });
+            }
+        }
+
+        // Check if license has expired
+        if (licenseInfo.active && licenseInfo.details && licenseInfo.details.expires && new Date(licenseInfo.details.expires).getTime() < Date.now()) {
+            logger.info({ msg: 'License has expired', license: redactLicense(licenseInfo.details) });
+
+            licenseInfo.active = false;
+            licenseInfo.details = false;
+        }
+
+        // Handle no active license - suspend workers
+        if (!licenseInfo.active && !suspendedWorkerTypes.size) {
+            // Said in the present tense, because that is what the loop below does. The line used to
+            // promise a 15 minute grace period that nothing anywhere implements, so an operator
+            // reading it waited for a window that had already closed.
+            logger.info({ msg: 'No active license. Suspending every worker except the API server.' });
+
+            // Suspend all worker types except API
+            for (let type of LICENSED_WORKER_TYPES) {
+                suspendedWorkerTypes.add(type);
+                if (workers.has(type)) {
+                    for (let worker of workers.get(type).values()) {
+                        worker.terminate();
+                    }
+                }
+            }
+        } else if (licenseInfo.active && suspendedWorkerTypes.size) {
+            // Re-enable workers after license activated
+            for (let type of suspendedWorkerTypes) {
+                suspendedWorkerTypes.delete(type);
+                switch (type) {
+                    case 'smtp':
+                    case 'imapProxy':
+                        {
+                            let serverEnabled = await settings.get(`${type}ServerEnabled`);
+                            if (serverEnabled) {
+                                await spawnWorker(type);
+                            }
+                        }
+                        break;
+                    default:
+                        if (config.workers && config.workers[type]) {
+                            for (let i = 0; i < config.workers[type]; i++) {
+                                await spawnWorker(type, workerSpawnOpts(type, i));
+                            }
+                        }
+                }
+            }
+
+            // Workers were respawned after license activation. Assign any accounts that
+            // accumulated in the unassigned set while workers were suspended, as the
+            // worker ready handler only reassigns after crashes (reassignmentPending)
+            assignAccounts().catch(err => logger.error({ msg: 'Unable to assign accounts after license activation', err }));
+        }
+        if (wasActive !== licenseInfo.active) {
+            notifyApiLicenseState();
+        }
+    } finally {
+        checkingLicense = false;
+        licenseCheckTimer = setTimeout(checkActiveLicense, LICENSE_CHECK_TIMEOUT);
+        licenseCheckTimer.unref();
+    }
+
+    return { outcome };
+};
+
+/**
+ * Schedule next license check
+ */
+function checkActiveLicense() {
+    clearTimeout(licenseCheckTimer);
+    licenseCheckHandler().catch(err => {
+        logger.error({ msg: 'License check error', err });
+    });
+}
+
+/**
+ * Check for available EmailEngine updates
+ * @returns {Promise<void>}
+ */
+let processCheckUpgrade = async () => {
+    try {
+        if (UPDATE_CHECK_DISABLED) {
+            // Clear any marker stored before the check was disabled, otherwise
+            // the dashboard banner would advertise a stale version forever
+            await redis.hdel(`${REDIS_PREFIX}settings`, 'upgrade');
+            return;
+        }
+        let updateInfo = await checkForUpgrade();
+        if (updateInfo.canUpgrade) {
+            logger.info({ msg: 'EmailEngine update available', updateInfo });
+
+            updateInfo.checked = Date.now();
+            await redis.hset(`${REDIS_PREFIX}settings`, 'upgrade', JSON.stringify(updateInfo));
+        } else {
+            await redis.hdel(`${REDIS_PREFIX}settings`, 'upgrade');
+        }
+    } catch (err) {
+        logger.warn({ msg: 'Update check failed', err });
+    }
+};
+
+// Upgrade checking state
+let upgradeCheckTimer = false;
+
+/**
+ * Periodic upgrade check handler
+ * @returns {Promise<void>}
+ */
+let upgradeCheckHandler = async () => {
+    // An up-to-date instance keeps checking too. The check used to return early, before
+    // rescheduling, whenever no upgrade was already known, so the daily check stopped after its
+    // first run on every instance that was current at the time.
+    try {
+        await processCheckUpgrade();
+    } finally {
+        upgradeCheckTimer = setTimeout(checkUpgrade, UPGRADE_CHECK_TIMEOUT);
+        upgradeCheckTimer.unref();
+    }
+};
+
+/**
+ * Schedule next upgrade check
+ */
+function checkUpgrade() {
+    clearTimeout(upgradeCheckTimer);
+    upgradeCheckHandler().catch(err => {
+        logger.error({ msg: 'Update check error', err });
+    });
+}
+
+// Redis ping monitoring
+let redisPingCounter = [];
+
+/**
+ * Calculate average Redis ping latency
+ * @returns {number|null} Average latency in nanoseconds
+ */
+function getRedisPing() {
+    if (!redisPingCounter.length) {
+        return null;
+    }
+
+    // Get recent entries and sort
+    let entries = []
+        .concat(redisPingCounter)
+        .slice(-34)
+        .sort((a, b) => a - b);
+
+    // Remove outliers (2 highest and lowest)
+    for (let i = 0; i < 2; i++) {
+        if (entries.length > 4) {
+            entries.shift();
+            entries.pop();
+        }
+    }
+
+    // Calculate average
+    let sum = 0;
+    for (let entry of entries) {
+        sum += entry;
+    }
+
+    return Math.round(sum / entries.length);
+}
+
+const REDIS_PING_TIMEOUT = 10 * 1000;
+let redisPingTimer = false;
+
+/**
+ * Measure current Redis ping latency
+ * @returns {Promise<number>} Latency in nanoseconds
+ */
+const getCurrentRedisPing = async () => {
+    try {
+        // Warm up connection
+        await redis.ping();
+
+        // Measure actual ping
+        let startTime = process.hrtime.bigint();
+        await redis.ping();
+        let endTime = process.hrtime.bigint();
+
+        let duration = Number(endTime - startTime);
+
+        return duration;
+    } catch (err) {
+        logger.error({ msg: 'Redis ping measurement failed', err });
+    }
+    return 0;
+};
+
+/**
+ * Process and store Redis ping measurement
+ * @returns {Promise<number>} Current ping duration
+ */
+const processRedisPing = async () => {
+    try {
+        let duration = await getCurrentRedisPing();
+        redisPingCounter.push(duration);
+        // Keep last 300 measurements
+        if (redisPingCounter.length > 300) {
+            // keep the newest samples, the average is computed from the tail
+            redisPingCounter = redisPingCounter.slice(-150);
+        }
+        return duration;
+    } catch (err) {
+        logger.error({ msg: 'Redis ping processing failed', err });
+    }
+};
+
+/**
+ * Periodic Redis ping handler
+ * @returns {Promise<void>}
+ */
+const redisPingHandler = async () => {
+    await processRedisPing();
+    redisPingTimer = setTimeout(checkRedisPing, REDIS_PING_TIMEOUT);
+    redisPingTimer.unref();
+};
+
+/**
+ * Schedule next Redis ping check
+ */
+function checkRedisPing() {
+    clearTimeout(redisPingTimer);
+    redisPingHandler().catch(err => {
+        logger.error({ msg: 'Redis ping check error', err });
+    });
+}
+
+/**
+ * Update Prometheus metrics for queues and Redis
+ * @returns {Promise<void>}
+ */
+async function updateQueueCounters() {
+    // Update EmailEngine configuration metrics
+    metrics.emailengineConfig.set({ version: 'v' + packageData.version }, 1);
+    metrics.emailengineConfig.set({ config: 'uvThreadpoolSize' }, Number(process.env.UV_THREADPOOL_SIZE));
+    metrics.emailengineConfig.set({ config: 'workersImap' }, config.workers.imap);
+    metrics.emailengineConfig.set({ config: 'workersWebhooks' }, config.workers.webhooks);
+    metrics.emailengineConfig.set({ config: 'workersSubmission' }, config.workers.submit);
+
+    // Update license days remaining metric
+    if (licenseInfo.active && licenseInfo.details) {
+        if (licenseInfo.details.lt) {
+            // Lifetime license
+            metrics.licenseDaysRemaining.set(-1);
+        } else if (licenseInfo.details.expires) {
+            // Time-limited license
+            let expiresAt = new Date(licenseInfo.details.expires).getTime();
+            let daysRemaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / (24 * 60 * 60 * 1000)));
+            metrics.licenseDaysRemaining.set(daysRemaining);
+        } else {
+            // Subscription license (no fixed expiry)
+            metrics.licenseDaysRemaining.set(-1);
+        }
+    } else {
+        // No active license
+        metrics.licenseDaysRemaining.set(0);
+    }
+
+    // Update thread metrics
+    let threadsInfo = await getThreadsInfo();
+
+    let now = Date.now();
+
+    let threadCounts = new Map();
+    let unresponsiveCount = 0;
+    // a replaced thread leaves with its thread id, so the series are rebuilt on every update
+    metrics.threadEventLoopDelayMax.reset();
+    metrics.threadEventLoopDelayP99.reset();
+    for (let { labels, max, p99 } of eventLoopDelaySeries(threadsInfo)) {
+        metrics.threadEventLoopDelayMax.set(labels, max);
+        metrics.threadEventLoopDelayP99.set(labels, p99);
+    }
+    metrics.threadHeapUsed.reset();
+    metrics.threadHeapTotal.reset();
+    for (let { labels, used, total } of threadHeapSeries(threadsInfo)) {
+        metrics.threadHeapUsed.set(labels, used);
+        metrics.threadHeapTotal.set(labels, total);
+    }
+    for (let workerThreadInfo of threadsInfo || []) {
+        let key = workerThreadInfo.type;
+        let metricKey = `${key}_total`;
+
+        // Check if thread is recent (started within METRIC_RECENT)
+        let recent = now - workerThreadInfo.online < METRIC_RECENT;
+        if (recent) {
+            metricKey = `${key}_recent`;
+        }
+
+        if (!threadCounts.has(metricKey)) {
+            threadCounts.set(metricKey, 1);
+        } else {
+            threadCounts.set(metricKey, threadCounts.get(metricKey) + 1);
+        }
+
+        // Count unresponsive workers
+        if (workerThreadInfo.resourceUsageError && workerThreadInfo.resourceUsageError.unresponsive) {
+            unresponsiveCount++;
+        }
+    }
+
+    // Set thread count metrics
+    for (let [key, value] of threadCounts.entries()) {
+        let [type, age] = key.split('_');
+        metrics.threads.set({ type, recent: age === 'recent' ? 'yes' : 'no' }, value || 0);
+    }
+
+    // Set unresponsive workers metric
+    metrics.unresponsiveWorkers.set(unresponsiveCount);
+
+    // Update queue metrics through BullMQ's own API (lib/queue-stats.js). Counting raw
+    // llen/zcard against BullMQ's private key layout broke silently in the 5.x -> 6.x bump: the
+    // `:paused` list no longer exists (a paused queue holds its jobs in `wait`), and a leftover
+    // `0:` wait-list marker from a 5.x install counts as a phantom waiting job. The `paused`
+    // gauge is kept at the 0 the getter reports so existing dashboards keep their series.
+    //
+    // A queue whose count fails is skipped rather than ending the update: returning here used to
+    // leave every Redis gauge below it stale for as long as that one count kept failing.
+    const counted = [
+        ['notify', notifyQueue],
+        ['submit', submitQueue],
+        ['export', exportQueue]
+    ];
+    const results = await Promise.allSettled(counted.map(([, queueObj]) => queueStats(queueObj, { failed: true })));
+    counted.forEach(([queue], i) => {
+        if (results[i].status === 'rejected') {
+            logger.error({ msg: 'Queue length count failed', queue, err: results[i].reason });
+            return;
+        }
+        const stats = results[i].value;
+
+        metrics.queues.set({ queue: `${queue}`, state: `active` }, stats.active);
+        metrics.queues.set({ queue: `${queue}`, state: `delayed` }, stats.delayed);
+        metrics.queues.set({ queue: `${queue}`, state: `paused` }, stats.paused);
+        metrics.queues.set({ queue: `${queue}`, state: `waiting` }, stats.waiting);
+        metrics.queueFailed.set({ queue: `${queue}` }, stats.failed);
+    });
+
+    // Update Redis metrics
+    try {
+        let redisInfo = await getRedisStats(redis);
+
+        if (redisInfo.redis_version) {
+            metrics.redisVersion.set({ version: 'v' + redisInfo.redis_version }, 1);
+        }
+
+        metrics.redisUptimeInSeconds.set(Number(redisInfo.uptime_in_seconds) || 0);
+
+        metrics.redisPing.set((await getCurrentRedisPing()) || 0);
+
+        metrics.redisRejectedConnectionsTotal.set(Number(redisInfo.rejected_connections) || 0);
+        metrics.redisConfigMaxclients.set(Number(redisInfo.maxclients) || 0);
+        metrics.redisConnectedClients.set(Number(redisInfo.connected_clients) || 0);
+        metrics.redisSlowlogLength.set(Number(redisInfo.slowlog_length) || 0);
+
+        metrics.redisCommandsDurationSecondsTotal.set(Math.ceil((Number(redisInfo.cmdstat_total && redisInfo.cmdstat_total.usec) || 0) / 1000000));
+        metrics.redisCommandsProcessedTotal.set(Number(redisInfo.cmdstat_total && redisInfo.cmdstat_total.calls) || 0);
+
+        metrics.redisKeyspaceHitsTotal.set(Number(redisInfo.keyspace_hits) || 0);
+        metrics.redisKeyspaceMissesTotal.set(Number(redisInfo.keyspace_misses) || 0);
+
+        metrics.redisEvictedKeysTotal.set(Number(redisInfo.evicted_keys) || 0);
+
+        metrics.redisMemoryUsedBytes.set(Number(redisInfo.used_memory) || 0);
+        metrics.redisMemoryMaxBytes.set(Number(redisInfo.maxmemory) || Number(redisInfo.total_system_memory) || 0);
+
+        metrics.redisMemFragmentationRatio.set(Number(redisInfo.mem_fragmentation_ratio) || 0);
+
+        // Update per-database metrics
+        Object.keys(redisInfo).forEach(key => {
+            if (/^db\d+$/.test(key)) {
+                metrics.redisKeyCount.set({ db: key }, Number(redisInfo[key].keys) || 0);
+            }
+
+            // Update command stats
+            if (key.indexOf('cmdstat_') === 0) {
+                let cmd = key.substr('cmdstat_'.length);
+                metrics.redisCommandRuns.set({ command: cmd }, Number(redisInfo[key].calls) || 0);
+
+                if (redisInfo[key].failed_calls) {
+                    metrics.redisCommandRunsFailed.set({ command: cmd, status: 'failed' }, Number(redisInfo[key].failed_calls) || 0);
+                }
+
+                if (redisInfo[key].rejected_calls) {
+                    metrics.redisCommandRunsFailed.set({ command: cmd, status: 'rejected' }, Number(redisInfo[key].rejected_calls) || 0);
+                }
+            }
+        });
+
+        metrics.redisLastSaveTime.set(Number(redisInfo.rdb_last_save_time) || 0);
+        metrics.redisOpsPerSec.set(Number(redisInfo.instantaneous_ops_per_sec) || 0);
+    } catch (err) {
+        logger.error({ msg: 'Metrics update failed', err });
+    }
+}
+
+/**
+ * Handle commands from worker threads
+ * @param {Worker} worker - Source worker
+ * @param {Object} message - Command message
+ * @returns {Promise<*>} Command result
+ */
+// Options shared by every OpenAI call. A function rather than a constant because httpAgent.fetch is
+// swapped when the proxy settings change. The plain agent rather than the retrying one: the library
+// keeps its own 429 retry.
+const openAiRequestOpts = () => ({
+    verbose: getBoolean(process.env.EE_OPENAPI_VERBOSE),
+    dispatcher: httpAgent.fetch
+});
+
+const aiValueSet = value => value !== undefined && value !== null && value !== '';
+
+const aiUrlValue = value => (value === undefined || value === null ? '' : String(value).trim());
+
+/**
+ * Options for one request to the AI provider. The configuration page's test sends every field as
+ * its form shows it, so the test runs with what the page shows; the sync path sends none and gets
+ * the stored settings. The key is the exception: the form leaves it blank to keep the stored one,
+ * and a request made with the stored key goes to the stored URL, since a write-only secret must
+ * not be extractable by pointing a request that falls back to it at a server of one's own. The
+ * rule is here rather than on the page's routes so every request the form can make is under it
+ * @param {Object} data - The command's data
+ * @returns {Promise<{openAiAPIKey: string, requestOpts: Object}>}
+ */
+async function aiRequestOptions(data) {
+    const stored = await settings.getMulti('openAiAPIKey', ...AI_SETTING_KEYS);
+    const values = data.options || stored;
+
+    const openAiAPIKey = (data.options && data.options.openAiAPIKey) || stored.openAiAPIKey;
+    if (!openAiAPIKey) {
+        throw new Error(`OpenAI API key is not configured`);
+    }
+    if (data.options && !data.options.openAiAPIKey && aiUrlValue(data.options.openAiAPIUrl) !== aiUrlValue(stored.openAiAPIUrl)) {
+        throw new Error('Enter the API key to use a different API URL');
+    }
+
+    const requestOpts = openAiRequestOpts();
+    requestOpts.gptModel = aiValueSet(values.openAiModel) ? values.openAiModel : openAiDefaultModel;
+    for (const [key, name] of [
+        ['openAiAPIUrl', 'baseApiUrl'],
+        ['openAiTemperature', 'temperature'],
+        ['openAiTopP', 'topP'],
+        ['openAiMaxTokens', 'maxTokens'],
+        ['openAiReasoningEffort', 'reasoningEffort'],
+        ['openAiPrompt', 'instructions']
+    ]) {
+        if (aiValueSet(values[key])) {
+            requestOpts[name] = values[key];
+        }
+    }
+
+    // which Authentication-Results header the summary may believe, decided by the worker that
+    // knows the account
+    if (data.trust) {
+        requestOpts.trustedAuthservIds = data.trust.trustedAuthservIds;
+        requestOpts.acceptUnnamedAuthentication = !!data.trust.acceptUnnamedAuthentication;
+    }
+
+    return { openAiAPIKey, requestOpts };
+}
+
+/**
+ * Runs a provider request that is aborted when the RPC that asked for it has given up, so it does
+ * not outlive its caller. The timer is cleared as the request ends rather than left to fire later
+ * @param {Object} message - The RPC message, with the caller's timeout
+ * @param {Function} run - Receives the abort signal, returns the request promise
+ */
+async function withRequestDeadline(message, run) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('AI request timed out')), message.timeout || AI_REQUEST_TIMEOUT);
+    timer.unref();
+    try {
+        return await run(controller.signal);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// Handlers for the commands workers send to the main thread, dispatched by onCommand(). A command
+// with no handler, and a handler that answers NOT_HANDLED, both reply with 999
+const NOT_HANDLED = 999;
+
+async function commandMetrics() {
+    // Return Prometheus metrics
+    await updateQueueCounters();
+    return promClient.register.metrics();
+}
+
+async function commandStructuredMetrics() {
+    // Return structured metrics for API
+    let connections = {};
+
+    for (let key of Object.keys(metrics.imapConnections.hashMap)) {
+        if (key.indexOf('status:') === 0) {
+            let metric = metrics.imapConnections.hashMap[key];
+            connections[metric.labels.status] = metric.value;
+        }
+    }
+
+    return { connections, redisPing: await getRedisPing() };
+}
+
+async function commandImapWorkerCount() {
+    // Return number of available IMAP workers
+    return { workers: availableIMAPWorkers.size };
+}
+
+async function commandCheckLicense(worker, message) {
+    // The license page asks on every view (60 s gate); the "Check subscription now" button forces a
+    // check, at most once a minute per instance, so the button cannot be used to hammer the server
+    let result = { outcome: 'skipped' };
+    try {
+        if (message && message.force) {
+            let acquired = await redis.set(`${REDIS_PREFIX}license:recheck`, '1', 'PX', 60 * 1000, 'NX');
+            result = acquired ? await licenseCheckHandler({ force: true }) : { outcome: 'throttled' };
+        } else {
+            result = await licenseCheckHandler({ subscriptionCheckTimeout: 60 * 1000 });
+        }
+    } catch (err) {
+        // ignore
+    }
+    return Object.assign(await commandLicense(), { checkOutcome: result.outcome });
+}
+
+async function commandLicense() {
+    // Return license info with suspension status and, for a subscription license that is not in
+    // good standing, the deadline or the suspension (lib/license-subscription.js)
+    let info = Object.assign({}, licenseInfo);
+    delete info.suspension;
+    if (!licenseInfo.active && suspendedWorkerTypes.size) {
+        info.suspended = true;
+    }
+    if (isSubscriptionLicense(licenseInfo.details)) {
+        let subscription = subscriptionView({ subexp: subscriptionDeadline, suspension: licenseInfo.suspension, now: Date.now() });
+        if (subscription) {
+            info.subscription = subscription;
+        }
+    }
+    return info;
+}
+
+async function commandUpdateLicense(worker, message) {
+    // Update license from API
+    try {
+        const licenseFile = message.license;
+
+        let licenseData = await checkLicense(licenseFile);
+        if (!licenseData) {
+            throw new Error('Invalid license provided');
+        }
+
+        logger.info({ msg: 'License updated', license: redactLicense(licenseData), source: 'API' });
+
+        await setLicense(licenseData, licenseFile);
+
+        licenseInfo.details = licenseData;
+        licenseInfo.type = 'EmailEngine License';
+
+        // The same key registered again keeps a suspension (setLicense keeps the stored state), so
+        // posting the file again does not lift one; a subscription license is checked online before
+        // the workers start, and the answer decides
+        let subscriptionLicense = isSubscriptionLicense(licenseData);
+        let [subexp, subsusp] = await redis.hmget(`${REDIS_PREFIX}settings`, 'subexp', 'subsusp');
+        subscriptionDeadline = subscriptionLicense ? toTime(subexp) : null;
+        setSuspension(subscriptionLicense ? parseSuspension(subsusp) : null);
+
+        if (!subscriptionLicense || (await licenseCheckHandler({ force: true })).outcome === 'busy') {
+            // Re-enable workers
+            checkActiveLicense();
+        }
+        notifyApiLicenseState();
+
+        return await commandLicense();
+    } catch (err) {
+        logger.warn({ msg: 'License update failed', source: 'API', err });
+        return false;
+    }
+}
+
+async function commandRemoveLicense() {
+    // Remove existing license
+    try {
+        await settings.removeLicense();
+
+        clearLicenseInfo();
+        notifyApiLicenseState();
+
+        return licenseInfo;
+    } catch (err) {
+        logger.error({ msg: 'License removal failed', err });
+        return false;
+    }
+}
+
+async function commandKillThread(worker, message) {
+    // Terminate a specific thread
+    for (let [, workerSet] of workers) {
+        if (workerSet && workerSet.size) {
+            for (let worker of workerSet) {
+                if (worker.threadId === message.thread) {
+                    logger.info({ msg: 'Thread termination requested', thread: message.thread });
+                    return await worker.terminate();
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+async function commandSnapshotThread(worker, message) {
+    // Get heap snapshot for debugging
+    if (message.thread === 0) {
+        // Main thread only - V8 operations should be done in main thread
+        try {
+            logger.info({ msg: 'Heap snapshot requested', thread: message.thread });
+            const stream = v8.getHeapSnapshot();
+            if (stream) {
+                return { _transfer: true, _response: await download(stream) };
+            }
+        } catch (err) {
+            logger.error({ msg: 'Failed to generate heap snapshot', thread: message.thread, err });
+        }
+        return false;
+    }
+
+    // Worker thread - use worker's built-in method which is safer
+    for (let [, workerSet] of workers) {
+        if (workerSet && workerSet.size) {
+            for (let worker of workerSet) {
+                if (worker.threadId === message.thread) {
+                    try {
+                        logger.info({ msg: 'Heap snapshot requested', thread: message.thread });
+                        // Use worker's built-in getHeapSnapshot method instead of V8 API
+                        const stream = await worker.getHeapSnapshot({ exposeInternals: true, exposeNumericValues: true });
+                        if (stream) {
+                            return { _transfer: true, _response: await download(stream) };
+                        }
+                    } catch (err) {
+                        logger.error({ msg: 'Failed to generate heap snapshot for worker', thread: message.thread, err });
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+async function commandBounceClassify(worker, message) {
+    // Classify bounce response message
+    try {
+        return await bounceClassifier.classify(message.data.message);
+    } catch (err) {
+        // ignore
+        logger.warn({
+            msg: 'Failed to classify bounce response',
+            bounceResponse: message.data.message,
+            err
+        });
+    }
+    return false;
+}
+
+// OpenAI integration commands - run in the main process, where the metrics live
+async function commandGenerateSummary(worker, message) {
+    const { openAiAPIKey, requestOpts } = await aiRequestOptions(message.data);
+    requestOpts.user = message.data.account;
+
+    // the configuration page's test runs are not production traffic
+    const counted = !message.data.options;
+    const model = requestOpts.gptModel;
+
+    try {
+        const response = await withRequestDeadline(message, signal =>
+            generateSummary(message.data.message, openAiAPIKey, Object.assign(requestOpts, { signal }))
+        );
+        const { usage } = response;
+
+        // the fitted email text the verbose mode adds stays out of the RPC and the log
+        delete usage.text;
+
+        if (counted) {
+            metrics.aiRequests.inc({ model, status: 'success' });
+            for (const type of ['prompt', 'completion']) {
+                const tokens = usage[`${type}Tokens`];
+                if (tokens) {
+                    metrics.aiTokens.inc({ model, type }, tokens);
+                }
+            }
+        }
+
+        return response;
+    } catch (err) {
+        if (counted) {
+            metrics.aiRequests.inc({ model, status: 'failure' });
+        }
+        throw err;
+    }
+}
+
+async function commandOpenAiListModels(worker, message) {
+    const { openAiAPIKey, requestOpts } = await aiRequestOptions(message.data);
+    return await withRequestDeadline(message, signal => openAiListModels(openAiAPIKey, Object.assign(requestOpts, { signal })));
+}
+
+async function commandThreads() {
+    return await getThreadsInfo();
+}
+
+async function commandApiWorkerScaling() {
+    // Reported on /admin/internals so operators can see when EENGINE_WORKERS_API > 1
+    // was requested but only one worker started, and why (reason: 'platform' | 'port').
+    return {
+        requested: apiWorkersRequested,
+        fallback: apiWorkersRequested > 1 && !apiWorkerReusePort,
+        reason: apiWorkerReusePortFallbackReason
+    };
+}
+
+async function commandWorkerAccounts(worker, message) {
+    // Get accounts assigned to a specific worker thread
+    const { threadId, page = 1, pageSize = 20 } = message;
+    const accounts = [];
+
+    // Find worker by threadId and get its assigned accounts
+    for (const [account, worker] of assigned) {
+        if (worker.threadId === threadId) {
+            accounts.push(account);
+        }
+    }
+
+    // Sort accounts for consistent ordering
+    accounts.sort((a, b) => a.localeCompare(b));
+
+    // Paginate
+    const totalAccounts = accounts.length;
+    const totalPages = Math.ceil(totalAccounts / pageSize) || 1;
+    const currentPage = Math.min(Math.max(1, page), totalPages);
+    const start = (currentPage - 1) * pageSize;
+    const pagedAccounts = accounts.slice(start, start + pageSize);
+
+    return {
+        accounts: pagedAccounts,
+        total: totalAccounts,
+        page: currentPage,
+        pageSize,
+        pages: totalPages
+    };
+}
+
+async function commandRateLimit(worker, message) {
+    return await checkRateLimit(message.key, message.count, message.allowed, message.windowSize);
+}
+
+async function commandUnsubscribe(worker, message) {
+    // Handle list unsubscribe
+    sendWebhook(message.account, LIST_UNSUBSCRIBE_NOTIFY, message.payload).catch(err =>
+        logger.error({ msg: 'Unsubscribe webhook failed', account: message.account, err })
+    );
+}
+
+async function commandSubscribe(worker, message) {
+    // Handle list subscribe
+    sendWebhook(message.account, LIST_SUBSCRIBE_NOTIFY, message.payload).catch(err =>
+        logger.error({ msg: 'Subscribe webhook failed', account: message.account, err })
+    );
+}
+
+async function commandNewAccount(worker, message) {
+    // Handle new account.
+    //
+    // `unassigned` is `false` until assignAccounts() loads the account list from Redis on
+    // its first run, which waits for an IMAP worker to report ready. An account created
+    // before that used to throw here and fail the request with a 500. Skipping the add is
+    // safe rather than merely quiet: the account is already in `ia:accounts` by the time
+    // this message is sent, so the first load picks it up.
+    if (unassigned) {
+        unassigned.add(message.account);
+    }
+    assignAccounts()
+        .then(() => sendWebhook(message.account, ACCOUNT_ADDED_NOTIFY, { account: message.account }))
+        .catch(err => logger.error({ msg: 'Account assignment failed', err }));
+}
+
+async function commandDeleteAccount(worker, message) {
+    // Handle account deletion
+    //
+    // Guarded for the same reason as commandNewAccount() above, and here the throw was
+    // answered with a 500 for a deletion that had in fact succeeded: the account was
+    // already gone from Redis by the time this message was sent.
+    let assignedWorker = forgetAccount({ workerAssigned, assigned, unassigned }, message.account);
+    if (assignedWorker) {
+        // Notify worker to clean up
+        call(assignedWorker, message)
+            .then(() => logger.debug('Account cleanup completed'))
+            .catch(err => logger.error({ msg: 'Account cleanup failed', account: message.account, err }));
+    }
+    sendWebhook(message.account, ACCOUNT_DELETED_NOTIFY, { account: message.account }).catch(err =>
+        logger.error({ msg: 'Account deletion webhook failed', account: message.account, err })
+    );
+}
+
+async function commandRunIndex() {
+    return runIndex;
+}
+
+async function commandForwardToAccountWorker(worker, message) {
+    // Forward to assigned worker
+    if (assigned.has(message.account)) {
+        let assignedWorker = assigned.get(message.account);
+        call(assignedWorker, message)
+            .then(() => logger.debug('Worker command completed'))
+            .catch(err => logger.error({ msg: 'Worker command failed', account: message.account, cmd: message.cmd, err }));
+    }
+}
+
+async function commandReloadServer(worker, message) {
+    // Reload proxy server
+    let type = message.cmd.replace(/Reload$/, '');
+    let hasWorkers = workers.has(type) && workers.get(type).size;
+    if (hasWorkers) {
+        // Kill existing workers
+        for (let worker of workers.get(type).values()) {
+            worker.terminate();
+        }
+    } else {
+        // Spawn new worker if enabled
+        let serverEnabled = await settings.get(`${type}ServerEnabled`);
+        if (serverEnabled) {
+            await spawnWorker(type);
+        }
+    }
+    return NOT_HANDLED;
+}
+
+async function commandReloadCertificates(worker, message) {
+    // A renewed certificate, handed to a running listener. Forwarded to the worker
+    // rather than terminating it: a restart would cut every session in flight, and
+    // every listener can swap its secure context between handshakes. Sent to every
+    // worker of the type, not just the one that ordered the certificate: the
+    // reconciler is a singleton but the listeners are not.
+    let type = message.cmd.replace(/ReloadCertificates$/, '');
+    for (let worker of (workers.get(type) || new Set()).values()) {
+        call(worker, message).catch(err => logger.error({ msg: 'Failed to reload certificates', type, worker: worker.threadId, err }));
+    }
+    return NOT_HANDLED;
+}
+
+// IMAP operations - forward to assigned worker
+async function commandAccountOperation(worker, message) {
+    if (!assigned.has(message.account)) {
+        throw NO_ACTIVE_HANDLER_RESP_ERR;
+    }
+
+    let assignedWorker = assigned.get(message.account);
+
+    let transferList = [];
+    // Handle transferable objects
+    if (['getRawMessage', 'getAttachment'].includes(message.cmd) && message.port) {
+        transferList.push(message.port);
+    }
+    if (['submitMessage', 'queueMessage'].includes(message.cmd) && typeof message.raw === 'object') {
+        transferList.push(message.raw);
+    }
+
+    return await call(assignedWorker, message, transferList);
+}
+
+async function commandSubconnections(worker, message) {
+    // Get submission connections
+    if (!assigned.has(message.account)) {
+        return [];
+    }
+
+    let assignedWorker = assigned.get(message.account);
+    return await call(assignedWorker, message, []);
+}
+
+async function commandGooglePubSub(worker, message) {
+    // Notify all webhook workers about PubSub app changes
+    if (!workers.has('webhooks')) {
+        return true;
+    }
+    let proms = [];
+    for (let worker of workers.get('webhooks')) {
+        proms.push(
+            call(worker, message).catch(err => {
+                logger.error({ msg: 'Failed to notify webhook worker about PubSub change', cmd: message.cmd, err });
+            })
+        );
+    }
+    await Promise.all(proms);
+    return true;
+}
+
+async function commandExternalNotify(worker, message) {
+    // External notification (e.g., Google Push)
+    let proms = [];
+    for (let account of message.accounts || []) {
+        if (!assigned.has(account)) {
+            continue;
+        }
+
+        let assignedWorker = assigned.get(account);
+        proms.push(
+            call(assignedWorker, { cmd: 'externalNotify', account, historyId: message.historyId }).catch(err => {
+                logger.error({ msg: 'External notification failed', cmd: 'externalNotify', account, historyId: message.historyId, err });
+            })
+        );
+    }
+    await Promise.all(proms);
+    return true;
+}
+
+async function commandSubscriptionLifecycle(worker, message) {
+    // MS Graph subscription lifecycle event (reauthorizationRequired, subscriptionRemoved)
+    if (!assigned.has(message.account)) {
+        logger.warn({
+            msg: 'Subscription lifecycle event for unassigned account',
+            account: message.account,
+            event: message.event
+        });
+        return false;
+    }
+    let assignedWorker = assigned.get(message.account);
+    return await call(assignedWorker, {
+        cmd: 'subscriptionLifecycle',
+        account: message.account,
+        event: message.event,
+        timeout: message.timeout
+    });
+}
+
+// A Map rather than an object literal, so a command name like `constructor` or `__proto__` is an
+// unknown command and not an inherited property
+const COMMAND_HANDLERS = new Map([
+    ['metrics', commandMetrics],
+    ['structuredMetrics', commandStructuredMetrics],
+    ['imapWorkerCount', commandImapWorkerCount],
+    ['checkLicense', commandCheckLicense],
+    ['license', commandLicense],
+    ['updateLicense', commandUpdateLicense],
+    ['removeLicense', commandRemoveLicense],
+    ['kill-thread', commandKillThread],
+    ['snapshot-thread', commandSnapshotThread],
+    ['bounceClassify', commandBounceClassify],
+    ['generateSummary', commandGenerateSummary],
+    ['openAiListModels', commandOpenAiListModels],
+    ['threads', commandThreads],
+    ['apiWorkerScaling', commandApiWorkerScaling],
+    ['worker-accounts', commandWorkerAccounts],
+    ['rate-limit', commandRateLimit],
+    ['unsubscribe', commandUnsubscribe],
+    ['subscribe', commandSubscribe],
+    ['new', commandNewAccount],
+    ['delete', commandDeleteAccount],
+    // an account no worker holds has nothing of the provider's open; answering false here keeps
+    // that apart from WorkerNotAvailable, which a worker dying mid-teardown also answers
+    ['teardown', (worker, message) => (assigned.has(message.account) ? commandAccountOperation(worker, message) : false)],
+    ['runIndex', commandRunIndex],
+    ...['update', 'sync', 'pause', 'resume', 'reconnect'].map(cmd => [cmd, commandForwardToAccountWorker]),
+    ...['smtpReload', 'imapProxyReload'].map(cmd => [cmd, commandReloadServer]),
+    ...['apiReloadCertificates', 'smtpReloadCertificates', 'imapProxyReloadCertificates'].map(cmd => [cmd, commandReloadCertificates]),
+    ...[
+        'submitMessage',
+        'queueMessage',
+        'listMessages',
+        'getRawMessage',
+        'getText',
+        'getMessage',
+        'getMessages',
+        'updateMessage',
+        'updateMessages',
+        'listMailboxes',
+        'moveMessage',
+        'moveMessages',
+        'deleteMessage',
+        'deleteMessages',
+        'getQuota',
+        'createMailbox',
+        'modifyMailbox',
+        'deleteMailbox',
+        'uploadMessage',
+        'getAttachment',
+        'listSignatures'
+    ].map(cmd => [cmd, commandAccountOperation]),
+    ['subconnections', commandSubconnections],
+    ['googlePubSub', commandGooglePubSub],
+    ['googlePubSubRemove', commandGooglePubSub],
+    ['externalNotify', commandExternalNotify],
+    ['subscriptionLifecycle', commandSubscriptionLifecycle]
+]);
+
+async function onCommand(worker, message) {
+    const handler = COMMAND_HANDLERS.get(message.cmd);
+    if (handler) {
+        return await handler(worker, message);
+    }
+
+    return NOT_HANDLED;
+}
+
+// Metrics collection results
+// Connection states published so far, so a state no account is in any more is reported as 0
+// instead of keeping its last value
+let publishedConnectionStates = new Set();
+let collectingMetrics = false;
+
+/**
+ * Collect IMAP connection metrics from all workers
+ * @returns {Promise<void>}
+ */
+async function collectMetrics() {
+    // Runs every second but awaits a countConnections call per worker, each allowed the full command
+    // timeout. Overlapping runs used to add into one shared result object while another run zeroed
+    // it, so the gauge reported doubled or partial counts exactly when a worker was slow.
+    if (collectingMetrics) {
+        return;
+    }
+    collectingMetrics = true;
+    try {
+        await collectConnectionMetrics();
+    } finally {
+        collectingMetrics = false;
+    }
+}
+
+async function collectConnectionMetrics() {
+    let metricsResult = {};
+    for (let status of publishedConnectionStates) {
+        metricsResult[status] = 0;
+    }
+
+    // Subscription state counters
+    let subscriptionResults = { valid: 0, expired: 0, unset: 0, failed: 0, pending: 0 };
+
+    // Collect from each IMAP worker
+    if (workers.has('imap')) {
+        let imapWorkers = workers.get('imap');
+        for (let imapWorker of imapWorkers) {
+            if (!availableIMAPWorkers.has(imapWorker)) {
+                // Worker not ready yet
+                continue;
+            }
+
+            try {
+                let workerStats = await call(imapWorker, { cmd: 'countConnections' });
+
+                // Handle connection states
+                let connectionStats = workerStats?.connections || workerStats || {};
+                Object.keys(connectionStats).forEach(status => {
+                    if (!metricsResult[status]) {
+                        metricsResult[status] = 0;
+                    }
+                    metricsResult[status] += Number(connectionStats[status]) || 0;
+                });
+
+                // Handle subscription states (MS Graph)
+                if (workerStats?.subscriptions) {
+                    Object.keys(workerStats.subscriptions).forEach(status => {
+                        if (subscriptionResults[status] !== undefined) {
+                            subscriptionResults[status] += Number(workerStats.subscriptions[status]) || 0;
+                        }
+                    });
+                }
+            } catch (err) {
+                logger.warn({ msg: 'Connection count failed', threadId: imapWorker.threadId, err });
+            }
+        }
+    }
+
+    // Add unassigned accounts to disconnected count
+    metricsResult.disconnected = (Number(metricsResult.disconnected) || 0) + (unassigned ? unassigned.size : 0);
+
+    // Update Prometheus metrics for connections
+    Object.keys(metricsResult).forEach(status => {
+        publishedConnectionStates.add(status);
+        metrics.imapConnections.set({ status }, metricsResult[status]);
+    });
+
+    // Update Prometheus metrics for MS Graph subscriptions
+    Object.keys(subscriptionResults).forEach(status => {
+        metrics.outlookSubscriptions.set({ status }, subscriptionResults[status]);
+    });
+}
+
+/**
+ * Close all queue connections gracefully
+ * @param {Function} cb - Callback when complete
+ */
+const closeQueues = cb => {
+    let proms = [];
+
+    // Signal every worker to wind down before exiting. Signals only reach this thread, so a worker
+    // cannot notice the shutdown on its own - without this its sockets are simply cut and any
+    // BullMQ job it was running is recovered as stalled and re-run, which for the submit queue
+    // means re-sending a message the MTA had already accepted.
+    //
+    // Broadcast rather than an allowlist of types: a worker with nothing to drain answers the
+    // unknown command with 999 and costs one round trip, whereas a list here has to be kept in
+    // sync with every worker that later grows a drain.
+    for (let [type, typeWorkers] of workers) {
+        for (let worker of typeWorkers) {
+            proms.push(
+                call(worker, { cmd: 'close', timeout: WORKER_DRAIN_TIMEOUT }).catch(err => {
+                    logger.warn({ msg: 'Failed to signal worker to close', type, err });
+                })
+            );
+        }
+    }
+
+    if (!proms.length) {
+        return setImmediate(() => cb());
+    }
+
+    let returned;
+
+    let closeTimeout = setTimeout(() => {
+        if (returned) {
+            return;
+        }
+        logger.warn({ msg: 'Shutdown drain did not finish in time, exiting anyway', timeout: SHUTDOWN_DRAIN_TIMEOUT });
+        returned = true;
+        cb();
+    }, SHUTDOWN_DRAIN_TIMEOUT);
+
+    Promise.allSettled(proms).then(() => {
+        clearTimeout(closeTimeout);
+        if (returned) {
+            return;
+        }
+        returned = true;
+        cb();
+    });
+};
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+    logger.info({ msg: 'Shutdown signal received', signal: 'SIGTERM', isClosing });
+    if (isClosing) {
+        return;
+    }
+    isClosing = true;
+    closeQueues(() => {
+        logger.flush(() => process.exit());
+    });
+});
+
+process.on('SIGINT', () => {
+    logger.info({ msg: 'Shutdown signal received', signal: 'SIGINT', isClosing });
+    if (isClosing) {
+        return;
+    }
+    isClosing = true;
+    closeQueues(() => {
+        logger.flush(() => process.exit());
+    });
+});
+
+// START APPLICATION
+
+/**
+ * Waits for a fleet of spawned workers and tolerates a partial start: proceeds as long as at
+ * least one worker reached 'ready' (the spawnWorker exit handler respawns any that failed;
+ * letting such a rejection abort startup would exit the process while the respawn is pending).
+ * Only a fleet that failed entirely is fatal - the thrown error rejects startApplication(), which
+ * logs fatal and exits the process, preserving the original single-worker "no worker => exit"
+ * behavior.
+ *
+ * @param {string} label - Worker type as it appears in the log lines ('API', 'IMAP')
+ * @param {Promise[]} promises - spawnWorker() promises of the fleet
+ * @param {Object} logFields - extra fields for the partial-failure log line (requested count etc.)
+ * @returns {Promise<Array>} Thread IDs of the workers that reached 'ready'
+ */
+const settleWorkerFleet = async (label, promises, logFields) => {
+    let results = await Promise.allSettled(promises);
+    let threadIds = results.filter(result => result.status === 'fulfilled').map(result => result.value);
+    let failed = results.length - threadIds.length;
+    if (failed) {
+        logger.error(
+            Object.assign({ msg: `Some ${label} workers failed to start; they will be respawned` }, logFields, {
+                ready: threadIds.length,
+                failed,
+                errors: results
+                    .filter(result => result.status === 'rejected')
+                    .map(result => ({
+                        message: result.reason && result.reason.message,
+                        exitCode: result.reason && result.reason.exitCode,
+                        threadId: result.reason && result.reason.threadId
+                    }))
+            })
+        );
+    }
+    if (results.length && !threadIds.length) {
+        throw new Error(`No ${label} worker thread could be started`);
+    }
+    return threadIds;
+};
+
+/**
+ * Loads the license from the configured license file and from EENGINE_PREPARED_LICENSE. Either one
+ * failing is fatal: the process exits once the log is flushed
+ * @returns {Promise<boolean>} true when startup has to stop
+ */
+const importConfiguredLicenses = async () => {
+    // Process license file if provided
+    if (config.licensePath) {
+        try {
+            let stat = await fs.stat(config.licensePath);
+            if (!stat.isFile()) {
+                throw new Error(`License file is not accessible`);
+            }
+            const licenseFile = await fs.readFile(config.licensePath, 'utf-8');
+            let licenseData = await checkLicense(licenseFile);
+            if (!licenseData) {
+                throw new Error('Invalid license key');
+            }
+            logger.info({ msg: 'License loaded', license: redactLicense(licenseData), source: config.licensePath });
+
+            await setLicense(licenseData, licenseFile);
+        } catch (err) {
+            logger.fatal({ msg: 'License verification failed', source: config.licensePath, err });
+            logger.flush(() => process.exit(13));
+            return true;
+        }
+    }
+
+    // Process prepared license
+    const preparedLicenseString = readEnvValue('EENGINE_PREPARED_LICENSE') || config.preparedLicense;
+    if (preparedLicenseString) {
+        try {
+            let imported = await settings.importLicense(preparedLicenseString, checkLicense);
+            if (imported) {
+                logger.info({ msg: 'License imported', source: 'import' });
+            }
+        } catch (err) {
+            logger.fatal({ msg: 'License import failed', source: 'import', err });
+            logger.flush(() => process.exit(13));
+            return true;
+        }
+    }
+
+    return false;
+};
+
+/**
+ * Activates the license stored in Redis, if there is a valid one
+ * @returns {Promise<void>}
+ */
+const loadStoredLicense = async () => {
+    // Load license from database
+    let licenseFile = await redis.hget(`${REDIS_PREFIX}settings`, 'license');
+    if (licenseFile) {
+        try {
+            let licenseData = await checkLicense(licenseFile);
+            if (!licenseData) {
+                throw new Error('Invalid license key');
+            }
+            licenseInfo.active = true;
+            licenseInfo.details = licenseData;
+            licenseInfo.type = 'EmailEngine License';
+            if (!config.licensePath) {
+                logger.info({ msg: 'License loaded', license: redactLicense(licenseData), source: 'db' });
+            }
+        } catch (err) {
+            logger.error({ msg: 'Stored license verification failed', contentLength: licenseFile.length, err });
+        }
+    }
+
+    if (!licenseInfo.active) {
+        logger.error({ msg: 'No active license. Running in limited mode.' });
+    }
+};
+
+/**
+ * Applies the stored subscription state before any worker starts (lib/license-subscription.js): a
+ * license suspended when EmailEngine stopped, or whose deadline ran out while it was not running,
+ * starts suspended rather than running until the first check
+ * @returns {Promise<boolean>} whether to check the subscription online right away
+ */
+const applyStartupSubscriptionState = async () => {
+    let [subexp, subsusp, subcheck] = await redis.hmget(`${REDIS_PREFIX}settings`, 'subexp', 'subsusp', 'subcheck');
+    subscriptionDeadline = toTime(subexp);
+    let plan = startupPlan({ details: licenseInfo.active && licenseInfo.details, subexp, subsusp, subcheck, now: Date.now() });
+
+    if (plan.suspension) {
+        logger.warn({ msg: 'Subscription not in good standing, starting suspended', license: redactLicense(licenseInfo.details), suspension: plan.suspension });
+        setSuspension(plan.suspension);
+        for (let type of LICENSED_WORKER_TYPES) {
+            suspendedWorkerTypes.add(type);
+        }
+    }
+
+    return plan.checkNow;
+};
+
+/**
+ * One-time data migrations that run before the workers spawn. None of them is fatal
+ * @returns {Promise<void>}
+ */
+const runStartupMigrations = async () => {
+    // Move any settings-based OAuth2 configuration into the app registry before workers spawn.
+    // A failure is not fatal: the source settings keys stay in place, so the migration retries
+    // on the next startup (the legacy config is simply not visible until it succeeds).
+    try {
+        await oauth2Apps.migrateLegacyApps();
+    } catch (err) {
+        logger.error({ msg: 'Failed to migrate legacy OAuth2 apps', err });
+    }
+
+    // Give accounts that 2.79.3 switched off after repeated authentication failures the provenance
+    // marker 2.79.4 recognises, so re-authorizing one resumes it instead of silently doing nothing.
+    // A failure is not fatal: the completion key is written last, so the next startup re-enters.
+    try {
+        await backfillAuthFailureDisabled();
+    } catch (err) {
+        logger.error({ msg: 'Failed to backfill the auth-failure disable marker', err });
+    }
+
+    // Index the exports created before the per-account export index, so deleting an account removes
+    // them too. Not fatal: the completion key is written last, so the next startup re-enters
+    try {
+        await backfillExportIndex();
+    } catch (err) {
+        logger.error({ msg: 'Failed to backfill the export index', err });
+    }
+
+    // One-time delete of the store behind the retired `bounces` field; not fatal, the completion key is written last
+    try {
+        await sweepBounceStore();
+    } catch (err) {
+        logger.error({ msg: 'Failed to sweep the retired bounce store', err });
+    }
+};
+
+/**
+ * Applies EENGINE_SETTINGS and records which keys it manages
+ * @returns {Promise<void>}
+ */
+const applyPreparedSettings = async () => {
+    // Apply prepared settings
+    if (preparedSettings) {
+        logger.debug({ msg: 'Applying configuration', settingsKeys: Object.keys(preparedSettings) });
+
+        for (let key of Object.keys(preparedSettings)) {
+            await settings.set(key, preparedSettings[key]);
+        }
+
+        // These keys are re-applied on every boot, so a value saved for one of them in the admin
+        // UI reverts at the next restart. The list is recorded for the settings pages
+        // (lib/ui-routes/settings-page.js) to flag those fields as managed by EENGINE_SETTINGS
+        await settings.set('preparedSettingsKeys', Object.keys(preparedSettings));
+    } else {
+        await settings.clear('preparedSettingsKeys');
+    }
+};
+
+/**
+ * Seeds the SMTP server settings that have no stored value yet
+ * @returns {Promise<void>}
+ */
+const seedSmtpServerSettings = async () => {
+    // SMTP server settings
+    let existingSmtpEnabled = await settings.get('smtpServerEnabled');
+    if (existingSmtpEnabled === null) {
+        await settings.set('smtpServerEnabled', !!SMTP_ENABLED);
+    }
+
+    let existingSmtpSecret = await settings.get('smtpServerPassword');
+    if (existingSmtpSecret === null) {
+        await settings.set('smtpServerPassword', SMTP_SECRET || null);
+    }
+
+    let existingSmtpAuthEnabled = await settings.get('smtpServerAuthEnabled');
+    if (existingSmtpAuthEnabled === null && (existingSmtpSecret || existingSmtpSecret === null)) {
+        await settings.set('smtpServerAuthEnabled', true);
+    }
+
+    let existingSmtpPort = await settings.get('smtpServerPort');
+    if (existingSmtpPort === null) {
+        await settings.set('smtpServerPort', SMTP_PORT);
+    }
+
+    let existingSmtpHost = await settings.get('smtpServerHost');
+    if (existingSmtpHost === null) {
+        await settings.set('smtpServerHost', SMTP_HOST);
+    }
+
+    let existingSmtpProxy = await settings.get('smtpServerProxy');
+    if (existingSmtpProxy === null) {
+        await settings.set('smtpServerProxy', SMTP_PROXY);
+    }
+};
+
+/**
+ * Seeds the IMAP proxy settings that have no stored value yet
+ * @returns {Promise<void>}
+ */
+const seedImapProxySettings = async () => {
+    // IMAP proxy settings
+    let existingImapProxyEnabled = await settings.get('imapProxyServerEnabled');
+    if (existingImapProxyEnabled === null) {
+        await settings.set('imapProxyServerEnabled', !!IMAP_PROXY_ENABLED);
+    }
+
+    let existingImapProxySecret = await settings.get('imapProxyServerPassword');
+    if (existingImapProxySecret === null) {
+        await settings.set('imapProxyServerPassword', IMAP_PROXY_SECRET || null);
+    }
+
+    let existingImapProxyPort = await settings.get('imapProxyServerPort');
+    if (existingImapProxyPort === null) {
+        await settings.set('imapProxyServerPort', IMAP_PROXY_PORT);
+    }
+
+    let existingImapProxyHost = await settings.get('imapProxyServerHost');
+    if (existingImapProxyHost === null) {
+        await settings.set('imapProxyServerHost', IMAP_PROXY_HOST);
+    }
+
+    let existingImapProxyProxy = await settings.get('imapProxyServerProxy');
+    if (existingImapProxyProxy === null) {
+        await settings.set('imapProxyServerProxy', IMAP_PROXY_PROXY);
+    }
+};
+
+/**
+ * Seeds the API, service, webhook, script and token settings that have no stored value yet
+ * @returns {Promise<void>}
+ */
+const seedServiceSettings = async () => {
+    // API proxy settings
+    let existingEnableApiProxy = await settings.get('enableApiProxy');
+    if (existingEnableApiProxy === null) {
+        await settings.set('enableApiProxy', HAS_API_PROXY_SET ? API_PROXY : true);
+    }
+
+    // Service settings. HSETNX rather than read-then-write: a stored secret that does not decrypt
+    // (the wrong EENGINE_SECRET) reads as null, and overwriting it would destroy a value the
+    // rotation CLI can still recover once the right secret is back
+    await settings.setIfMissing('serviceSecret', crypto.randomBytes(16).toString('hex'));
+
+    let existingQueueKeep = await settings.get('queueKeep');
+    if (existingQueueKeep === null) {
+        let QUEUE_KEEP = Math.max((readEnvValue('EENGINE_QUEUE_REMOVE_AFTER') && Number(readEnvValue('EENGINE_QUEUE_REMOVE_AFTER'))) || 0, 0);
+        await settings.set('queueKeep', QUEUE_KEEP);
+    }
+
+    // Webhook settings
+    let existingNotifyText = await settings.get('notifyText');
+    if (existingNotifyText === null) {
+        await settings.set('notifyText', true);
+    }
+
+    let existingNotifyTextSize = await settings.get('notifyTextSize');
+    if (existingNotifyTextSize === null) {
+        await settings.set('notifyTextSize', 2 * 1024 * 1024); // 2MB default
+    }
+
+    // Script settings
+    let existingScriptEnv = await settings.get('scriptEnv');
+    if (existingScriptEnv === null) {
+        await settings.set('scriptEnv', {}); // empty object
+    }
+
+    // OAuth2 token access settings
+    let existingEnableOAuthTokensApi = await settings.get('enableOAuthTokensApi');
+    if (existingEnableOAuthTokensApi === null && ENABLE_OAUTH_TOKENS_API !== null) {
+        await settings.set('enableOAuthTokensApi', ENABLE_OAUTH_TOKENS_API);
+    }
+
+    // API authentication requirement settings
+    let existingDisableTokens = await settings.get('disableTokens');
+    if (existingDisableTokens === null && REQUIRE_API_AUTH !== null) {
+        // disableTokens is the inverse of REQUIRE_API_AUTH
+        await settings.set('disableTokens', !REQUIRE_API_AUTH);
+    }
+};
+
+/**
+ * Seeds every setting that has no stored value yet, in a fixed order
+ * @returns {Promise<void>}
+ */
+const seedDefaultSettings = async () => {
+    // Initialize required settings
+    let existingServiceId = await settings.get('serviceId');
+    if (existingServiceId === null) {
+        await settings.set('serviceId', crypto.randomBytes(16).toString('hex'));
+    }
+
+    await seedSmtpServerSettings();
+    await seedImapProxySettings();
+    await seedServiceSettings();
+};
+
+/**
+ * Imports EENGINE_PREPARED_TOKEN and EENGINE_PREPARED_PASSWORD. A failure is logged, not fatal
+ * @returns {Promise<void>}
+ */
+const importPreparedCredentials = async () => {
+    // Import prepared token
+    if (preparedToken) {
+        try {
+            let imported = await tokens.setRawData(preparedToken);
+            if (imported) {
+                logger.debug({ msg: 'Token imported', token: preparedToken.id });
+            } else {
+                logger.debug({ msg: 'Token already exists', token: preparedToken.id });
+            }
+        } catch (err) {
+            logger.error({ msg: 'Token import failed', token: preparedToken.id, err });
+        }
+    }
+
+    // Import prepared password
+    if (preparedPassword) {
+        try {
+            await importPreparedPassword(preparedPassword, { settings, passkeys: require('./lib/passkeys'), logger });
+        } catch (err) {
+            logger.error({ msg: 'Password import failed', err });
+        }
+    }
+};
+
+/**
+ * Warns about a missing encryption secret and makes sure the admin session cookie key exists
+ * @returns {Promise<void>}
+ */
+const ensureInstanceSecrets = async () => {
+    if (!(await getSecret())) {
+        // Every consumer of the secret stores the value as it is when there is none, so without
+        // it the account passwords, OAuth2 tokens, webhook secrets and TLS keys sit in Redis in
+        // clear text. Nothing else says so: the instance works exactly the same either way
+        logger.warn({
+            msg: 'No encryption secret is configured, account passwords, OAuth2 tokens, webhook secrets and TLS keys are stored in Redis unencrypted. Set EENGINE_SECRET to encrypt them'
+        });
+    }
+
+    // Ensure cookie password
+    let cookiePassword = await settings.get('cookiePassword');
+    if (!cookiePassword) {
+        cookiePassword = crypto.randomBytes(32).toString('base64');
+        await settings.set('cookiePassword', cookiePassword);
+    }
+};
+
+/**
+ * Starts the API workers, several sharing the listen port when SO_REUSEPORT allows it
+ * @returns {Promise<void>}
+ */
+const startApiWorkers = async () => {
+    // Start API server first for health checks.
+    // Optionally run several API workers that share the listen port via SO_REUSEPORT.
+    apiWorkersRequested = config.workers.api;
+    // Effective count we actually start; drops to 1 if SO_REUSEPORT is unavailable. Kept as a local
+    // so we don't mutate the parsed config object that is read elsewhere.
+    let effectiveApiWorkers = config.workers.api;
+    if (config.workers.api > 1) {
+        const probe = await probeReusePort(config.api.host, config.api.port);
+        apiWorkerReusePort = probe.supported;
+        if (!apiWorkerReusePort) {
+            // Only a first-bind EADDRINUSE/EACCES (stage 'probe') means we genuinely could not test
+            // the port - a transient conflict or permission issue, which the single API worker we
+            // start next will surface. A failed second bind (stage 'reuse') instead means reusePort
+            // is accepted but not honored on this platform/Node (e.g. Node < 23.1), which is a
+            // capability limitation rather than a port conflict, so it falls through to the
+            // "not available on this platform" message below.
+            if (probe.stage === 'probe' && (probe.code === 'EADDRINUSE' || probe.code === 'EACCES')) {
+                apiWorkerReusePortFallbackReason = 'port';
+                logger.warn({
+                    msg: 'Could not probe SO_REUSEPORT because the API port is unavailable; starting a single API worker',
+                    requested: apiWorkersRequested,
+                    code: probe.code,
+                    host: config.api.host,
+                    port: config.api.port
+                });
+            } else {
+                apiWorkerReusePortFallbackReason = 'platform';
+                logger.warn({
+                    msg: 'Multiple API workers requested but SO_REUSEPORT is not available on this platform; starting a single API worker',
+                    requested: apiWorkersRequested,
+                    code: probe.code
+                });
+            }
+            effectiveApiWorkers = 1;
+            // The /admin/internals warning banner (via the apiWorkerScaling command) tells the
+            // operator only one worker started; the thread-config popover keeps showing the
+            // configured EENGINE_WORKERS_API value rather than being rewritten here.
+        } else {
+            logger.info({ msg: 'SO_REUSEPORT is available; starting multiple API workers', workers: effectiveApiWorkers });
+        }
+    }
+
+    let apiPromises = [];
+    for (let i = 0; i < effectiveApiWorkers; i++) {
+        apiPromises.push(spawnWorker('api', workerSpawnOpts('api', i)));
+    }
+
+    // `attempted` can be below `requested` after the SO_REUSEPORT fallback above
+    let apiReady = (await settleWorkerFleet('API', apiPromises, { requested: apiWorkersRequested, attempted: apiPromises.length })).length;
+    logger.info({ msg: 'API workers started', requested: apiWorkersRequested, ready: apiReady });
+};
+
+/**
+ * Starts the IMAP workers and assigns the accounts to them
+ * @returns {Promise<void>}
+ */
+const startImapWorkers = async () => {
+    // Start IMAP workers
+    let workerPromises = [];
+    for (let i = 0; i < config.workers.imap; i++) {
+        workerPromises.push(spawnWorker('imap'));
+    }
+
+    let threadIds = await settleWorkerFleet('IMAP', workerPromises, { requested: config.workers.imap });
+    logger.info({ msg: 'IMAP workers started', workers: config.workers.imap, threadIds });
+
+    // Mark that initial workers are loaded BEFORE assignment
+    // This prevents race conditions where late-ready workers trigger redundant assignments
+    imapInitialWorkersLoaded = true;
+
+    // Wait a brief moment to ensure all workers have sent their 'ready' messages
+    await new Promise(r => setTimeout(r, 100));
+
+    // Assign accounts to workers after all are ready
+    try {
+        await assignAccounts();
+    } catch (err) {
+        logger.error({ msg: 'Initial account assignment failed', err });
+    }
+};
+
+/**
+ * Starts the webhook, submission and export workers, then the SMTP server and the IMAP proxy if
+ * they are enabled
+ * @returns {Promise<void>}
+ */
+const startBackgroundWorkers = async () => {
+    // Start webhook workers
+    for (let i = 0; i < config.workers.webhooks; i++) {
+        await spawnWorker('webhooks');
+    }
+
+    // Start submission workers
+    for (let i = 0; i < config.workers.submit; i++) {
+        await spawnWorker('submit');
+    }
+
+    // Start export workers
+    for (let i = 0; i < config.workers.export; i++) {
+        await spawnWorker('export');
+    }
+
+    // The Document Store was removed in 2.82.0. An instance upgraded with it still switched on
+    // is told where the feature went, here and on every admin page (workers/api.js), rather
+    // than losing its search index quietly
+    if (await settings.get('documentStoreEnabled')) {
+        logger.warn({
+            msg: 'The Document Store feature has been removed from EmailEngine. Downgrade if you still need it',
+            lastVersionWithDocumentStore: LAST_DOCUMENT_STORE_VERSION
+        });
+    }
+
+    // Start SMTP proxy if enabled
+    if (await settings.get('smtpServerEnabled')) {
+        await spawnWorker('smtp');
+    }
+
+    // Start IMAP proxy if enabled
+    if (await settings.get('imapProxyServerEnabled')) {
+        await spawnWorker('imapProxy');
+    }
+};
+
+/**
+ * Creates and starts the background metrics collector
+ */
+const startMetricsCollector = () => {
+    // Initialize and start the metrics collector after all workers are ready
+    metricsCollector = new MetricsCollector({
+        logger,
+        cacheInterval: 10 * 1000, // 10 seconds
+        workerTimeout: 500, // 500ms timeout per worker
+        delayBetweenWorkers: 50, // 50ms delay between worker queries
+        startTime: NOW,
+
+        // Provide callbacks to access server state
+        getWorkers: () => workers,
+        callWorker: (worker, message) => call(worker, message),
+        getWorkerMetadata: worker => {
+            const metadata = {};
+
+            // Add account count for IMAP workers
+            if (workerAssigned.has(worker)) {
+                metadata.accounts = workerAssigned.get(worker).size;
+            }
+
+            // Add health status
+            metadata.healthStatus = workerHealthStatus.get(worker) || 'unknown';
+            const lastHeartbeat = workerHeartbeats.get(worker);
+            if (lastHeartbeat) {
+                metadata.lastHeartbeat = lastHeartbeat;
+                metadata.timeSinceHeartbeat = Date.now() - lastHeartbeat;
+            }
+
+            // Add worker metadata
+            let workerMeta = workersMeta.has(worker) ? workersMeta.get(worker) : {};
+            for (let key of Object.keys(workerMeta)) {
+                metadata[key] = workerMeta[key];
+            }
+
+            return metadata;
+        }
+    });
+
+    // Start the background collection
+    metricsCollector.start();
+
+    logger.info({ msg: 'Background metrics collector initialized and started' });
+};
+
+/**
+ * Main application startup
+ * @returns {Promise<void>}
+ */
+const startApplication = async () => {
+    // Generate unique run index
+    runIndex = await redis.hincrby(`${REDIS_PREFIX}settings`, 'run', 1);
+
+    // A license that was explicitly configured but cannot be loaded stops the startup
+    if (await importConfiguredLicenses()) {
+        return;
+    }
+
+    await loadStoredLicense();
+
+    startupLicenseCheck = await applyStartupSubscriptionState();
+
+    // Check for updates
+    processCheckUpgrade().catch(err => {
+        logger.warn({ msg: 'Update check failed', err });
+    });
+
+    await runStartupMigrations();
+
+    await applyPreparedSettings();
+
+    await seedDefaultSettings();
+
+    await importPreparedCredentials();
+
+    await ensureInstanceSecrets();
+
+    // Redis reconnection is now handled by workers themselves
+    // Workers will exit when Redis reconnects after disconnection,
+    // and the server will automatically restart them
+
+    // Initialize HTTP proxy agent from settings/env vars before spawning workers
+    await reloadHttpProxyAgent();
+
+    // -- START WORKER THREADS
+
+    await startApiWorkers();
+
+    if (licenseInfo.suspension) {
+        // the API answers like an unlicensed instance from the start, not from the next precheck tick
+        notifyApiLicenseState();
+    }
+
+    // Small delay to allow API to start
+    await new Promise(r => setTimeout(r, 100));
+
+    await startImapWorkers();
+
+    await startBackgroundWorkers();
+
+    startMetricsCollector();
+};
+
+// Start the application
+startApplication()
+    .then(bounceClassifier.initialize)
+    .then(() => {
+        // Start periodic metric collection
+        setInterval(() => {
+            collectMetrics().catch(err => logger.error({ msg: 'Metrics collection failed', err }));
+        }, 1000).unref();
+
+        // Schedule periodic checks. A monthly-plan license, or one that is not in good standing, is
+        // checked right away (unless an hour has not passed since the last check, so a restart
+        // loop costs one call an hour); everything else after the usual first delay
+        if (startupLicenseCheck) {
+            licenseCheckHandler({ force: true }).catch(err => logger.error({ msg: 'License check error', err }));
+        } else {
+            licenseCheckTimer = setTimeout(checkActiveLicense, LICENSE_CHECK_TIMEOUT);
+            licenseCheckTimer.unref();
+        }
+
+        upgradeCheckTimer = setTimeout(checkUpgrade, UPGRADE_CHECK_TIMEOUT);
+        upgradeCheckTimer.unref();
+
+        redisPingTimer = setTimeout(checkRedisPing, REDIS_PING_TIMEOUT);
+        redisPingTimer.unref();
+
+        // Start worker health monitoring
+        startHealthMonitoring();
+
+        // Periodic queue cleanup (every 6 hours)
+        const QUEUE_CLEANUP_INTERVAL = 6 * 60 * 60 * 1000;
+
+        async function cleanupQueues() {
+            const queues = [notifyQueue, submitQueue, exportQueue];
+            const ages = queueCleanAges(await getFailedJobRetention());
+            for (const queue of queues) {
+                try {
+                    // The same ages the jobs are added with, see lib/queue-retention.js
+                    await queue.clean(ages.completed, 10000, 'completed');
+                    await queue.clean(ages.failed, 10000, 'failed');
+                    logger.trace({ msg: 'Queue cleanup completed', queue: queue.name });
+                } catch (err) {
+                    logger.error({ msg: 'Queue cleanup failed', queue: queue.name, err });
+                }
+            }
+
+            // The content kept for retrying failed messages follows the failed jobs it belongs
+            // to: whatever the clean above removed, and whatever aged out, is dropped here
+            try {
+                const pruned = await pruneFailedContent({ logger });
+                logger.trace({ msg: 'Failed message content pruned', ...pruned });
+            } catch (err) {
+                logger.error({ msg: 'Failed to prune the content of failed messages', err });
+            }
+        }
+
+        const queueCleanupTimer = setInterval(cleanupQueues, QUEUE_CLEANUP_INTERVAL);
+        queueCleanupTimer.unref();
+
+        // Initial cleanup 5 minutes after startup
+        setTimeout(cleanupQueues, 5 * 60 * 1000).unref();
+    })
+    .catch(err => {
+        logger.fatal({ msg: 'Application startup failed', err });
+        logger.flush(() => process.exit(1));
+    });

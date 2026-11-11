@@ -1,0 +1,30 @@
+{{> gateways_header}}
+
+{{> ui/breadcrumb parentHref="/admin/gateways" parentLabel="Gateways" current="New" class="mt-6 mb-6"}}
+
+<form method="post" action="/admin/gateways/new">
+    <input type="hidden" name="crumb" value="{{crumb}}">
+
+    <div class="card bg-base-100 shadow-md mb-6">
+
+        <div class="card-header flex flex-wrap items-center justify-between gap-3">
+            <h6 class="card-title text-primary">New Gateway</h6>
+            {{> ui/btn label="Test connection" variant="neutral" style="soft" size="sm" id="test-verify-btn"
+            icon="icon-[tabler--send]"}}
+        </div>
+
+        <div class="card-body space-y-4">
+
+            {{> ui/form-field id="gateway" name="gateway" label="Gateway ID" value=values.gateway error=errors.gateway placeholder="sendgrid-main" lpignore=true hint="Unique identifier for this gateway. Leave empty to auto-generate."}}
+
+            {{>gateway_form}}
+
+        </div>
+    </div>
+
+    <div class="mb-6">
+        {{> ui/btn label="Create gateway" type="submit" icon="icon-[tabler--send]"}}
+    </div>
+</form>
+
+{{>gateway_js}}

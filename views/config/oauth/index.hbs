@@ -1,0 +1,96 @@
+{{#> oauth_config_header badgeLabel=total}}
+<div class="dropdown relative inline-flex">
+    <button type="button" id="create-app-dropdown" class="dropdown-toggle btn btn-primary" aria-haspopup="menu"
+        aria-expanded="false">
+        <span class="icon-[tabler--plus] size-4"></span> Create OAuth2 app
+        <span class="icon-[tabler--chevron-down] size-4"></span>
+    </button>
+    <ul class="dropdown-menu dropdown-open:opacity-100 hidden min-w-52" role="menu" aria-orientation="vertical"
+        aria-labelledby="create-app-dropdown">
+        <li><a class="dropdown-item" href="{{newLink}}?provider=gmail">Gmail</a></li>
+        <li><a class="dropdown-item" href="{{newLink}}?provider=gmailService">Gmail Service Accounts</a></li>
+        <li><a class="dropdown-item" href="{{newLink}}?provider=outlook">Outlook (delegated)</a></li>
+        <li><a class="dropdown-item" href="{{newLink}}?provider=outlookService">Outlook (application)</a></li>
+        <li><a class="dropdown-item" href="{{newLink}}?provider=mailRu">Mail.ru</a></li>
+    </ul>
+</div>
+{{/oauth_config_header}}
+
+{{> oauth_tabs}}
+
+{{#if apps}}
+<div class="card bg-base-100 shadow-md mb-6">
+    <div class="overflow-x-auto">
+        <table class="table ee-table-stack">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Description</th>
+                    <th>Type</th>
+                    <th>Base scopes</th>
+                    <th>Status</th>
+                    <th class="w-12"><span class="sr-only">Actions</span></th>
+                </tr>
+            </thead>
+
+            <tbody>
+                {{#each apps}}
+                <tr class="hover:bg-base-200/60">
+                    <td class="relative">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id) label="Open OAuth2 app"}}
+                        <div><strong>{{name}}</strong></div>
+                        {{> ui/entity-id id=id prefix="Provider ID"}}
+                        {{!-- The provider-issued client id, which for Azure Entra is the same
+                              value the portal lists as "Application (client) ID" - showing it
+                              here is what lets an operator match this row against the Entra
+                              app list without opening every app --}}
+                        {{#if clientId}}
+                        <div>{{> ui/entity-id id=clientId prefix="Client ID"}}</div>
+                        {{/if}}
+                    </td>
+
+                    <td class="relative" data-label="Description">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}{{description}}
+                    </td>
+
+                    <td class="relative" data-label="Type">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}{{providerData.comment}}
+                    </td>
+
+                    <td class="relative" data-label="Base scopes">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}{{baseScopesText}}
+                    </td>
+
+                    <td class="relative" data-label="Status">
+                        {{> ui/row-link href=(concat "/admin/config/oauth/app/" id)}}
+                        {{#if enabled}}
+
+                        {{#if meta.authFlag}}
+                        {{> ui/badge label="Failing" variant="error" class="" icon="" soft=""}}
+                        {{else}}
+                        {{> ui/badge label="Enabled" variant="success" class="" icon="" soft=""}}
+                        {{/if}}
+                        {{else}}
+                        {{> ui/badge label="Disabled" variant="warning" class="" icon="" soft=""}}
+                        {{/if}}
+                    </td>
+
+                    <td class="ee-stack-actions relative text-end">
+                        {{> ui/row-actions openHref=(concat "/admin/config/oauth/app/" id) label="OAuth2 app actions"
+                        deleteModal="#deleteOauthApp" deleteId=id deleteName=name}}
+                    </td>
+                </tr>
+                {{/each}}
+            </tbody>
+        </table>
+    </div>
+
+    {{> ui/pagination showPaging=showPaging prevPage=prevPage nextPage=nextPage pageLinks=pageLinks}}
+</div>
+{{else}}
+{{> ui/list-empty noun="OAuth2 apps" query=query firstPage=firstPage clearHref="/admin/config/oauth"}}
+{{/if}}
+
+{{#> ui/delete-modal id="deleteOauthApp" noun="OAuth2 app" action="/admin/config/oauth/delete" fieldName="app"}}
+Are you sure you want to delete <strong class="delete-target-name"></strong>? Accounts using this app will stop working until reconfigured. This action cannot be undone.
+{{/ui/delete-modal}}

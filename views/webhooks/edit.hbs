@@ -1,0 +1,18 @@
+{{> webhooks_header}}
+
+{{> ui/breadcrumb parentHref="/admin/webhooks" parentLabel="Webhook Routes" midHref=(concat "/admin/webhooks/webhook/" webhook.id) midLabel=webhook.name current="Edit" class="mt-6 mb-6"}}
+
+
+<form method="post" action="/admin/webhooks/edit" id="edit-form">
+    {{!-- no id: the layout already renders the #crumb element scripts read --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+    <input type="hidden" name="webhook" value="{{values.webhook}}">
+
+    {{>webhook_form}}
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--device-floppy]"}}
+    </div>
+</form>
+
+{{>webhooks_editor_functions}}

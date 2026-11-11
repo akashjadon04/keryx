@@ -1,0 +1,73 @@
+{{> gateways_header}}
+
+{{> ui/breadcrumb parentHref="/admin/gateways" parentLabel="Gateways" current=gateway.gateway class="mt-6 mb-6"}}
+
+{{#if gateway.lastError}}
+{{#> ui/alert-banner variant="error" title="Connection error"}}
+<div class="break-words"><small>{{gateway.lastError.description}}</small></div>
+{{#if gateway.lastError.response}}
+<div class="break-words"><small>Server response: <code>{{gateway.lastError.response}}</code></small></div>
+{{/if}}
+{{/ui/alert-banner}}
+{{/if}}
+
+{{#> ui/card}}
+
+        {{#> ui/detail-toolbar label="Gateway actions"}}
+        {{#> ui/tooltip text="Modify gateway settings"}}
+        {{> ui/btn variant="primary" style="outline" size="sm" href=(concat "/admin/gateways/edit/" (urlpart gateway.gateway)) icon="icon-[tabler--edit]" label="Edit gateway"}}
+        {{/ui/tooltip}}
+
+        {{> ui/overflow-menu label="More gateway actions" deleteLabel="Delete gateway"}}
+        {{/ui/detail-toolbar}}
+
+        <h6 class="card-title mb-6">{{gateway.name}}</h6>
+
+        <dl class="ee-dl">
+            {{#if gateway.gateway}}
+            <dt>Gateway ID</dt>
+            <dd>
+                <strong>{{gateway.gateway}}</strong>
+
+                {{!-- live state badge with an error tooltip --}}
+                {{> ui/state-badge label=label account=gateway.gateway}}
+            </dd>
+            {{/if}}
+
+            {{#if gateway.deliveries}}
+            <dt>Emails Sent</dt>
+            <dd>{{gateway.deliveries}}</dd>
+            {{/if}}
+
+            {{#if gateway.user}}
+            <dt>Username</dt>
+            <dd>{{gateway.user}}</dd>
+            {{/if}}
+
+            {{#if gateway.pass}}
+            <dt>Password</dt>
+            <dd>********</dd>
+            {{/if}}
+
+            {{#if gateway.host}}
+            <dt>Server</dt>
+            <dd>{{gateway.host}}</dd>
+            {{/if}}
+
+            {{#if gateway.port}}
+            <dt>Port</dt>
+            <dd>{{gateway.port}}</dd>
+            {{/if}}
+
+            <dt>Encryption</dt>
+            <dd>{{#if gateway.secure}}Direct TLS{{else}}STARTTLS (when available){{/if}}
+            </dd>
+        </dl>
+
+
+{{/ui/card}}
+
+{{#> ui/confirm-modal id="deleteModal" title="Delete gateway" action=(concat "/admin/gateways/delete/" (urlpart gateway.gateway))
+submitLabel="Delete gateway"}}
+<p>Delete gateway "{{gateway.name}}"? This action cannot be undone.</p>
+{{/ui/confirm-modal}}

@@ -1,0 +1,167 @@
+{{> webhooks_header}}
+
+{{> ui/breadcrumb parentHref="/admin/webhooks" parentLabel="Webhook Routes" current=webhook.name class="mt-6 mb-6"}}
+
+{{#> ui/card}}
+
+        {{#> ui/detail-toolbar label="Webhook route actions"}}
+        {{#> ui/tooltip text="Edit webhook route settings"}}
+        {{> ui/btn variant="primary" style="outline" size="sm" href=(concat "/admin/webhooks/webhook/" webhook.id "/edit") icon="icon-[tabler--file-pencil]" label="Edit route"}}
+        {{/ui/tooltip}}
+
+        {{> ui/overflow-menu label="More webhook route actions" deleteLabel="Delete route"}}
+        {{/ui/detail-toolbar}}
+
+        {{#if webhook.description}}
+        <h6 class="card-title">{{webhook.name}}</h6>
+        <h6 class="mb-6 text-base-content/60">{{webhook.description}}</h6>
+        {{else}}
+        <h6 class="card-title mb-6">{{webhook.name}}</h6>
+        {{/if}}
+
+        {{#if webhook.webhookErrorFlag.message}}
+        {{#> ui/clear-alert alert="webhook-route" entry=webhook.id class="mb-6"}}
+            <p><strong>Warning:</strong> The last webhook delivery attempt failed:</p>
+            <hr class="my-2">
+            <p class="mb-0">
+                <code>
+            {{webhook.webhookErrorFlag.message}}
+        </code>
+            </p>
+        {{/ui/clear-alert}}
+        {{/if}}
+
+
+        <dl class="ee-dl">
+
+            {{#if webhook.targetUrlShort}}
+            <dt>Webhook Target</dt>
+            <dd>
+                {{#> ui/tooltip text=webhook.targetUrl}}<em>{{webhook.targetUrlShort}}</em>{{/ui/tooltip}}
+            </dd>
+            {{/if}}
+
+            <dt>Trigger count</dt>
+            <dd>
+                {{#> ui/tooltip text="How many times this route has been triggered"}}
+                {{> ui/badge label=webhook.tcount variant="neutral" soft=true}}
+                {{/ui/tooltip}}
+                <a href="/admin/queues/notify?state=failed&amp;route={{urlpart webhook.id}}" class="link link-animated text-sm ms-2">Failed deliveries</a>
+                <span class="text-base-content/40 text-sm">|</span>
+                <a href="/admin/queues/notify?route={{urlpart webhook.id}}" class="link link-animated text-sm">Waiting</a>
+            </dd>
+
+            {{#if webhook.customHeaders}}
+            <dt>Custom request headers</dt>
+            <dd>
+                {{#each webhook.customHeaders as |header|}}
+                {{#> ui/tooltip text=(concat header.key ": " header.value)}}
+                {{#> ui/badge soft=true}}<span class="font-mono">{{header.key}}</span>{{/ui/badge}}
+                {{/ui/tooltip}}
+                {{/each}}
+            </dd>
+            {{/if}}
+
+            <dt>Status</dt>
+            <dd>
+                {{#if webhook.enabled}}
+                {{> ui/badge label="Enabled" variant="success"}}
+                {{else}}
+                {{> ui/badge label="Disabled" variant="warning"}}
+                {{/if}}
+            </dd>
+
+        </dl>
+
+        <div class="mt-6">
+            {{#> ui/tabs label="Webhook route functions"}}
+            {{> ui/tab target="fn" label="Filter function" active=true}}
+            {{> ui/tab target="map" label="Map function"}}
+            {{#if errorLog}}
+            {{> ui/tab target="errors" label="Error log"}}
+            {{/if}}
+            {{/ui/tabs}}
+            <div class="mt-4">
+                <div id="fn" role="tabpanel" aria-labelledby="fn-tab">
+
+                    <div id="fn-preview" class="code-editor">{{webhook.content.fn}}</div>
+
+                </div>
+                <div id="map" class="hidden" role="tabpanel" aria-labelledby="map-tab">
+
+                    <div id="map-preview" class="code-editor">{{webhook.content.map}}</div>
+
+                </div>
+
+
+                {{#if errorLog}}
+                <div id="errors" class="hidden" role="tabpanel" aria-labelledby="errors-tab">
+
+
+                    <p class="mb-4">Recent errors from this route's filter and map functions:</p>
+
+                    <div class="overflow-x-auto">
+                        <table class="table">
+
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Function</th>
+                                    <th width="40%">Error</th>
+                                    <th width="40%">Payload</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {{#each errorLog}}
+
+                                <tr>
+
+                                    <td>
+                                        <span class="relative-time" data-time="{{created}}"></span>
+                                    </td>
+
+                                    <td>
+                                        <strong>{{type}}</strong>
+                                    </td>
+
+                                    <td>
+                                        <textarea class="error-log-field autoselect" readonly>{{error}}</textarea>
+                                    </td>
+
+                                    <td>
+                                        <textarea class="error-log-field autoselect" readonly>{{json payload}}</textarea>
+                                    </td>
+
+                                </tr>
+
+                                {{/each}}
+                            </tbody>
+
+                        </table>
+                    </div>
+
+                </div>
+                {{/if}}
+
+            </div>
+        </div>
+    
+{{/ui/card}}
+
+{{#> ui/confirm-modal id="deleteModal" title="Delete webhook route" action="/admin/webhooks/delete"
+fieldName="webhook" fieldValue=webhook.id submitLabel="Delete route"}}
+<p>Are you sure you want to delete <strong>{{webhook.name}}</strong>? This action cannot be undone.</p>
+{{/ui/confirm-modal}}
+
+{{> ace_assets}}
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        {{!-- useWorker is false, so the JSHint options machinery the editable
+              variants carry would be inert here - plain read-only previews --}}
+        uiAcePreview("fn-preview", "javascript", { useWorker: false });
+        uiAcePreview("map-preview", "javascript", { useWorker: false });
+
+    })
+</script>

@@ -1,0 +1,16 @@
+{{> oauth_config_header}}
+
+{{> ui/breadcrumb parentHref="/admin/config/oauth" parentLabel="OAuth2 Apps" midHref=(concat "/admin/config/oauth/app/"
+appData.id) midLabel=appData.name current="Edit app" class="mt-6 mb-6"}}
+
+<form method="post" action="/admin/config/oauth/edit">
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+    <input type="hidden" name="provider" value="{{appData.provider}}">
+    <input type="hidden" name="app" value="{{appData.id}}">
+
+    {{> oauth_form }}
+
+    <div class="mb-6">
+        {{> ui/btn label="Update app" type="submit" icon="icon-[tabler--device-floppy]"}}
+    </div>
+</form>

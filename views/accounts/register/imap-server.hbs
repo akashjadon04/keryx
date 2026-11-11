@@ -1,0 +1,457 @@
+{{!-- Hosted authentication form, step 3 (IMAP path): IMAP and SMTP server
+settings. "Verify connection" tests the settings through
+/accounts/new/imap/test before the form is submitted; the split button's
+dropdown allows skipping the test. --}}
+
+<form method="post" id="settings-form" action="/accounts/new/imap/server">
+    <input type="hidden" name="crumb" value="{{crumb}}">
+    <input type="hidden" name="data" value="{{values.data}}">
+    <input type="hidden" name="sig" value="{{values.sig}}">
+    <input type="hidden" name="email" value="{{values.email}}">
+    <input type="hidden" name="name" value="{{values.name}}">
+
+    {{!-- The appPassword_* hint values are server-derived only (initial render and the failAction
+    re-render both compute them from the static provider table), never read back from the
+    submission - the payload schemas stripUnknown any posted copy. Do not reintroduce hidden
+    inputs for them: echoing a client-controlled hint into the page was an XSS vector. --}}
+
+    <input type="hidden" id="tz" name="tz" value="{{values.tz}}" data-ee-tz>
+
+    {{#if autodetectFailed}}
+    <div class="ee-alert ee-alert-info">
+        <span class="ee-icon ee-icon-alert-circle"></span>
+        <span>{{_ "Server settings could not be detected automatically for %s. Enter them below." templateLocale
+            (escapeHtml autodetectDomain) }}</span>
+    </div>
+    {{/if}}
+
+    {{!-- Set when the checking page sent the visitor here because its connection check did not pass,
+    so the form says what it is for instead of appearing out of nowhere. The per-protocol detail stays
+    on the page they read it on. --}}
+    {{#if checkFailed}}
+    <div class="ee-alert ee-alert-warning">
+        <span class="ee-icon ee-icon-alert-circle"></span>
+        <span>{{_ "We couldn't sign in to your mail server with those settings. Check them and try again."
+            templateLocale }}</span>
+    </div>
+    {{/if}}
+
+    <div class="ee-form-grid">
+        <div class="ee-form-col">
+            <h6>{{_ "IMAP" templateLocale }}</h6>
+
+            <div class="ee-field">
+                <label class="ee-label" for="imap_auth_user">{{_ "Username" templateLocale }}</label>
+                <input type="text" class="ee-input{{#if errors.imap_auth_user}} ee-invalid{{/if}}"
+                    id="imap_auth_user" name="imap_auth_user" value="{{values.imap_auth_user}}" data-lpignore="true"
+                    autocomplete="off" required tabindex="1" />
+                {{#if errors.imap_auth_user}}
+                <span class="ee-field-error">{{errors.imap_auth_user}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+
+                {{#unless values.appPassword_required}}
+
+                <label class="ee-label" for="imap_auth_pass">
+                    {{_ "Password" templateLocale }}
+                </label>
+
+                {{else}}
+
+                {{#if values.appPassword_warning}}
+
+                <div class="ee-label-aside">
+                    <span class="ee-tooltip">
+                        <span class="ee-tooltip-trigger"><span
+                                class="ee-icon ee-icon-alert-circle ee-error-text"></span></span>
+                        <span class="ee-tooltip-content" role="tooltip">
+                            <strong>{{_ 'Important' templateLocale }}</strong><br>
+                            {{values.appPassword_warning}}
+                        </span>
+                    </span>
+                </div>
+
+                {{else}}
+
+                <div class="ee-label-aside">
+                    <span class="ee-tooltip">
+                        <span class="ee-tooltip-trigger"><a target="_blank" rel="noopener noreferrer" class="ee-link"
+                                href="{{values.appPassword_instructions}}" tabindex="-1">{{_ 'Instructions'
+                                templateLocale }}</a></span>
+                        <span class="ee-tooltip-content" role="tooltip">{{_
+                            '%s accounts require an application password for %s.' templateLocale
+                            values.appPassword_provider "IMAP"}}</span>
+                    </span>
+                </div>
+
+                {{/if}}
+
+                <label class="ee-label" for="imap_auth_pass">
+                    {{_ "Application Password" templateLocale }}
+                </label>
+
+                {{/unless}}
+
+                <input type="password" class="ee-input{{#if errors.imap_auth_pass}} ee-invalid{{/if}}"
+                    id="imap_auth_pass" name="imap_auth_pass" value="{{values.imap_auth_pass}}" data-lpignore="true"
+                    autocomplete="off" required tabindex="2" />
+                {{#if errors.imap_auth_pass}}
+                <span class="ee-field-error">{{errors.imap_auth_pass}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+                <label class="ee-label" for="imap_host">{{_ "Hostname" templateLocale }}</label>
+                <input type="text" class="ee-input{{#if errors.imap_host}} ee-invalid{{/if}}" data-lpignore="true"
+                    autocomplete="off" id="imap_host" name="imap_host" value="{{values.imap_host}}" required
+                    tabindex="3" />
+                {{#if errors.imap_host}}
+                <span class="ee-field-error">{{errors.imap_host}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+                <label class="ee-label" for="imap_port">{{_ "Port" templateLocale }}</label>
+                <input type="number" class="ee-input{{#if errors.imap_port}} ee-invalid{{/if}}" data-lpignore="true"
+                    autocomplete="off" id="imap_port" name="imap_port" value="{{values.imap_port}}" required
+                    tabindex="4" />
+                {{#if errors.imap_port}}
+                <span class="ee-field-error">{{errors.imap_port}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+                <div class="ee-label-aside">
+                    <span class="ee-tooltip">
+                        <span class="ee-tooltip-trigger"><span
+                                class="ee-icon ee-icon-help-circle ee-icon-muted"></span></span>
+                        <span class="ee-tooltip-content" role="tooltip">
+                            <strong>{{_ 'TLS for IMAP' templateLocale }}</strong><br>
+                            {{_ 'TLS (also known as SSL) is usually only needed when using port 993. For other ports EmailEngine falls back to using STARTTLS based encryption.' templateLocale }}
+                        </span>
+                    </span>
+                </div>
+                <div class="ee-checkbox-row">
+                    <input type="checkbox" class="ee-checkbox{{#if errors.imap_secure}} ee-invalid{{/if}}"
+                        id="imap_secure" name="imap_secure" {{#if values.imap_secure}}checked{{/if}} tabindex="5" />
+                    <label class="ee-label" for="imap_secure">{{_ "Use TLS" templateLocale }}</label>
+                </div>
+                {{#if errors.imap_secure}}
+                <span class="ee-field-error">{{errors.imap_secure}}</span>
+                {{/if}}
+            </div>
+
+        </div>
+        <div class="ee-form-col">
+            <h6>{{_ "SMTP" templateLocale }}</h6>
+
+            <div class="ee-field">
+                <label class="ee-label" for="smtp_auth_user">{{_ "Username" templateLocale }}</label>
+                <input type="text" class="ee-input{{#if errors.smtp_auth_user}} ee-invalid{{/if}}"
+                    id="smtp_auth_user" name="smtp_auth_user" value="{{values.smtp_auth_user}}" data-lpignore="true"
+                    autocomplete="off" required tabindex="6" />
+                {{#if errors.smtp_auth_user}}
+                <span class="ee-field-error">{{errors.smtp_auth_user}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+
+                {{#unless values.appPassword_required}}
+
+                <label class="ee-label" for="smtp_auth_pass">
+                    {{_ "Password" templateLocale }}
+                </label>
+
+                {{else}}
+
+                {{#if values.appPassword_warning}}
+
+                <div class="ee-label-aside">
+                    <span class="ee-tooltip">
+                        <span class="ee-tooltip-trigger"><span
+                                class="ee-icon ee-icon-alert-circle ee-error-text"></span></span>
+                        <span class="ee-tooltip-content" role="tooltip">
+                            <strong>{{_ 'Important' templateLocale }}</strong><br>
+                            {{values.appPassword_warning}}
+                        </span>
+                    </span>
+                </div>
+
+                {{else}}
+
+                <div class="ee-label-aside">
+                    <span class="ee-tooltip">
+                        <span class="ee-tooltip-trigger"><a target="_blank" rel="noopener noreferrer" class="ee-link"
+                                href="{{values.appPassword_instructions}}" tabindex="-1">{{_ 'Instructions'
+                                templateLocale }}</a></span>
+                        <span class="ee-tooltip-content" role="tooltip">{{_
+                            '%s accounts require an application password for %s.' templateLocale
+                            values.appPassword_provider 'SMTP'}}</span>
+                    </span>
+                </div>
+
+                {{/if}}
+
+                <label class="ee-label" for="smtp_auth_pass">
+                    {{_ "Application Password" templateLocale }}
+                </label>
+
+                {{/unless}}
+
+                <input type="password" class="ee-input{{#if errors.smtp_auth_pass}} ee-invalid{{/if}}"
+                    id="smtp_auth_pass" name="smtp_auth_pass" value="{{values.smtp_auth_pass}}" data-lpignore="true"
+                    autocomplete="off" required tabindex="7" />
+                {{#if errors.smtp_auth_pass}}
+                <span class="ee-field-error">{{errors.smtp_auth_pass}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+                <label class="ee-label" for="smtp_host">{{_ "Hostname" templateLocale }}</label>
+                <input type="text" class="ee-input{{#if errors.smtp_host}} ee-invalid{{/if}}" data-lpignore="true"
+                    autocomplete="off" id="smtp_host" name="smtp_host" value="{{values.smtp_host}}" required
+                    tabindex="8" />
+                {{#if errors.smtp_host}}
+                <span class="ee-field-error">{{errors.smtp_host}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+                <label class="ee-label" for="smtp_port">{{_ "Port" templateLocale }}</label>
+                <input type="number" class="ee-input{{#if errors.smtp_port}} ee-invalid{{/if}}" data-lpignore="true"
+                    autocomplete="off" id="smtp_port" name="smtp_port" value="{{values.smtp_port}}" required
+                    tabindex="9" />
+                {{#if errors.smtp_port}}
+                <span class="ee-field-error">{{errors.smtp_port}}</span>
+                {{/if}}
+            </div>
+
+            <div class="ee-field">
+                <div class="ee-label-aside">
+                    <span class="ee-tooltip">
+                        <span class="ee-tooltip-trigger"><span
+                                class="ee-icon ee-icon-help-circle ee-icon-muted"></span></span>
+                        <span class="ee-tooltip-content" role="tooltip">
+                            <strong>{{_ 'TLS for SMTP' templateLocale }}</strong><br>
+                            {{_ 'TLS (also known as SSL) is usually only needed when using port 465. For other ports EmailEngine falls back to using STARTTLS based encryption.' templateLocale }}
+                        </span>
+                    </span>
+                </div>
+                <div class="ee-checkbox-row">
+                    <input type="checkbox" class="ee-checkbox{{#if errors.smtp_secure}} ee-invalid{{/if}}"
+                        id="smtp_secure" name="smtp_secure" {{#if values.smtp_secure}}checked{{/if}} tabindex="10" />
+                    <label class="ee-label" for="smtp_secure">{{_ "Use TLS" templateLocale }}</label>
+                </div>
+                {{#if errors.smtp_secure}}
+                <span class="ee-field-error">{{errors.smtp_secure}}</span>
+                {{/if}}
+            </div>
+        </div>
+    </div>
+
+    <div class="ee-form-actions">
+
+        <button type="button" id="test-settings-btn" class="ee-btn ee-btn-primary" tabindex="11">
+            <span class="ee-icon ee-icon-help-circle" id="test-settings-btn-icon"></span>
+            {{_ "Verify connection" templateLocale }}
+        </button>
+
+        <div class="ee-split">
+            <button type="submit" id="submit-settings-btn" class="ee-btn ee-btn-neutral">
+                <span class="ee-icon ee-icon-arrow-right"></span>
+                {{_ "Save and continue" templateLocale }}
+            </button>
+            <details class="ee-dropdown">
+                <summary id="submit-settings-btn-down" class="ee-btn ee-btn-neutral ee-dropdown-toggle"
+                    aria-haspopup="menu">
+                    <span class="ee-sr-only">{{_ "Toggle Dropdown" templateLocale }}</span>
+                    <span class="ee-icon ee-icon-chevron-down"></span>
+                </summary>
+                <ul class="ee-dropdown-menu" role="menu" aria-labelledby="submit-settings-btn-down">
+                    <li role="none"><a class="ee-dropdown-item" role="menuitem" href="#" id="submit-wo-testing">{{_
+                            "Skip verification" templateLocale }}</a></li>
+                </ul>
+            </details>
+        </div>
+
+    </div>
+</form>
+
+{{!-- autofocus on the dialog keeps showModal() from focusing (and drawing a
+focus ring on) the corner close button --}}
+<dialog id="testResponseModal" class="ee-modal ee-modal-wide" aria-labelledby="testResponseModalLabel" autofocus>
+    <div class="ee-modal-header">
+        <h3 class="ee-modal-title" id="testResponseModalLabel">{{_ "Connection test failed" templateLocale }}</h3>
+        <button type="button" class="ee-modal-close" aria-label="{{_ "Close" templateLocale }}" data-modal-close>
+            <span class="ee-icon ee-icon-x"></span>
+        </button>
+    </div>
+    <div class="ee-modal-body">
+        <p>{{_ "We couldn't connect with these settings. Check the errors below." templateLocale}}</p>
+        <dl class="ee-dl" id="test-errors-list"></dl>
+    </div>
+    <div class="ee-modal-footer">
+        <button type="button" class="ee-btn ee-btn-neutral ee-btn-soft" data-modal-close>{{_ "Close" templateLocale
+            }}</button>
+    </div>
+</dialog>
+
+<input type="hidden" id="autoTest" value="{{#if autoTest}}true{{/if}}">
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        let formTested = false;
+        let formTesting = false;
+
+        let myForm = document.getElementById('settings-form');
+        let btnElm = document.getElementById('test-settings-btn');
+        let iconElm = document.getElementById('test-settings-btn-icon');
+        let submitElm = document.getElementById('submit-settings-btn')
+        let submitDownElm = document.getElementById('submit-settings-btn-down')
+        let errorsListElm = document.getElementById('test-errors-list')
+
+        {{!-- The busy button is feedback only: it greys the real submit <button> out and spins its
+        icon while a submit is in flight, so the wait for the account to be created is visible (the
+        dropdown toggle is a <summary> and the skip link an <a>, neither has disabled semantics).
+        The duplicate-submit guard is inside eeSubmitOnce (static/js/public.js), which every submit
+        path here routes through. --}}
+        let submitForm = eeSubmitOnce(myForm, { button: submitElm, validate: true, recoveryMs: 20 * 1000 });
+
+        {{!-- Both the row layout and the three response shapes it has to tell apart are shared with
+        the checking page (static/js/public.js); only what happens after belongs to this page. --}}
+        {{> public_test_labels}}
+
+        let showErrorPopup = (data) => {
+            eeRenderTestErrors(errorsListElm, data, TEST_ERROR_LABELS);
+            document.getElementById('testResponseModal').showModal();
+        }
+
+        let toggleSpinner = (enabled, success) => {
+
+            // the submit split button turns primary once the connection test has passed
+            if (enabled) {
+                iconElm.classList.remove('ee-icon-loader', 'ee-spin', 'ee-icon-help-circle', 'ee-icon-circle-check', 'ee-icon-circle-x');
+                iconElm.classList.add(success ? 'ee-icon-circle-check' : 'ee-icon-circle-x');
+                btnElm.disabled = false;
+
+                if (success) {
+                    submitElm.classList.replace('ee-btn-neutral', 'ee-btn-primary');
+                    submitDownElm.classList.replace('ee-btn-neutral', 'ee-btn-primary');
+                } else {
+                    submitElm.classList.replace('ee-btn-primary', 'ee-btn-neutral');
+                    submitDownElm.classList.replace('ee-btn-primary', 'ee-btn-neutral');
+                }
+            } else {
+                iconElm.classList.remove('ee-icon-circle-check', 'ee-icon-circle-x', 'ee-icon-help-circle');
+                iconElm.classList.add('ee-icon-loader', 'ee-spin');
+                btnElm.disabled = true;
+
+                submitElm.classList.replace('ee-btn-primary', 'ee-btn-neutral');
+                submitDownElm.classList.replace('ee-btn-primary', 'ee-btn-neutral');
+            }
+        }
+
+        let testSettings = () => eePostConnectionTest(myForm, { requestFailedText: REQUEST_FAILED_TEXT });
+
+        let runTest = (continueIfSuccessful) => {
+            if (formTesting) {
+                return;
+            }
+            formTesting = true;
+
+            toggleSpinner(false);
+            testSettings().then(data => {
+                formTesting = false;
+
+                if (data.imap && data.imap.success && data.smtp && data.smtp.success) {
+                    toggleSpinner(true, true);
+                    // everything checks out!
+                    formTested = true;
+
+                    if (continueIfSuccessful) {
+                        // resubmit after paint
+                        setTimeout(() => submitForm(), 10);
+                    }
+
+                } else {
+                    toggleSpinner(true, false);
+                    formTested = false;
+                    showErrorPopup(data);
+                }
+            }).catch(err => {
+                formTesting = false;
+                toggleSpinner(true, false);
+                formTested = false;
+                showErrorPopup({ error: err });
+            });
+        }
+
+        // (the containing dropdown closes on any menu item activation - static/js/public.js)
+        document.getElementById('submit-wo-testing').addEventListener('click', e => {
+            e.preventDefault();
+            formTested = true;
+            submitForm();
+        });
+
+        btnElm.addEventListener('click', () => {
+            runTest();
+        });
+
+        myForm.addEventListener('submit', e => {
+            submitElm.blur();
+            e.preventDefault();
+            if (formTested) {
+                submitForm();
+                return;
+            }
+            runTest(true);
+        });
+
+        const checkPort = (proto) => {
+            let portNr = Number(document.getElementById(`${proto}_port`).value);
+            switch (proto) {
+                case 'imap':
+                    if (portNr === 993) {
+                        // enable TLS checkbox
+                        document.getElementById(`${proto}_secure`).checked = true;
+                    }
+                    if (portNr === 143) {
+                        // plaintext IMAP port (STARTTLS), so clear the TLS checkbox
+                        document.getElementById(`${proto}_secure`).checked = false;
+                    }
+                    break;
+                case 'smtp':
+                    if (portNr === 465) {
+                        // enable TLS checkbox
+                        document.getElementById(`${proto}_secure`).checked = true;
+                    }
+                    if (portNr === 25 || portNr === 587) {
+                        // enable TLS checkbox
+                        document.getElementById(`${proto}_secure`).checked = false;
+                    }
+                    break;
+            }
+        }
+
+        let imapPortElm = document.getElementById('imap_port');
+        let smtpPortElm = document.getElementById('smtp_port');
+
+        {{!-- the tz field carries data-ee-tz, which static/js/public.js fills --}}
+
+        imapPortElm.addEventListener('change', () => checkPort('imap'));
+        imapPortElm.addEventListener('click', () => checkPort('imap'));
+        imapPortElm.addEventListener('keyup', () => checkPort('imap'));
+        smtpPortElm.addEventListener('change', () => checkPort('smtp'));
+        smtpPortElm.addEventListener('click', () => checkPort('smtp'));
+        smtpPortElm.addEventListener('keyup', () => checkPort('smtp'));
+
+        if (document.getElementById('autoTest').value.trim() === 'true') {
+            runTest();
+        }
+
+    })
+</script>

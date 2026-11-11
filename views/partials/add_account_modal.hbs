@@ -1,0 +1,34 @@
+{{#> ui/modal id="addAccount" title="Add an account"}}
+<form method="post" action="/admin/accounts/new">
+    <input type="hidden" name="crumb" value="{{crumb}}">
+    <div class="modal-body space-y-4">
+        {{> ui/form-field id="account-name" name="name" label="Full name" placeholder="e.g., John Smith"}}
+        {{> ui/form-field id="account-id" name="account" label="Account ID (optional)" placeholder="e.g., account_123" hint="Leave blank to generate an ID. Using an existing ID updates that account."}}
+
+        <p class="text-sm text-base-content/60">Next, connect the email account through the hosted authentication form. You can also <a
+                href="https://learn.emailengine.app/docs/accounts/hosted-authentication" target="_blank" rel="noopener noreferrer"
+                referrerpolicy="no-referrer" class="link link-animated">use this form in your own app</a>.
+        </p>
+    </div>
+    <div class="modal-footer">
+        {{> ui/btn label="Cancel" variant="neutral" style="soft" overlay="#addAccount"}}
+        {{> ui/btn label="Continue" type="submit" icon="icon-[tabler--arrow-right]"}}
+    </div>
+</form>
+{{/ui/modal}}
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+        let modalElm = document.getElementById('addAccount');
+
+        modalElm.addEventListener('open.overlay', () => {
+            document.getElementById('account-name').focus();
+            document.getElementById('account-name').select();
+        });
+
+        modalElm.addEventListener('close.overlay', () => {
+            document.getElementById('account-name').value = '';
+            document.getElementById('account-id').value = '';
+        });
+    });
+</script>

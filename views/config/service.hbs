@@ -1,0 +1,196 @@
+{{> ui/page-header title="General" icon="icon-[tabler--settings]" class="mb-1"}}
+
+<p class="mb-6">Configure core settings for your EmailEngine instance.</p>
+
+{{> ui/env-managed-alert}}
+
+<form method="post" action="/admin/config/service">
+    {{!-- no id: the layout already renders the #crumb element the script reads --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+
+    {{#> ui/card title="System Configuration" bodyClass="space-y-4"}}
+
+            <div>
+                {{> ui/setting-ref name="serviceUrl"}}
+                {{#> ui/form-field id="settingsServiceUrl" label="Service URL" error=errors.serviceUrl}}
+                <input type="url" class="input{{#if errors.serviceUrl}} is-invalid{{/if}}" id="settingsServiceUrl"
+                    name="serviceUrl" value="{{values.serviceUrl}}" data-lpignore="true" autocomplete="off" />
+                <span class="helper-text">URL used to reach this EmailEngine instance, including http:// or https:// and no path.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="enableApiProxy"}}
+                {{> ui/checkbox id="enableApiProxy" name="enableApiProxy" label="Behind Reverse Proxy"
+                checked=values.enableApiProxy error=errors.enableApiProxy}}
+                <span class="helper-text">Enable if using Nginx, Caddy, or similar. Uses
+                    <code>X-Forwarded-For</code> headers to identify client IPs.</span>
+            </div>
+
+
+            <div>
+                {{> ui/setting-ref name="timezone"}}
+                {{#> ui/form-field id="settingsServiceTimezone" label="Timezone" error=errors.timezone}}
+                <select id="settingsServiceTimezone" class="select max-w-md{{#if errors.timezone}} is-invalid{{/if}}"
+                    name="timezone">
+                    {{#unless values.timezone}}
+                    <option value="" selected>Not set</option>
+                    {{/unless}}
+                    {{#each timezones}}
+                    <option value="{{timezone}}" {{#if selected}}selected{{/if}}>{{name}}</option>
+                    {{/each}}
+                </select>
+                {{/ui/form-field}}
+            </div>
+
+    {{/ui/card}}
+
+    {{#> ui/card title="Language" id="language" bodyClass="space-y-4"}}
+            <div>
+                {{> ui/setting-ref name="locale"}}
+                {{#> ui/form-field id="settingsServiceLocale" label="Default Language" error=errors.locale}}
+                <select id="settingsServiceLocale" class="select max-w-md{{#if errors.locale}} is-invalid{{/if}}"
+                    name="locale">
+                    {{#each locales}}
+                    <option value="{{locale}}" {{#if selected}}selected{{/if}}>{{name}} ({{locale}})</option>
+                    {{/each}}
+                </select>
+                <span class="helper-text">
+                    Default language for public pages and translated API messages. The admin interface is in English.
+                </span>
+                {{/ui/form-field}}
+
+                <details id="languageDetails" class="group mt-2">
+                    <summary
+                        class="cursor-pointer text-sm text-base-content/60 list-none [&::-webkit-details-marker]:hidden inline-flex items-center gap-1">
+                        <span class="link link-animated">How to override</span>
+                        <span
+                            class="icon-[tabler--chevron-down] size-3.5 transition-transform duration-200 group-open:rotate-180"></span>
+                    </summary>
+                    <div class="alert alert-soft alert-info mt-2 block">
+                        <h6 class="font-bold mb-2">Override Language Settings</h6>
+                        <p class="mb-2">Set language per request (highest to lowest priority):</p>
+                        <ol class="list-decimal ps-6 mb-4 space-y-1">
+                            <li><strong>URL parameter:</strong> <code>?locale=xx</code></li>
+                            <li><strong>Custom header:</strong> <code>X-EE-Locale: xx</code> (API only)</li>
+                            <li><strong>Browser preference:</strong> <code>Accept-Language</code> header</li>
+                            <li><strong>Default:</strong> Language selected above</li>
+                        </ol>
+
+                        <strong>Examples:</strong>
+                        <ul class="list-disc ps-6 mb-0 space-y-1">
+                            <li>Web: <code>/accounts/new?locale=et</code></li>
+                            <li>API: <code>GET /v1/accounts?locale=nl</code></li>
+                            <li>Header: <code>X-EE-Locale: de</code></li>
+                        </ul>
+                    </div>
+                </details>
+            </div>
+
+            <p class="mb-0">
+                <a href="https://github.com/postalsys/emailengine/blob/master/translations/README.md" target="_blank"
+                    rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">
+                    <span class="icon-[tabler--external-link] size-4 align-text-bottom"></span> Help us translate
+                    EmailEngine
+                </a>
+            </p>
+
+    {{/ui/card}}
+
+    <div id="queue_settings" class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header flex flex-wrap items-center justify-between gap-3">
+            <h6 class="card-title text-primary">Queue Management</h6>
+            {{> ui/btn label="Clear completed jobs" variant="neutral" style="soft" size="sm" id="clean-queues-btn"
+            icon="icon-[tabler--trash] clean-icon"}}
+        </div>
+
+        <div class="card-body">
+            <div>
+                {{> ui/setting-ref name="queueKeep"}}
+                {{#> ui/form-field id="settingsQueueKeep" label="Completed job history limit" error=errors.queueKeep}}
+                <input type="number" min="0" class="input{{#if errors.queueKeep}} is-invalid{{/if}}"
+                    id="settingsQueueKeep" name="queueKeep" value="{{values.queueKeep}}" data-lpignore="true"
+                    autocomplete="off" />
+                <span class="helper-text">Maximum completed jobs to retain per queue for up to 24 hours. Set to 0 to remove completed jobs.
+                    Failed jobs are retained separately, even when this is 0; this value also raises their count limit
+                    if it exceeds the configured failed-job limit. Review retained jobs on the <a href="/admin/queues" class="link link-animated">Queues</a> page.</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div class="grid gap-4 sm:grid-cols-2 mt-4">
+                <div>
+                    {{> ui/setting-ref name="queueKeepFailed"}}
+                    {{#> ui/form-field id="settingsQueueKeepFailed" label="Failed job limit" error=errors.queueKeepFailed}}
+                    <input type="number" min="1" class="input{{#if errors.queueKeepFailed}} is-invalid{{/if}}"
+                        id="settingsQueueKeepFailed" name="queueKeepFailed" value="{{values.queueKeepFailed}}" data-lpignore="true"
+                        autocomplete="off" />
+                    <span class="helper-text">Failed jobs retained per queue, at least. A failed job is the only record that a
+                        delivery was given up on.</span>
+                    {{/ui/form-field}}
+                </div>
+
+                <div>
+                    {{> ui/setting-ref name="queueKeepFailedAge"}}
+                    {{#> ui/form-field id="settingsQueueKeepFailedAge" label="Failed job retention (days)" error=errors.queueKeepFailedAge}}
+                    <input type="number" min="0.01" step="any" class="input{{#if errors.queueKeepFailedAge}} is-invalid{{/if}}"
+                        id="settingsQueueKeepFailedAge" name="queueKeepFailedAge" value="{{values.queueKeepFailedAge}}" data-lpignore="true"
+                        autocomplete="off" />
+                    <span class="helper-text">How long failed jobs are kept.</span>
+                    {{/ui/form-field}}
+                </div>
+
+                <div>
+                    {{> ui/setting-ref name="queueKeepFailedContent"}}
+                    {{#> ui/form-field id="settingsQueueKeepFailedContent" label="Retryable failed messages" error=errors.queueKeepFailedContent}}
+                    <input type="number" min="0" class="input{{#if errors.queueKeepFailedContent}} is-invalid{{/if}}"
+                        id="settingsQueueKeepFailedContent" name="queueKeepFailedContent" value="{{values.queueKeepFailedContent}}" data-lpignore="true"
+                        autocomplete="off" />
+                    <span class="helper-text">How many of the most recent failed messages keep their content so they can be
+                        retried. 0 keeps none.</span>
+                    {{/ui/form-field}}
+                </div>
+
+                <div>
+                    {{> ui/setting-ref name="queueKeepFailedContentSize"}}
+                    {{#> ui/form-field id="settingsQueueKeepFailedContentSize" label="Retryable message content (MB)" error=errors.queueKeepFailedContentSize}}
+                    <input type="number" min="0" step="any" class="input{{#if errors.queueKeepFailedContentSize}} is-invalid{{/if}}"
+                        id="settingsQueueKeepFailedContentSize" name="queueKeepFailedContentSize" value="{{values.queueKeepFailedContentSize}}" data-lpignore="true"
+                        autocomplete="off" />
+                    <span class="helper-text">Total size of the kept content. 0 keeps none.</span>
+                    {{/ui/form-field}}
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--settings]"}}
+    </div>
+
+</form>
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+
+        const sendCleanPayload = async () => {
+
+            const data = await uiPostJson('/admin/config/service/clean');
+
+            return data;
+        }
+
+        const cleanQueuesBtn = document.getElementById('clean-queues-btn');
+        cleanQueuesBtn.addEventListener('click', e => {
+            e.preventDefault();
+            uiButtonBusy(cleanQueuesBtn, true);
+
+            sendCleanPayload().then(data => {
+                showToast(data.error ? data.error : (data.success ? 'Cleanup request sent' : 'Could not request queue cleanup. Try again.'), data.success ? 'check-circle' : 'alert-triangle');
+            }).catch(err => {
+                showToast('Request failed\n' + err.message, 'alert-triangle');
+            }).finally(() => uiButtonBusy(cleanQueuesBtn, false));
+        });
+
+    });
+</script>

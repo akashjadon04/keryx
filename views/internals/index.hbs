@@ -1,0 +1,198 @@
+{{> ui/page-header title="Workers" icon="icon-[tabler--cpu]" subtitle="Live status of the worker threads EmailEngine uses to sync accounts, deliver mail, and serve the API." badgeLabel=threadCount badgeVariant="neutral" class="mb-6"}}
+
+{{#if apiWorkerWarning}}
+<div class="alert alert-soft alert-warning mb-6 block" role="alert">
+    <span class="icon-[tabler--alert-triangle] size-4 align-text-bottom"></span>
+    <strong>Multiple API workers are not active.</strong>
+    {{#equals apiWorkerWarning.reason "port"}}
+    <code>EENGINE_WORKERS_API</code> is set to {{apiWorkerWarning.requested}}, but EmailEngine could not verify
+    <code>SO_REUSEPORT</code> support because the API port was unavailable while probing at startup, so only a single
+    API worker was started. This is usually a transient conflict and may clear on the next restart.
+    {{else}}
+    <code>EENGINE_WORKERS_API</code> is set to {{apiWorkerWarning.requested}}, but this platform does not support
+    <code>SO_REUSEPORT</code> (requires Linux with Node.js 23.1 or newer), so only a single API worker was started.
+    {{/equals}}
+</div>
+{{/if}}
+
+{{#each groups}}
+<div class="card bg-base-100 shadow-md mb-6">
+
+    {{!-- Pool header: worst-member health dot + kind name and purpose on the left;
+          running/expected count and the configured env var (shown once per pool) on
+          the right. --}}
+    <div class="card-header flex flex-wrap items-start justify-between gap-3">
+        <div class="flex items-start gap-2">
+            {{#> ui/tooltip text=healthLabel class="mt-1.5"}}
+            <span class="size-2.5 rounded-full bg-{{healthVariant}} shrink-0"></span>
+            {{/ui/tooltip}}
+            <div>
+                <h6 class="card-title text-primary mb-0">{{description}}</h6>
+                {{#if purpose}}
+                <p class="text-base-content/60 text-sm mt-1 mb-0 max-w-2xl">{{purpose}}</p>
+                {{/if}}
+            </div>
+        </div>
+        {{!-- wraps: the count badge and a 26-character env var name together outrun a phone-width
+              card, and the nowrap on the name is there so it never breaks mid-identifier --}}
+        <div class="flex flex-wrap items-center justify-end gap-3">
+            {{#if hasExpected}}
+            {{#> ui/tooltip text="Worker threads running vs. the number configured to run"}}
+            {{> ui/badge label=countLabel variant=countVariant}}
+            {{/ui/tooltip}}
+            {{else}}
+            {{> ui/badge label=countLabel variant="neutral"}}
+            {{/if}}
+            {{#if configRef}}
+            <span class="text-base-content/60 text-sm whitespace-nowrap"><code>{{configRef}}</code></span>
+            {{/if}}
+        </div>
+    </div>
+
+    <div class="overflow-x-auto">
+        <table class="table ee-table-stack">
+
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>ID</th>
+                    <th>Uptime</th>
+                    <th class="text-end">Memory</th>
+                    <th class="text-end" title="Longest event loop delay over the last 15 seconds">Event loop</th>
+                    {{#if showAccounts}}
+                    <th class="text-end">Accounts</th>
+                    {{/if}}
+                    <th><span class="sr-only">Actions</span></th>
+                </tr>
+            </thead>
+
+            <tbody>
+                {{#each threads}}
+                <tr{{#if isUnresponsive}} class="bg-error/10"{{/if}}>
+                    <td>
+                        <span class="inline-flex items-center gap-2">
+                            <span class="size-2.5 rounded-full bg-{{statusVariant}} shrink-0"></span>
+                            <span>{{statusLabel}}</span>
+                            {{#if errorMessage}}
+                            {{#> ui/tooltip-rich icon="icon-[tabler--alert-triangle] text-error"}}
+                            <strong>Error</strong><br>
+                            {{errorMessage}}
+                            {{/ui/tooltip-rich}}
+                            {{/if}}
+                            {{#if recentlyRestarted}}
+                            {{#> ui/tooltip-rich icon="icon-[tabler--refresh] text-warning"}}
+                            <strong>Recently restarted</strong><br>
+                            This worker came online noticeably later than the main process, so it started
+                            after the initial boot rather than with the rest of the fleet. See the Uptime
+                            column for when it last started.
+                            {{/ui/tooltip-rich}}
+                            {{/if}}
+                        </span>
+                    </td>
+                    <td data-label="ID"><span class="text-base-content/60 font-mono text-sm">#{{formatInteger threadId userLocale}}</span></td>
+                    <td data-label="Uptime">
+                        <span class="relative-time" data-time="{{timeStr}}"></span>
+                    </td>
+                    <td class="text-end" data-label="Memory">
+                        {{#if isUnresponsive}}
+                        <span class="text-base-content/40">-</span>
+                        {{else}}
+                        {{heapUsed}}
+                        {{/if}}
+                    </td>
+                    <td class="text-end" data-label="Event loop">
+                        {{#if eventLoopDelayMax includeZero=true}}
+                        {{formatInteger eventLoopDelayMax userLocale}} ms
+                        {{else}}
+                        <span class="text-base-content/40">-</span>
+                        {{/if}}
+                    </td>
+                    {{#if ../showAccounts}}
+                    <td class="text-end" data-label="Accounts">
+                        {{#if accounts}}
+                        <a href="/admin/internals/thread/{{threadId}}"
+                            class="link link-animated">{{formatInteger accounts userLocale}}</a>
+                        {{else}}
+                        {{formatInteger accounts userLocale}}
+                        {{/if}}
+                    </td>
+                    {{/if}}
+                    <td class="ee-stack-actions relative text-end">
+                        {{#> ui/row-actions label="Worker actions"}}
+                        <li>
+                            <button type="button" class="dropdown-item snapshot-thread-btn" data-thread="{{threadId}}">
+                                Download memory snapshot
+                            </button>
+                        </li>
+                        {{#unless isMain}}
+                        <li>
+                            <button type="button" class="dropdown-item text-error kill-thread-btn" data-thread="{{threadId}}">
+                                Restart worker
+                            </button>
+                        </li>
+                        {{/unless}}
+                        {{/ui/row-actions}}
+                    </td>
+                </tr>
+                {{/each}}
+            </tbody>
+
+        </table>
+    </div>
+
+</div>
+{{/each}}
+
+{{#> ui/details summary="About workers" class="card bg-base-100 shadow-md mb-6"}}
+<div>
+    <p class="mb-4">EmailEngine spreads its work across worker threads - account sync, the API and web server, webhook
+        delivery, message submission, and exports. Their counts are set at startup with environment variables such as
+        <code>EENGINE_WORKERS</code> (account sync), <code>EENGINE_WORKERS_API</code>, <code>EENGINE_WORKERS_WEBHOOKS</code>,
+        <code>EENGINE_WORKERS_SUBMIT</code> and <code>EENGINE_WORKERS_EXPORT</code>.</p>
+    <p class="mb-4">Most worker types can be scaled to several threads with those variables. The HTTP and API server is
+        the exception: running more than one API worker requires <code>SO_REUSEPORT</code>, which is available only on
+        Linux with Node.js 23.1 or newer. On macOS, Windows, or older Node.js versions EmailEngine falls back to a
+        single API worker even when <code>EENGINE_WORKERS_API</code> is higher, so its count may read lower than
+        configured.</p>
+    <p class="mb-4">Use the row actions to restart an individual thread or download a memory snapshot for debugging; a
+        row highlighted in red is unresponsive.</p>
+    <p class="mb-0"><a href="https://learn.emailengine.app/docs/advanced/performance-tuning" target="_blank"
+            rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">Learn more about scaling
+            workers</a>.</p>
+</div>
+{{/ui/details}}
+
+{{#> ui/confirm-modal id="killThread" title="Restart worker" action="/admin/internals/kill"
+fieldName="thread" fieldId="kill-thread" submitLabel="Restart worker"}}
+Restart this worker? Its current operations will be interrupted.
+{{/ui/confirm-modal}}
+
+{{#> ui/confirm-modal id="snapshotThread" title="Memory Snapshot" action="/admin/internals/snapshot"
+formId="snapshot-form" formTarget="_blank" fieldName="thread" fieldId="snapshot-thread"
+submitLabel="Download Snapshot" submitVariant="info"}}
+Generate a memory snapshot for debugging? This may briefly affect the worker's performance.
+{{/ui/confirm-modal}}
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+        for (let elm of document.querySelectorAll('.kill-thread-btn')) {
+            elm.addEventListener('click', e => {
+                e.preventDefault();
+                document.getElementById('kill-thread').value = elm.dataset.thread;
+                uiModal.open('#killThread');
+            });
+        }
+
+        for (let elm of document.querySelectorAll('.snapshot-thread-btn')) {
+            elm.addEventListener('click', e => {
+                e.preventDefault();
+                document.getElementById('snapshot-thread').value = elm.dataset.thread;
+                uiModal.open('#snapshotThread');
+            });
+        }
+
+        document.getElementById('snapshot-form').addEventListener('submit', () => {
+            uiModal.close('#snapshotThread');
+        });
+    });
+</script>

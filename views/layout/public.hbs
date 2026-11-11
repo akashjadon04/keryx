@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="description" content="EmailEngine Application page; The Ultimate Email API for Developers" />
+    <meta name="author" content="Postal Systems OÜ">
+
+    <title>{{#if pageTitleFull}}{{pageTitleFull}}{{else}}{{pageBrandName}}{{#if pageTitle}} -
+        {{pageTitle}}{{/if}}{{/if}}</title>
+
+    <link rel="apple-touch-icon" href="/static/favicon/apple-touch-icon.png" sizes="180x180" />
+    <link rel="icon" href="/static/favicon/favicon-32x32.png" sizes="32x32" type="image/png" />
+    <link rel="icon" href="/static/favicon/favicon-16x16.png" sizes="16x16" type="image/png" />
+    <link rel="manifest" href="/static/favicon/manifest.json" />
+    <link rel="icon" href="/favicon.ico" />
+
+    {{> public_theme_init}}
+
+    <link href="/static/fonts/pt-sans-font.css" rel="stylesheet">
+
+    {{!-- Public pages use a standalone, framework-free stylesheet so operators
+    can restyle them through the head/header injection blocks below - see the
+    override notes at the top of static/css/public.css --}}
+    <link href="/static/css/public.css" rel="stylesheet">
+
+    {{#if httpRedirectUrl}}
+    <meta http-equiv="refresh" content="0;URL='{{httpRedirectUrl}}'" />
+    {{/if}}
+
+    {{#if embeddedTemplateHtmlHead}}
+    {{{embeddedTemplateHtmlHead}}}
+    {{/if}}
+
+</head>
+
+<body class="ee-page">
+
+    <main class="ee-card">
+
+        {{> public_alerts}}
+
+        <div class="ee-card-body">
+
+            {{#if embeddedTemplateHeader}}
+            <div class="ee-custom-header">
+                {{{embeddedTemplateHeader}}}
+            </div>
+            {{/if}}
+
+            {{{content}}}
+        </div>
+
+    </main>
+
+    <script data-cfasync="false" src="/static/js/public.js"></script>
+
+</body>
+
+</html>

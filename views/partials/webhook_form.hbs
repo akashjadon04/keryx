@@ -1,0 +1,83 @@
+<input type="hidden" id="fn-content-element" name="contentFnJson" value="{{values.contentFnJson}}">
+<input type="hidden" id="map-content-element" name="contentMapJson" value="{{values.contentMapJson}}">
+
+{{#> ui/card bodyClass="space-y-4"}}
+
+        {{> ui/form-field id="inputName" name="name" label="Name" value=values.name error=errors.name required=true hint="Name shown in the webhook route list."}}
+
+        {{> ui/form-field id="inputDescription" name="description" label="Description" value=values.description error=errors.description hint="Describe which events this route handles and where it sends them."}}
+
+        {{> ui/form-field id="inputTargetUrl" name="targetUrl" type="url" label="Target URL" value=values.targetUrl error=errors.targetUrl placeholder='URL like "https://myservice.com/imap/webhooks"' hint="Destination for matching events. Leave blank to use the default URL in Webhooks settings."}}
+
+        {{> ui/checkbox id="enabled" label="Enable this webhook route" checked=values.enabled error=errors.enabled hint="Send matching events to this route's target URL. New routes are disabled until you enable them."}}
+
+        {{#> ui/details summary="Custom request headers" class="card border border-base-content/10" summaryClass="px-4 py-2" open=values.customHeaders}}
+        <div>
+            <p class="mb-4">Add headers to each request sent by this route, such as an Authorization header.
+            </p>
+
+            {{#> ui/form-field id="customHeaders" label="Custom headers" error=errors.customHeaders hint="Enter one header per line in Header-Name: value format."}}
+            <textarea class="textarea font-mono w-full{{#if errors.customHeaders}} is-invalid{{/if}}" id="customHeaders"
+                name="customHeaders" rows="5" spellcheck="false" data-enable-grammarly="false"
+                placeholder="Custom headers like &quot;Authorization: Bearer secret_token&quot;&mldr;">{{values.customHeaders}}</textarea>
+            {{/ui/form-field}}
+
+        </div>
+        {{/ui/details}}
+
+        <div>
+            <div class="text-base-content/60 float-right code-link">[<a
+                    href="https://learn.emailengine.app/docs/webhooks/pre-processing" target="_blank" rel="noopener noreferrer"
+                    referrerpolicy="no-referrer" class="link link-animated">documentation</a>]</div>
+            <label class="label-text" for="editor-fn">Filter function</label>
+            <div class="mb-2 leading-tight">
+                <small>Return <code>true</code> to send the event, or <code>false</code> to skip it.
+                    A route without a filter sends no events. Access the event data through <code>payload</code>. Use <code>env</code> to access <a href="/admin/config/webhooks#scriptEnv"
+                        class="link link-animated">script variables</a>.</small>
+            </div>
+            {{#> ui/code-editor id="editor-fn" title="Filter function"}}
+            <div class="editor-embed-content editor-embed-content-left editor-embed-content-right">
+                <a href="#" id="test-payload-btn">Set test payload</a>
+            </div>
+            <div class="editor-embed-content editor-embed-content-left editor-embed-content-right">
+                Evaluation result:
+                <span id="filter-res" class="text-info">no match</span>
+            </div>
+            <div class="editor-embed-content editor-embed-content-right">
+                {{> editor_scope_info}}
+            </div>
+            
+            {{/ui/code-editor}}
+
+        </div>
+
+        <div>
+            <label class="label-text" for="editor-map">Map function</label>
+            <div class="mb-2 leading-tight">
+                <small>Transform the event data into the format your destination expects. Return the object to send as the webhook
+                    payload. Use <code>env</code> to access <a href="/admin/config/webhooks#scriptEnv"
+                        class="link link-animated">script variables</a>.</small>
+            </div>
+
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-12">
+                <div class="sm:col-span-7">
+                    {{#> ui/code-editor id="editor-map" title="Mapping function"}}
+                    <div class="editor-embed-content editor-embed-content-right">
+                        {{> editor_scope_info}}
+                    </div>
+                    
+                    {{/ui/code-editor}}
+                </div>
+                <div class="sm:col-span-5">
+                    {{#> ui/code-editor id="editor-map-preview" title="Mapping preview"}}
+                    <div class="editor-embed-content editor-embed-content-right">
+                        <a href="#" id="test-send-btn">Send webhook preview</a>
+                    </div>
+                    
+                    {{/ui/code-editor}}
+                </div>
+            </div>
+        </div>
+
+    
+{{/ui/card}}

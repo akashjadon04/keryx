@@ -1,0 +1,1161 @@
+'use strict';
+const { parentPort } = require('worker_threads');
+
+const packageData = require('../package.json');
+const config = require('@zone-eu/wild-config');
+const logger = require('../lib/logger');
+
+const { REDIS_PREFIX } = require('../lib/consts');
+const { assignRelayStatus } = require('../lib/email-client/imap/connection-errors');
+
+const { getDuration, getBoolean, emitChangeEvent, readEnvValue, hasEnvValue, threadStats } = require('../lib/tools');
+
+const { initSentry } = require('../lib/sentry');
+initSentry('imap');
+
+const { IMAPClient } = require('../lib/email-client/imap-client');
+const { GmailClient } = require('../lib/email-client/gmail-client');
+const { OutlookClient } = require('../lib/email-client/outlook-client');
+const { BaseClient } = require('../lib/email-client/base-client');
+const { Account } = require('../lib/account');
+const { oauth2Apps, isApiBasedApp } = require('../lib/oauth2-apps');
+const { redis, notifyQueue, submitQueue, watchRedisReconnect } = require('../lib/db');
+const { sendToMessagePort, MessagePortWritable } = require('../lib/message-port-stream');
+const { describeRpcCommand } = require('../lib/worker-rpc-error');
+const { createRpcClient, respond, isCall } = require('../lib/worker-rpc');
+const settings = require('../lib/settings');
+const msgpack = require('../lib/msgpack');
+
+const getSecret = require('../lib/get-secret');
+const { getSharedLock } = require('../lib/lock-run');
+const { sendQueuedOnce } = require('../lib/submit-lock');
+
+config.service = config.service || {};
+
+config.log = config.log || {
+    raw: false
+};
+
+const EENGINE_LOG_RAW = hasEnvValue('EENGINE_LOG_RAW') ? getBoolean(readEnvValue('EENGINE_LOG_RAW')) : getBoolean(config.log.raw);
+const DEFAULT_EENGINE_TIMEOUT = 10 * 1000;
+const EENGINE_TIMEOUT = getDuration(readEnvValue('EENGINE_TIMEOUT') || config.service.commandTimeout) || DEFAULT_EENGINE_TIMEOUT;
+
+const DEFAULT_STATES = {
+    init: 0,
+    connected: 0,
+    connecting: 0,
+    authenticationError: 0,
+    connectError: 0,
+    unset: 0,
+    disconnected: 0
+};
+
+// Minimum interval between reports about failed account log writes, see getAccountLogger()
+const LOG_FAILURE_REPORT_INTERVAL = 60 * 1000;
+
+const NO_ACTIVE_HANDLER_RESP_ERR = new Error('No active handler for requested account. Try again later.');
+NO_ACTIVE_HANDLER_RESP_ERR.statusCode = 503;
+NO_ACTIVE_HANDLER_RESP_ERR.code = 'WorkerNotAvailable';
+
+class ConnectionHandler {
+    constructor() {
+        this.rpc = createRpcClient({ port: parentPort, defaultTimeout: EENGINE_TIMEOUT, timeoutTag: 'T3' });
+
+        this.accounts = new Map();
+
+        // account -> token of the latest assign. An unassign or a newer assign replaces or drops it,
+        // which is how an assign still awaiting its setup learns it has been superseded. The one
+        // supersession check there is: the identity of the this.accounts entry cannot serve, because
+        // nothing is registered there until the Account object exists, so an unassign that lands
+        // during the loads before that leaves nothing to compare against. Entry identity is only
+        // consulted to decide whether a cleanup or an init retry still concerns the entry this
+        // assign registered.
+        this.assignTokens = new Map();
+    }
+
+    async init() {
+        // Redis reconnected after being disconnected during our lifetime. In-memory account state
+        // may no longer match Redis (a restart or a flush), so exit cleanly: the main thread
+        // treats exit code 0 as this case, respawns the worker and reassigns its accounts.
+        watchRedisReconnect(
+            redis,
+            () => {
+                logger.info({ msg: 'Redis reconnected after disconnection, exiting worker for clean restart', worker: 'imap' });
+                process.exit(0);
+            },
+            () => logger.warn({ msg: 'Redis connection lost', worker: 'imap' })
+        );
+
+        // indicate that we are ready to process connections
+        parentPort.postMessage({ cmd: 'ready' });
+
+        // Start sending heartbeats to main thread
+        this.startHeartbeat();
+    }
+
+    startHeartbeat() {
+        // Send heartbeat every 10 seconds
+        setInterval(() => {
+            try {
+                parentPort.postMessage({ cmd: 'heartbeat' });
+            } catch (err) {
+                // Ignore errors, parent might be shutting down
+            }
+        }, 10 * 1000).unref();
+    }
+
+    getLogKey(account) {
+        // this format ensures that the key is deleted when user is removed
+        return `${REDIS_PREFIX}iam:${account}:g`;
+    }
+
+    async getAccountLogger(account) {
+        let logKey = this.getLogKey(account);
+        let logging = await settings.getLoggingInfo(account);
+
+        // log() runs once per protocol line, so a persistent write failure (Redis OOM, MISCONF,
+        // READONLY) would report itself on every single line. Report the first failure, then at
+        // most one summary per interval, otherwise a failing account log floods the main log.
+        let lastFailureReport = 0;
+        let suppressedFailures = 0;
+        let reportFailure = (msg, err) => {
+            let now = Date.now();
+            if (now - lastFailureReport < LOG_FAILURE_REPORT_INTERVAL) {
+                suppressedFailures++;
+                return;
+            }
+
+            // ioredis attaches the failed command to the error, and the arguments of these
+            // writes include the encoded log entry itself (protocol traces, and even raw
+            // credentials when EENGINE_LOG_RAW is set), so such errors are summarized instead
+            // of being handed to the log serializer, which copies all enumerable properties
+            let reported = err && (err.command || err.previousErrors) ? { name: err.name, code: err.code, message: err.message } : err;
+
+            let payload = { msg, account, err: reported };
+            if (suppressedFailures) {
+                payload.suppressed = suppressedFailures;
+            }
+            logger.error(payload);
+
+            lastFailureReport = now;
+            suppressedFailures = 0;
+        };
+
+        // Members are referenced by name instead of through `this` as this object is passed
+        // around to client classes that might call log() detached from its receiver
+        let accountLogger = {
+            enabled: logging.enabled,
+            maxLogLines: logging.maxLogLines,
+
+            log(entry) {
+                if (!accountLogger.maxLogLines || !accountLogger.enabled) {
+                    return;
+                }
+
+                if (entry.err && entry.err.cert) {
+                    delete entry.err.cert;
+                }
+
+                let logRow;
+                try {
+                    logRow = msgpack.encode(entry);
+                    redis
+                        .multi()
+                        .rpush(logKey, logRow)
+                        .ltrim(logKey, -accountLogger.maxLogLines, -1)
+                        .exec()
+                        .catch(err => reportFailure('Failed to update log entries', err));
+                } catch (err) {
+                    reportFailure('Failed to encode log entry', err);
+                }
+            },
+
+            async reload() {
+                let updated = await settings.getLoggingInfo(account);
+                accountLogger.enabled = updated.enabled;
+                accountLogger.maxLogLines = updated.maxLogLines;
+            }
+        };
+
+        return accountLogger;
+    }
+
+    /**
+     * Closes an account connection this worker no longer tracks. Nothing is deleted, the account
+     * is only moving to another worker or being assigned here again
+     * @param {string} account - Account ID
+     * @param {Object} accountObject - The entry that was removed from this.accounts
+     */
+    async closeReleasedConnection(account, accountObject) {
+        if (!accountObject || !accountObject.connection) {
+            return;
+        }
+        try {
+            await accountObject.connection.close();
+        } catch (err) {
+            logger.error({ msg: 'Failed to close released account connection', account, err });
+        }
+    }
+
+    // The main thread takes an account back after an `assign` it gave up waiting for, or to move
+    // it onto another worker. An assignment still being set up notices the missing entry and stops.
+    async unassignConnection(account) {
+        logger.info({ msg: 'Account unassign requested', account });
+        this.assignTokens.delete(account);
+        let accountObject = this.accounts.get(account);
+        this.accounts.delete(account);
+        await this.closeReleasedConnection(account, accountObject);
+        return true;
+    }
+
+    async assignConnection(account, runIndex, initOpts) {
+        logger.debug({ msg: 'Assigned account to worker', account });
+
+        if (!this.runIndex) {
+            this.runIndex = runIndex;
+        }
+
+        if (!runIndex && this.runIndex) {
+            runIndex = this.runIndex;
+        }
+
+        const token = Symbol(account);
+        this.assignTokens.set(account, token);
+        const isCurrent = () => this.assignTokens.get(account) === token;
+
+        let accountLogger = await this.getAccountLogger(account);
+        let secret = await getSecret();
+        let accountObject = new Account({
+            redis,
+            account,
+            secret,
+            // Needed so Account.update() can dispatch reconnect/update commands back to
+            // this worker (e.g. auto-reconnect after OAuth re-auth in an error state).
+            call: msg => this.call(msg)
+        });
+
+        if (!isCurrent()) {
+            logger.info({ msg: 'Dropped superseded account assignment', account });
+            return false;
+        }
+
+        // Assigning an account this worker already runs replaces the connection. A retried assign
+        // (the main thread timed out on the first one) used to overwrite the map entry and leave the
+        // first connection running with nothing able to reach it. Swapped without an await in
+        // between, so two overlapping assigns cannot both keep a connection.
+        let previous = this.accounts.get(account);
+        this.accounts.set(account, accountObject);
+        await this.closeReleasedConnection(account, previous);
+
+        let current;
+        try {
+            current = await this.setupConnection(account, accountObject, { runIndex, accountLogger, secret, isCurrent });
+        } catch (err) {
+            // Leave no connection-less entry behind: it answered commands with "no active handler"
+            // and counted as a disconnected account for as long as the worker lived. Only the entry
+            // this assign registered is its to remove, a newer assign may have replaced it
+            if (this.accounts.get(account) === accountObject) {
+                this.accounts.delete(account);
+            }
+            if (isCurrent()) {
+                this.assignTokens.delete(account);
+            }
+            if (err.isBoom && !err.statusCode && err.output) {
+                // Lets the main thread tell an account that is gone (404) from a transient failure
+                err.statusCode = err.output.statusCode;
+            }
+            throw err;
+        }
+
+        if (!current) {
+            // Unassigned or assigned again while this was being set up; the client was never
+            // started, so there is nothing to close
+            if (this.accounts.get(account) === accountObject) {
+                this.accounts.delete(account);
+            }
+            logger.info({ msg: 'Dropped superseded account assignment', account });
+            return false;
+        }
+
+        // do not wait before returning as it may take forever
+        this.startConnection(account, accountObject, initOpts);
+    }
+
+    /**
+     * Loads the account and builds its client, without starting it
+     * @param {string} account - Account ID
+     * @param {Object} accountObject - The entry assignConnection() registered
+     * @param {Object} opts - runIndex, accountLogger, secret and isCurrent, the assign's own
+     *   supersession check (see the assignTokens comment in the constructor)
+     * @returns {Promise<boolean>} false when the assign was superseded in the meantime
+     */
+    async setupConnection(account, accountObject, { runIndex, accountLogger, secret, isCurrent }) {
+        const accountData = await accountObject.loadAccountData();
+
+        if (accountData.oauth2 && accountData.oauth2.auth) {
+            let oauth2App;
+
+            if (accountData?.oauth2?.auth?.delegatedUser && accountData?.oauth2?.auth?.delegatedAccount) {
+                let baseClient = new BaseClient(account, {
+                    runIndex,
+                    accountObject,
+                    redis,
+                    accountLogger,
+                    secret
+                });
+                let delegatedAccountData = await baseClient.getDelegatedAccount(accountData);
+                oauth2App = await oauth2Apps.get(delegatedAccountData.oauth2.provider);
+            } else {
+                oauth2App = await oauth2Apps.get(accountData.oauth2.provider);
+            }
+
+            if (isApiBasedApp(oauth2App)) {
+                // Use API instead of IMAP
+
+                switch (oauth2App.provider) {
+                    case 'gmail':
+                        accountObject.connection = new GmailClient(account, {
+                            runIndex,
+                            accountObject,
+                            redis,
+                            accountLogger,
+                            secret,
+
+                            notifyQueue,
+                            submitQueue,
+
+                            call: msg => this.call(msg)
+                        });
+                        accountData.state = 'connecting';
+                        accountObject.logger = accountObject.connection.logger;
+                        break;
+
+                    case 'outlookService':
+                    case 'outlook':
+                        accountObject.connection = new OutlookClient(account, {
+                            runIndex,
+                            accountObject,
+                            redis,
+                            accountLogger,
+                            secret,
+
+                            notifyQueue,
+                            submitQueue,
+
+                            call: msg => this.call(msg)
+                        });
+                        accountData.state = 'connecting';
+                        accountObject.logger = accountObject.connection.logger;
+                        break;
+
+                    default:
+                        throw new Error('Unsupported OAuth2 API');
+                }
+            }
+        }
+
+        if (!accountObject.connection) {
+            accountObject.connection = new IMAPClient(account, {
+                runIndex,
+
+                accountObject,
+                redis,
+                accountLogger,
+                secret,
+
+                notifyQueue,
+                submitQueue,
+
+                call: msg => this.call(msg),
+                logRaw: EENGINE_LOG_RAW
+            });
+            accountObject.logger = accountObject.connection.logger;
+        }
+
+        if (!isCurrent()) {
+            return false;
+        }
+
+        if (accountData.state) {
+            await redis.hSetExists(accountObject.connection.getAccountKey(), 'state', accountData.state);
+            await emitChangeEvent(logger, account, 'state', accountData.state);
+        }
+
+        return isCurrent();
+    }
+
+    /**
+     * Runs init() without waiting for it. A client that retries its own init() (the API
+     * clients, see BaseClient.scheduleInitRetry()) gets another attempt when it fails on
+     * something other than a refused credential; a client that was replaced in the meantime
+     * is left alone when the timer fires
+     * @param {string} account - Account ID
+     * @param {Object} accountObject - Account instance holding the connection
+     * @param {Object} initOpts - Options passed to init()
+     */
+    startConnection(account, accountObject, initOpts) {
+        const connection = accountObject.connection;
+
+        connection
+            .init(initOpts)
+            .then(() => connection.resetInitRetry())
+            .catch(err => {
+                logger.error({ msg: 'Failed to initialize account connection', account, err });
+
+                if (!connection.retriesInit || err.authenticationFailed) {
+                    return;
+                }
+
+                connection.scheduleInitRetry(() => {
+                    if (this.accounts.get(account) !== accountObject) {
+                        return;
+                    }
+                    this.startConnection(account, accountObject, initOpts);
+                });
+            });
+    }
+
+    async deleteConnection(account) {
+        logger.info({ msg: 'Deleting connection', account });
+        this.assignTokens.delete(account);
+        if (this.accounts.has(account)) {
+            let accountObject = this.accounts.get(account);
+            try {
+                if (accountObject.connection) {
+                    await accountObject.connection.delete();
+                }
+            } finally {
+                // The account record is already gone and nothing retries the delete, so an entry
+                // left behind by a failed teardown would stay registered for the worker's lifetime
+                if (this.accounts.get(account) === accountObject) {
+                    this.accounts.delete(account);
+                }
+            }
+        }
+    }
+
+    /**
+     * Removes what the provider keeps for the account, ahead of its deletion, see
+     * BaseClient.releaseRemoteResources()
+     */
+    async teardownConnection(account) {
+        const accountObject = this.accounts.get(account);
+        if (!accountObject?.connection) {
+            return false;
+        }
+        return await accountObject.connection.releaseRemoteResources();
+    }
+
+    async updateConnection(account) {
+        logger.info({ msg: 'Account update requested', account });
+        if (this.accounts.has(account)) {
+            let accountObject = this.accounts.get(account);
+            if (accountObject.connection) {
+                accountObject.connection.accountLogger.log({
+                    level: 'info',
+                    t: Date.now(),
+                    cid: accountObject.connection.cid,
+                    msg: 'Account update requested'
+                });
+
+                let state = 'connecting';
+                await redis.hSetExists(accountObject.connection.getAccountKey(), 'state', state);
+                accountObject.connection.state = state;
+                await emitChangeEvent(logger, account, 'state', state);
+                await accountObject.connection.reconnect(true);
+            }
+        }
+    }
+
+    async syncConnection(account, opts = {}) {
+        logger.info({ msg: 'Account sync requested', account });
+        if (this.accounts.has(account)) {
+            let accountObject = this.accounts.get(account);
+            if (accountObject.connection) {
+                accountObject.connection.accountLogger.log({
+                    level: 'info',
+                    t: Date.now(),
+                    cid: accountObject.connection.cid,
+                    msg: 'Account sync requested'
+                });
+
+                // only the Graph client reads the options, the others sync their own way
+                await accountObject.connection.syncMailboxes(opts);
+
+                return true;
+            }
+        }
+    }
+
+    async pauseConnection(account) {
+        logger.info({ msg: 'Account pause requested', account });
+        if (this.accounts.has(account)) {
+            let accountObject = this.accounts.get(account);
+            if (accountObject.connection) {
+                accountObject.connection.accountLogger.log({
+                    level: 'info',
+                    t: Date.now(),
+                    cid: accountObject.connection.cid,
+                    msg: 'Account pause requested'
+                });
+
+                await accountObject.connection.pause();
+
+                return true;
+            }
+        }
+    }
+
+    async resumeConnection(account) {
+        logger.info({ msg: 'Account resume requested', account });
+        if (this.accounts.has(account)) {
+            let accountObject = this.accounts.get(account);
+            if (accountObject.connection) {
+                accountObject.connection.accountLogger.log({
+                    level: 'info',
+                    t: Date.now(),
+                    cid: accountObject.connection.cid,
+                    msg: 'Account resume requested'
+                });
+
+                await accountObject.connection.resume();
+
+                return true;
+            }
+        }
+    }
+
+    async reconnectConnection(account) {
+        logger.info({ msg: 'Account reconnection requested', account });
+        if (this.accounts.has(account)) {
+            let accountObject = this.accounts.get(account);
+            if (accountObject.connection) {
+                accountObject.connection.accountLogger.log({
+                    level: 'info',
+                    t: Date.now(),
+                    cid: accountObject.connection.cid,
+                    msg: 'Account reconnection requested'
+                });
+
+                try {
+                    await accountObject.connection.close();
+                } catch (err) {
+                    // a failed state write during close must not stop the reconnect
+                    logger.error({ msg: 'Failed to close connection', account, err });
+                }
+            }
+
+            await this.assignConnection(account, false, { forceWatchRenewal: true });
+        }
+    }
+
+    async listMessages(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.listMessages(message);
+    }
+
+    async listSignatures(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.listSignatures(message.account);
+    }
+
+    async getText(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.getText(message.text, message.options);
+    }
+
+    async getMessage(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.getMessage(message.message, message.options);
+    }
+
+    async getMessages(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        // Use batch method if available (Gmail/Outlook API clients)
+        if (typeof accountData.connection.getMessages === 'function') {
+            return await accountData.connection.getMessages(message.messageIds, message.options);
+        }
+
+        // Fallback to sequential fetching for IMAP
+        const results = [];
+        for (const messageId of message.messageIds) {
+            try {
+                const msg = await accountData.connection.getMessage(messageId, message.options);
+                results.push({ messageId, data: msg, error: null });
+            } catch (err) {
+                results.push({ messageId, data: null, error: { message: err.message, code: err.code } });
+            }
+        }
+        return results;
+    }
+
+    async updateMessage(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.updateMessage(message.message, message.updates);
+    }
+
+    async updateMessages(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+        return await accountData.connection.updateMessages(message.path, message.search, message.updates);
+    }
+
+    async listMailboxes(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.listMailboxes(message.options);
+    }
+
+    async moveMessage(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.moveMessage(message.message, message.target, message.options);
+    }
+
+    async moveMessages(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.moveMessages(message.source, message.search, message.target);
+    }
+
+    async deleteMessage(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.deleteMessage(message.message, message.force);
+    }
+
+    async deleteMessages(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.deleteMessages(message.path, message.search, message.force);
+    }
+
+    async submitMessage(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        // A queued message is sent under a lock, so a retry never runs next to a send still in
+        // progress (lib/submit-lock.js)
+        return await sendQueuedOnce({
+            lock: getSharedLock(),
+            redis,
+            logger,
+            account: message.account,
+            queueId: message.data && message.data.queueId,
+            send: () => accountData.connection.submitMessage(message.data)
+        });
+    }
+
+    async queueMessage(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        const accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.queueMessage(message.data, message.meta);
+    }
+
+    async subconnections(message) {
+        if (!this.accounts.has(message.account)) {
+            return [];
+        }
+
+        const accountObject = this.accounts.get(message.account);
+        if (!accountObject.connection) {
+            return [];
+        }
+
+        return accountObject.connection.subconnections.map(subconnection => ({
+            path: subconnection.path,
+            state: subconnection.state,
+            disabledReason: subconnection.disabledReason
+        }));
+    }
+
+    async uploadMessage(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.uploadMessage(message.data);
+    }
+
+    async externalNotify(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.externalNotify(message);
+    }
+
+    async subscriptionLifecycle(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let connection = accountData.connection;
+
+        switch (message.event) {
+            case 'reauthorizationRequired':
+                return await connection.renewSubscription({ force: true });
+
+            case 'subscriptionRemoved':
+                // Clear stored subscription since MS deleted it server-side, under lock
+                logger.info({ msg: 'Handling subscriptionRemoved lifecycle event', account: message.account });
+                await connection.ensureSubscription({ clearExisting: true });
+                return true;
+
+            case 'missed':
+                // the API worker already stored the recovery request, see Account.queueMissedRecovery()
+                logger.info({ msg: 'Handling missed notification lifecycle event', account: message.account });
+                return connection.recoverMissedNotifications();
+
+            default:
+                logger.warn({ msg: 'Unknown subscription lifecycle event', event: message.event, account: message.account });
+                return false;
+        }
+    }
+
+    async getQuota(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.getQuota();
+    }
+
+    async createMailbox(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.createMailbox(message.path);
+    }
+
+    async modifyMailbox(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        return await accountData.connection.modifyMailbox(message.path, message.newPath, message.subscribed);
+    }
+
+    async deleteMailbox(message) {
+        if (!this.accounts.has(message.account)) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            throw NO_ACTIVE_HANDLER_RESP_ERR;
+        }
+        return await accountData.connection.deleteMailbox(message.path);
+    }
+
+    async getRawMessage(message) {
+        // Built before the fetch rather than after it: the fetch can take minutes, and a consumer
+        // whose thread dies in the meantime closes the port with nothing queued, which only reaches
+        // a listener that was already attached. See the MessagePortWritable constructor.
+        const writable = new MessagePortWritable(message.port);
+        try {
+            if (!this.accounts.has(message.account)) {
+                throw NO_ACTIVE_HANDLER_RESP_ERR;
+            }
+
+            let accountData = this.accounts.get(message.account);
+            if (!accountData.connection) {
+                throw NO_ACTIVE_HANDLER_RESP_ERR;
+            }
+            let source = await accountData.connection.getRawMessage(message.message);
+            if (!source) {
+                let err = new Error('Requested file not found');
+                err.statusCode = 404;
+                throw err;
+            }
+
+            sendToMessagePort(writable, source, accountData.connection.logger);
+
+            return {
+                headers: {
+                    'content-type': 'message/rfc822',
+                    'content-disposition': `attachment; filename=message.eml`
+                },
+                contentType: 'message/rfc822'
+            };
+        } catch (err) {
+            // Nothing to send, so the port goes back untouched - the consumer is about to be handed
+            // this error, and a closed port would reach it as a failed transfer instead.
+            writable.releaseListeners();
+            throw err;
+        }
+    }
+
+    async getAttachment(message) {
+        // Built before the download starts, not after: an attachment is the longest wait on this
+        // worker, and a consumer thread that dies during it closes the port with nothing queued -
+        // which only a listener attached beforehand ever sees. See the MessagePortWritable
+        // constructor.
+        const writable = new MessagePortWritable(message.port);
+        try {
+            if (!this.accounts.has(message.account)) {
+                throw NO_ACTIVE_HANDLER_RESP_ERR;
+            }
+
+            let accountData = this.accounts.get(message.account);
+            if (!accountData.connection) {
+                throw NO_ACTIVE_HANDLER_RESP_ERR;
+            }
+
+            let source = await accountData.connection.getAttachment(message.attachment);
+            if (!source) {
+                let err = new Error('Requested file not found');
+                err.statusCode = 404;
+                throw err;
+            }
+
+            // IMAP resolves an attachment to the download stream itself, Gmail and Graph to a Buffer
+            // wrapped alongside the headers.
+            let payload = Buffer.isBuffer(source.data) ? source.data : source;
+
+            sendToMessagePort(writable, payload, accountData.connection.logger);
+
+            return {
+                headers: source.headers,
+                contentType: source.contentType
+            };
+        } catch (err) {
+            // Nothing to send, so the port goes back untouched - the consumer is about to be handed
+            // this error, and a closed port would reach it as a failed transfer instead.
+            writable.releaseListeners();
+            throw err;
+        }
+    }
+
+    // Shutdown teardown: closes every account connection this worker owns. The main thread owns
+    // the worker's lifetime and terminates it once the drain returns, so this deliberately does
+    // not exit the process itself.
+    async closeConnections() {
+        if (this.connectionsClosed) {
+            return;
+        }
+        logger.info({ msg: 'Closing account connections', accounts: this.accounts.size });
+        this.connectionsClosed = true;
+
+        this.accounts.forEach((accountObject, account) => {
+            if (accountObject && accountObject.connection) {
+                // Gmail and Graph close() write state to Redis; a rejection here is only worth a log line
+                Promise.resolve()
+                    .then(() => accountObject.connection.close())
+                    .catch(err => logger.error({ msg: 'Failed to close connection', account, err }));
+            }
+        });
+    }
+
+    // some general message
+    async onMessage(message) {
+        /*
+        let dataview = new DataView(message);
+        dataview.setUint8(Number(threadId), Number(threadId));
+        */
+
+        switch (message.cmd) {
+            case 'settings':
+                if (message.data && message.data.logs) {
+                    for (let [account, accountObject] of this.accounts) {
+                        // update log handling
+                        let logging = await settings.getLoggingInfo(account, message.data.logs);
+                        if (accountObject.connection) {
+                            accountObject.connection.accountLogger.maxLogLines = logging.maxLogLines;
+                            accountObject.connection.accountLogger.enabled = logging.enabled;
+                            accountObject.connection.emitLogs = logging.enabled;
+                            if (accountObject.connection.imapClient) {
+                                accountObject.connection.imapClient.emitLogs = logging.enabled;
+                            }
+                        }
+                        if (!logging.enabled) {
+                            await redis.del(this.getLogKey(account));
+                        }
+                    }
+                }
+                return;
+        }
+
+        logger.debug({ msg: 'Unhandled message', message });
+    }
+
+    // message that expects a response
+    async onCommand(message) {
+        switch (message.cmd) {
+            case 'resource-usage':
+                return threadStats.usage();
+
+            // Shutdown drain. Signals reach the main thread only, so this worker cannot notice
+            // SIGTERM itself; server.js forwards it here on the way down so accounts get a chance
+            // to close their connections cleanly instead of having the sockets cut.
+            case 'close':
+                await this.closeConnections();
+                return true;
+
+            case 'sync':
+                return await this.syncConnection(message.account, { since: message.since });
+
+            case 'delete':
+            case 'teardown':
+            case 'unassign':
+            case 'update':
+            case 'pause':
+            case 'resume':
+            case 'reconnect':
+                return await this[`${message.cmd}Connection`](message.account);
+
+            case 'assign':
+                return await this[`${message.cmd}Connection`](message.account, message.runIndex);
+
+            case 'listMessages':
+            case 'getText':
+            case 'getMessage':
+            case 'getMessages':
+            case 'updateMessage':
+            case 'updateMessages':
+            case 'listMailboxes':
+            case 'moveMessage':
+            case 'moveMessages':
+            case 'deleteMessage':
+            case 'deleteMessages':
+            case 'getRawMessage':
+            case 'getQuota':
+            case 'createMailbox':
+            case 'modifyMailbox':
+            case 'deleteMailbox':
+            case 'getAttachment':
+            case 'submitMessage':
+            case 'queueMessage':
+            case 'uploadMessage':
+            case 'subconnections':
+            case 'externalNotify':
+            case 'subscriptionLifecycle':
+            case 'listSignatures':
+                return await this[message.cmd](message);
+
+            case 'countConnections': {
+                let results = Object.assign({}, DEFAULT_STATES);
+                let subscriptions = { valid: 0, expired: 0, unset: 0, failed: 0, pending: 0 };
+
+                for (let accountObject of this.accounts.values()) {
+                    let state;
+
+                    if (!accountObject || !accountObject.connection) {
+                        state = 'unassigned';
+                    } else {
+                        state = await accountObject.connection.currentState();
+
+                        // Collect MS Graph subscription states for Outlook accounts
+                        if (accountObject.connection instanceof OutlookClient) {
+                            let subState = accountObject.connection.subscriptionState || 'unset';
+                            if (subscriptions[subState] !== undefined) {
+                                subscriptions[subState]++;
+                            }
+                        }
+                    }
+
+                    if (!results[state]) {
+                        results[state] = 0;
+                    }
+                    results[state] += 1;
+                }
+
+                return { connections: results, subscriptions };
+            }
+
+            default:
+                return false;
+        }
+    }
+
+    call(message) {
+        return this.rpc.call(message);
+    }
+
+    metrics(key, method, ...args) {
+        parentPort.postMessage({
+            cmd: 'metrics',
+            key,
+            method,
+            args
+        });
+    }
+}
+
+let connectionHandler = new ConnectionHandler();
+
+async function main() {
+    // Try to run a redis command to be sure that Redis is connected
+    await redis.ping();
+
+    logger.info({ msg: 'Started IMAP worker thread', version: packageData.version });
+    await connectionHandler.init();
+}
+
+parentPort.on('message', message => {
+    if (connectionHandler.rpc.handleResponse(message)) {
+        return;
+    }
+
+    if (isCall(message)) {
+        return respond(parentPort, message, command => connectionHandler.onCommand(command), {
+            logger,
+            onError(err) {
+                // Anything with a client-facing status (404 not found, 503 no active handler) is
+                // reported back to the caller as the command response, so it is not a server fault.
+                // 503 is excluded from the error branch on purpose: both "no active handler" and
+                // IMAPConnectionClosing carry it, and a worker taking over accounts answers every
+                // in-flight command with one until the reassignment settles.
+                // ImapFlow's codes for "throttled" and "the connection went away" carry no HTTP
+                // status of their own (429 and 503, see assignRelayStatus())
+                assignRelayStatus(err);
+                let isServerFault = !err || !err.statusCode || (err.statusCode >= 500 && err.statusCode !== 503);
+                logger[isServerFault ? 'error' : 'debug'](Object.assign(describeRpcCommand(message), { msg: 'Command failed', err }));
+            }
+        });
+    }
+
+    connectionHandler.onMessage(message).catch(err => logger.error({ msg: 'Failed to process IPC message', err }));
+});
+
+// NB! No SIGTERM/SIGINT handlers here. Node delivers signals to the main thread only, so handlers
+// registered in a worker thread never run. Shutdown reaches this worker as a 'close' command from
+// server.js instead; see onCommand().
+
+main().catch(err => {
+    logger.fatal({ msg: 'IMAP worker startup failed', err });
+    logger.flush(() => process.exit(6));
+});

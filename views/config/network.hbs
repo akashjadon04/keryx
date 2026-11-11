@@ -1,0 +1,283 @@
+{{> ui/page-header title="Network" icon="icon-[tabler--network]" class="mb-1"}}
+
+<p class="mb-6">Control how EmailEngine connects to email servers and routes traffic.</p>
+
+{{> ui/env-managed-alert}}
+
+<form method="post" action="/admin/config/network">
+    {{!-- no id: the layout already renders the #crumb element the script reads --}}
+    <input type="hidden" name="crumb" value="{{crumb}}" />
+
+    {{#> ui/card title="Proxy Settings" bodyClass="space-y-4"}}
+            <p>Route all outbound connections through a proxy: IMAP and SMTP sessions, Gmail API and Microsoft
+                Graph requests, OAuth2 token exchange, webhook delivery, and EmailEngine's own requests such as
+                license validation. Supports HTTP CONNECT, SOCKS4, and SOCKS5.</p>
+
+            <div>
+                {{> ui/setting-ref name="proxyEnabled"}}
+                {{> ui/checkbox id="proxy_enabled" name="proxyEnabled" label="Enable Global Proxy" class="proxy-status"
+                checked=values.proxyEnabled error=errors.proxyEnabled
+                hint="Routes all outbound connections through the proxy below. Individual accounts can override it for their IMAP and SMTP connections."}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="proxyUrl"}}
+                {{#> ui/form-field id="proxyUrl" label="Proxy URL" error=errors.proxyUrl}}
+                <input type="text" class="input or-else-all{{#if errors.proxyUrl}} is-invalid{{/if}}" id="proxyUrl"
+                    placeholder="socks://localhost:1080" value="{{values.proxyUrl}}" name="proxyUrl"
+                    data-target="proxy-status">
+                <span class="helper-text" id="proxyUrlBlock">Format: <code>http://</code>, <code>https://</code>,
+                    <code>socks://</code>, <code>socks4://</code>, or <code>socks5://</code> followed by
+                    host:port</span>
+                {{/ui/form-field}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="smtpEhloName"}}
+                {{#> ui/form-field id="smtpEhloName" label="SMTP Greeting Name" error=errors.smtpEhloName}}
+                <input type="text" class="input{{#if errors.smtpEhloName}} is-invalid{{/if}}" id="smtpEhloName"
+                    placeholder="mail.example.com" value="{{values.smtpEhloName}}" name="smtpEhloName">
+                <span class="helper-text" id="smtpEhloNameBlock">Hostname used in SMTP EHLO/HELO greetings. Defaults to
+                    <code>{{defaultSmtpEhloName}}</code>. For dedicated IPs, use the IP's reverse DNS hostname.</span>
+                {{/ui/form-field}}
+            </div>
+        
+    {{/ui/card}}
+
+    {{#> ui/card title="HTTP Proxy Settings" bodyClass="space-y-4"}}
+            <p>Optional. Use a different proxy for HTTP/HTTPS requests only: webhook delivery, OAuth2 token exchange,
+                Gmail API and Microsoft Graph calls, and license validation. When disabled, these requests use the
+                global proxy above.</p>
+
+            <div>
+                {{> ui/setting-ref name="httpProxyEnabled"}}
+                {{> ui/checkbox id="http_proxy_enabled" name="httpProxyEnabled" label="Enable HTTP Proxy"
+                class="http-proxy-status" checked=values.httpProxyEnabled error=errors.httpProxyEnabled
+                hint="Routes outbound HTTP/HTTPS requests through the proxy below instead of the global proxy."}}
+            </div>
+
+            <div>
+                {{> ui/setting-ref name="httpProxyUrl"}}
+                {{#> ui/form-field id="httpProxyUrl" label="HTTP Proxy URL" error=errors.httpProxyUrl}}
+                <input type="text" class="input or-else-all{{#if errors.httpProxyUrl}} is-invalid{{/if}}"
+                    id="httpProxyUrl" placeholder="http://proxy:8080" value="{{values.httpProxyUrl}}"
+                    name="httpProxyUrl" data-target="http-proxy-status">
+                <span class="helper-text" id="httpProxyUrlBlock">Format: <code>http://</code>, <code>https://</code>,
+                    <code>socks4://</code>, or <code>socks5://</code> followed by host:port</span>
+                {{/ui/form-field}}
+            </div>
+        
+    {{/ui/card}}
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header">
+            <h6 class="card-title text-primary">IP Address Strategy</h6>
+        </div>
+        <div class="card-body">
+            <p class="mb-2">Choose how EmailEngine selects IP addresses when your server has multiple IPs:</p>
+            <ul class="list-disc ps-6 space-y-1">
+                <li><strong>Dedicated</strong> - Each account always uses the same IP from your pool</li>
+                <li><strong>Random</strong> - Each connection uses a randomly selected IP</li>
+                <li><strong>Server Default</strong> - Uses your server's default network configuration</li>
+            </ul>
+        </div>
+
+        <div class="overflow-x-auto">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Traffic</th>
+                        <th>Selection Method</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>
+                            <span class="block">Mailbox access</span>
+                            <small class="text-base-content/60">IMAP sessions, Gmail API and MS Graph requests, and OAuth2 token requests. One address per account under Dedicated</small>
+                        </td>
+                        <td>
+                            {{> ui/setting-ref name="imapStrategy"}}
+                            <select class="select max-w-xs{{#if errors.imapStrategy}} is-invalid{{/if}}"
+                                name="imapStrategy" aria-label="Mailbox access IP selection method">
+                                {{#each imapStrategies}}
+                                <option value="{{key}}" {{#if selected}}selected{{/if}}>{{title}}</option>
+                                {{/each}}
+                            </select>
+                            {{#if errors.imapStrategy}}
+                            <span class="helper-text text-error">{{errors.imapStrategy}}</span>
+                            {{/if}}
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td>
+                            <span class="block">Sending over SMTP</span>
+                            <small class="text-base-content/60">SMTP delivery of submitted messages</small>
+                        </td>
+                        <td>
+                            {{> ui/setting-ref name="smtpStrategy"}}
+                            <select class="select max-w-xs{{#if errors.smtpStrategy}} is-invalid{{/if}}"
+                                name="smtpStrategy" aria-label="Sending over SMTP IP selection method">
+                                {{#each smtpStrategies}}
+                                <option value="{{key}}" {{#if selected}}selected{{/if}}>{{title}}</option>
+                                {{/each}}
+                            </select>
+                            {{#if errors.smtpStrategy}}
+                            <span class="helper-text text-error">{{errors.smtpStrategy}}</span>
+                            {{/if}}
+                        </td>
+                    </tr>
+
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card bg-base-100 shadow-md mb-6">
+        <div class="card-header flex flex-wrap items-center justify-between gap-3">
+            <h6 class="card-title text-primary">Available IP Addresses</h6>
+            {{> ui/btn label="Scan for IPs" id="reload-btn" icon="icon-[tabler--refresh] reload-icon"}}
+        </div>
+
+        <div class="card-body">
+            {{> ui/setting-ref name="localAddresses"}}
+            Select which IP addresses EmailEngine can use with the Dedicated or Random strategies. If selected IPs
+            become unavailable, EmailEngine falls back to server defaults.
+        </div>
+        <div class="overflow-x-auto">
+            <table class="table ee-table-stack">
+                <thead>
+                    <tr>
+                        <th>
+                            <input type="checkbox" class="checkbox checkbox-sm" id="checkbox-all"
+                                aria-label="Select all addresses">
+                        </th>
+                        <th>
+                            Local IP
+                        </th>
+                        <th>
+                            Public IP
+                        </th>
+                        <th colspan="2">
+                            Hostname
+                        </th>
+                    </tr>
+                </thead>
+                <tbody id="address-list">
+                    {{>address_list}}
+                </tbody>
+
+            </table>
+        </div>
+
+    </div>
+
+    <div class="mb-6">
+        {{> ui/btn label="Save changes" type="submit" icon="icon-[tabler--settings]"}}
+    </div>
+
+</form>
+
+
+{{#> ui/confirm-modal id="deleteAddress" title="Remove IP Address" titleId="deleteAddressLabel"
+action="/admin/config/network/delete" fieldName="localAddress" submitLabel="Remove"}}
+Remove this IP from the list? It will be re-added if found during the next scan.
+{{/ui/confirm-modal}}
+
+
+<script data-cfasync="false" nonce="{{cspNonce}}">
+    document.addEventListener('DOMContentLoaded', () => {
+        let reloadBtn = document.getElementById('reload-btn');
+
+        const requestReload = async () => {
+            const data = await uiPostJson('/admin/config/network/reload');
+
+            return data;
+        }
+
+        let updateAllCheckboxes = () => {
+            let state = document.getElementById('checkbox-all').checked;
+
+            for (let elm of document.querySelectorAll('.checkbox-entry')) {
+                elm.checked = state
+            }
+        }
+
+        let checkCheckboxes = elm => {
+            let allChecked = true;
+            for (let elm of document.querySelectorAll('#address-list .checkbox-entry')) {
+                if (!elm.checked) {
+                    allChecked = false
+                }
+            }
+            document.getElementById('checkbox-all').checked = allChecked;
+        }
+
+        document.getElementById('checkbox-all').addEventListener('click', updateAllCheckboxes);
+        document.getElementById('checkbox-all').addEventListener('change', updateAllCheckboxes);
+
+        for (let elm of document.querySelectorAll('#address-list .checkbox-entry')) {
+            elm.addEventListener('click', checkCheckboxes);
+            elm.addEventListener('change', checkCheckboxes);
+        }
+
+        checkCheckboxes()
+
+        let redrawAddressList = html => {
+            // rendered server-side by /admin/config/network/reload from the same
+            // address_list partial as the initial page
+            document.getElementById('address-list').innerHTML = html;
+
+            for (let elm of document.querySelectorAll('#address-list .checkbox-entry')) {
+                elm.addEventListener('click', checkCheckboxes);
+                elm.addEventListener('change', checkCheckboxes);
+            }
+
+            checkCheckboxes();
+
+            // FlyonUI components (address notice tooltips) in the re-rendered
+            // rows need a fresh init pass
+            uiAutoInit();
+        }
+
+        let reloadAddresses = () => {
+            uiButtonBusy(reloadBtn, true);
+
+            requestReload().then(data => {
+                if (data.error) {
+                    showToast('Failed to send payload', 'alert-triangle')
+                    return;
+                }
+
+                if (data.html) {
+                    redrawAddressList(data.html);
+                }
+
+            }).catch(err => {
+                showToast('Request failed\n' + err.message, 'alert-triangle');
+            }).finally(() => uiButtonBusy(reloadBtn, false));
+        }
+
+        reloadBtn.addEventListener('click', reloadAddresses);
+
+        if (!document.querySelectorAll('#address-list .checkbox-entry').length) {
+            reloadAddresses();
+        }
+
+        // delete triggers live inside the re-renderable address list, so the
+        // listener is delegated from the tbody container (replaces the
+        // Bootstrap show.bs.modal relatedTarget contract)
+        document.getElementById('address-list').addEventListener('click', e => {
+            let btn = e.target.closest('.address-action-delete');
+            if (!btn) {
+                return;
+            }
+            e.preventDefault();
+            let address = btn.dataset.address;
+            document.getElementById('deleteAddressLabel').textContent = `Remove ${address}?`;
+            document.querySelector('#deleteAddress .modal-footer input[name=localAddress]').value = address;
+            uiModal.open('#deleteAddress');
+        });
+    });
+</script>
