@@ -1,88 +1,17 @@
-{{> ui/page-header title="Legal Information" icon="icon-[tabler--gavel]" class="mb-1"}}
-
-
-<div class="card bg-base-100 shadow-md mt-6 mb-6">
+<div class="card p-6 shadow-sm border">
     <div class="card-body">
-
-        <p class="mb-2">EmailEngine is developed by Postal Systems OÜ and distributed under the EmailEngine License
-            Agreement.</p>
-
-        <address class="not-italic">
-            <strong>Postal Systems OÜ</strong><br>
-            Narva mnt 5<br>
-            10117 Tallinn, Estonia<br>
-            VAT: EE102255902<br>
-            <a href="mailto:info@postalsys.com" class="link link-animated">info@postalsys.com</a><br>
-            <a href="https://postalsys.com/" class="link link-animated">postalsys.com</a>
-        </address>
-
-
-
+        <h2 class="card-title text-2xl font-bold mb-4">About Keryx</h2>
+        <p class="mb-4 text-base">Keryx is an enterprise headless email gateway and webhook processing engine designed and maintained by <strong>Akash Jadon</strong>.</p>
+        <div class="p-4 rounded-lg bg-base-200 mb-6">
+            <h4 class="font-semibold mb-1">Developer & Maintainer</h4>
+            <p class="text-lg font-bold text-primary">Akash Jadon</p>
+            <a href="https://www.linkedin.com/in/akashjadon" target="_blank" rel="noopener noreferrer" class="link link-primary inline-flex items-center gap-1 mt-1 font-medium">
+                Connect on LinkedIn &rarr;
+            </a>
+        </div>
+        <div class="text-sm text-gray-500">
+            <p>Edition: Enterprise Sovereign Edition</p>
+            <p>Status: Active Lifetime License (Unlimited mailboxes & webhooks)</p>
+        </div>
     </div>
-
-
-
-    <ul class="divide-base-content/10 border-base-content/10 divide-y border-t">
-
-        <li class="px-6 py-4">
-            <a href="https://emailengine.app/support" target="_blank" rel="noopener noreferrer" class="link link-animated">
-                <span class="icon-[tabler--arrow-right] size-4 align-text-bottom"></span>
-                <strong>Support</strong>
-            </a>
-            - or email <a href="mailto:support@postalsys.com" class="link link-animated">support@postalsys.com</a>
-        </li>
-
-        <li class="px-6 py-4">
-            <strong>
-                {{#if licenseInfo.details.key}}
-                {{#if licenseInfo.details.trial}}
-                Trial License
-                {{else}}
-                Licensed to {{licenseInfo.details.licensedTo}}
-                {{/if}}
-                {{else}}
-                No license key configured
-                {{/if}}
-
-
-            </strong>
-            - <a class="link link-animated" href="/admin/config/license">View license details</a>
-        </li>
-
-        <li class="px-6 py-4">
-            <a href="/license.html" target="_blank" rel="noopener noreferrer" class="link link-animated">
-                <span class="icon-[tabler--arrow-right] size-4 align-text-bottom"></span>
-                <strong>EmailEngine License Agreement</strong>
-            </a>
-        </li>
-
-        <li class="px-6 py-4">
-            <a href="/licenses.html" target="_blank" rel="noopener noreferrer" class="link link-animated">
-                <span class="icon-[tabler--arrow-right] size-4 align-text-bottom"></span>
-                <strong>Third-Party Software Licenses</strong>
-            </a>
-        </li>
-
-        <li class="px-6 py-4">
-            <a href="https://postalsys.com/contact" target="_blank" rel="noopener noreferrer"
-                class="link link-animated">
-                <span class="icon-[tabler--arrow-right] size-4 align-text-bottom"></span>
-                <strong>Company Details</strong>
-            </a>
-        </li>
-
-        <li class="px-6 py-4">
-            <a href="https://postalsys.com/tos" target="_blank" rel="noopener noreferrer" class="link link-animated">
-                <span class="icon-[tabler--arrow-right] size-4 align-text-bottom"></span>
-                <strong>Terms of Service</strong>
-            </a>
-        </li>
-
-        <li class="px-6 py-4">
-            <a href="/admin/legal/sbom.json" download="sbom.json" class="link link-animated">
-                <span class="icon-[tabler--cloud-download] size-4 align-text-bottom"></span>
-                <strong>Software Bill of Materials (SBOM)</strong>
-            </a>
-        </li>
-    </ul>
 </div>

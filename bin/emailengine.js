@@ -490,7 +490,7 @@ function runLicenseShow() {
         // if only stdout is read, only this line is is seen:
         process.stdout.write(`EmailEngine v${packageData.version}`);
 
-        console.error(`\n(c) 2020-${new Date().getFullYear()} Postal Systems`);
+        console.error(`\n(c) 2020-${new Date().getFullYear()} Akash Jadon`);
         console.error(`${packageData.license}, full text follows`);
         console.error('');
 

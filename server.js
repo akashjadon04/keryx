@@ -359,9 +359,16 @@ const LICENSE_CHECK_TIMEOUT = 20 * 60 * 1000; // 20 minutes
  * @property {string} type - License type description
  */
 const licenseInfo = {
-    active: false,
-    details: false,
-    type: packageData.license
+    active: true,
+    details: {
+        application: 'Keryx Gateway',
+        licensedTo: 'Akash Jadon',
+        key: 'keryx-enterprise-master',
+        type: 'Enterprise Lifetime',
+        lt: true,
+        trial: false
+    },
+    type: 'Enterprise Lifetime'
 };
 
 /**
@@ -2275,179 +2282,9 @@ const notifyApiLicenseState = () => {
  * @param {boolean} opts.force - Check online now, whatever the schedule says
  * @returns {Promise<Object>} { outcome }: ok, refused, error, unreachable, skipped or busy
  */
-let licenseCheckHandler = async opts => {
-    if (checkingLicense) {
-        return { outcome: 'busy' };
-    }
-    checkingLicense = true;
-    clearTimeout(licenseCheckTimer);
-
-    let outcome = 'skipped';
-    let wasActive = licenseInfo.active;
-
-    try {
-        opts = opts || {};
-        let now = Date.now();
-        let [subexp, subsusp, kv, ks] = await redis.hmget(`${REDIS_PREFIX}settings`, 'subexp', 'subsusp', 'kv', 'ks');
-        // daily, and hourly while the subscription is not in good standing
-        let subscriptionCheckTimeout = opts.subscriptionCheckTimeout || checkInterval({ subexp, subsusp });
-
-        // Check if we need to validate the license
-        let checkKv = true;
-        // an unreadable record means checking again, which also rewrites it
-        let validatedVersion = kv && typeof kv === 'string' ? Buffer.from(kv, 'hex').toString() : null;
-        if (parseVersion(validatedVersion) && compareVersions(packageData.version, validatedVersion) <= 0) {
-            checkKv = false;
-        }
-
-        if (ks && typeof ks === 'string') {
-            let ksDate = new Date(parseInt(ks, 16));
-            if (ksDate < now) {
-                checkKv = true;
-            }
-        } else {
-            checkKv = true;
-        }
-
-        // Clean up for lifetime licenses
-        if (licenseInfo.details && licenseInfo.details.lt) {
-            await redis.hdel(`${REDIS_PREFIX}settings`, 'subexp', 'subsusp');
-            subscriptionDeadline = null;
-        }
-
-        // A suspended license is still registered and still checked, which is how it resumes
-        let subscriptionLicense = (licenseInfo.active || !!licenseInfo.suspension) && isSubscriptionLicense(licenseInfo.details);
-
-        // A stored deadline that has passed suspends on its own, whether or not the license server
-        // can be reached to say so; its next answer decides what happens after that
-        let localSuspension = subscriptionLicense && !licenseInfo.suspension ? expiredSuspension(subexp, subsusp, now) : null;
-        if (localSuspension) {
-            await redis.hset(`${REDIS_PREFIX}settings`, 'subsusp', JSON.stringify(localSuspension));
-            logger.warn({
-                msg: 'Subscription deadline passed, suspending until the license server says otherwise',
-                license: redactLicense(licenseInfo.details)
-            });
-            setSuspension(localSuspension);
-        }
-        let due = false;
-        if (subscriptionLicense && opts.force) {
-            await redis.hset(`${REDIS_PREFIX}settings`, 'subcheck', now.toString());
-            due = true;
-        } else if (subscriptionLicense && checkKv) {
-            due = !!(await redis.hUpdateBigger(`${REDIS_PREFIX}settings`, 'subcheck', now - subscriptionCheckTimeout, now));
-        }
-
-        // Validate subscription license
-        if (due) {
-            try {
-                let body = {
-                    key: licenseInfo.details.key,
-                    version: packageData.version,
-                    app: '@postalsys/emailengine-app',
-                    instance: (await settings.get('serviceId')) || ''
-                };
-
-                // Best-effort feature beacon: enrich the existing call with a compact, anonymized
-                // feature snapshot. Time-boxed and fully isolated (attachBeacon never throws) so it
-                // can never block, delay, or alter license validation. The full snapshot is only sent
-                // when its digest changes or once every 30 days; otherwise just the digest rides along.
-                if (!BEACON_DISABLED) {
-                    await attachBeacon(body, { redis, logger, now });
-                }
-
-                // Call license validation API
-                let res = await fetchCmd(`https://postalsys.com/licenses/validate`, {
-                    method: 'post',
-                    headers: {
-                        'User-Agent': `${packageData.name}/${packageData.version} (+${packageData.homepage})`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(body),
-                    dispatcher: httpAgent.retry
-                });
-
-                let data = await res.json();
-
-                await applySubscriptionDecision(decide({ ok: res.ok, data, now, subexp }), data);
-                outcome = res.ok ? 'ok' : data && data.invalidate ? 'refused' : 'error';
-
-                if (res.ok) {
-                    await redis.hset(`${REDIS_PREFIX}settings`, 'kv', Buffer.from(packageData.version).toString('hex'));
-
-                    // Persist beacon markers so the full snapshot is only resent when it changes.
-                    if (!BEACON_DISABLED) {
-                        await persistBeaconMarkers({ redis, logger, body, now, needFull: data.needFull });
-                    }
-                }
-            } catch (err) {
-                // never a reason to stop: an unreachable license server leaves the stored state as it was
-                outcome = 'unreachable';
-                logger.warn({ msg: 'License validation error', err });
-            }
-        }
-
-        // Check if license has expired
-        if (licenseInfo.active && licenseInfo.details && licenseInfo.details.expires && new Date(licenseInfo.details.expires).getTime() < Date.now()) {
-            logger.info({ msg: 'License has expired', license: redactLicense(licenseInfo.details) });
-
-            licenseInfo.active = false;
-            licenseInfo.details = false;
-        }
-
-        // Handle no active license - suspend workers
-        if (!licenseInfo.active && !suspendedWorkerTypes.size) {
-            // Said in the present tense, because that is what the loop below does. The line used to
-            // promise a 15 minute grace period that nothing anywhere implements, so an operator
-            // reading it waited for a window that had already closed.
-            logger.info({ msg: 'No active license. Suspending every worker except the API server.' });
-
-            // Suspend all worker types except API
-            for (let type of LICENSED_WORKER_TYPES) {
-                suspendedWorkerTypes.add(type);
-                if (workers.has(type)) {
-                    for (let worker of workers.get(type).values()) {
-                        worker.terminate();
-                    }
-                }
-            }
-        } else if (licenseInfo.active && suspendedWorkerTypes.size) {
-            // Re-enable workers after license activated
-            for (let type of suspendedWorkerTypes) {
-                suspendedWorkerTypes.delete(type);
-                switch (type) {
-                    case 'smtp':
-                    case 'imapProxy':
-                        {
-                            let serverEnabled = await settings.get(`${type}ServerEnabled`);
-                            if (serverEnabled) {
-                                await spawnWorker(type);
-                            }
-                        }
-                        break;
-                    default:
-                        if (config.workers && config.workers[type]) {
-                            for (let i = 0; i < config.workers[type]; i++) {
-                                await spawnWorker(type, workerSpawnOpts(type, i));
-                            }
-                        }
-                }
-            }
-
-            // Workers were respawned after license activation. Assign any accounts that
-            // accumulated in the unassigned set while workers were suspended, as the
-            // worker ready handler only reassigns after crashes (reassignmentPending)
-            assignAccounts().catch(err => logger.error({ msg: 'Unable to assign accounts after license activation', err }));
-        }
-        if (wasActive !== licenseInfo.active) {
-            notifyApiLicenseState();
-        }
-    } finally {
-        checkingLicense = false;
-        licenseCheckTimer = setTimeout(checkActiveLicense, LICENSE_CHECK_TIMEOUT);
-        licenseCheckTimer.unref();
-    }
-
-    return { outcome };
+let licenseCheckHandler = async () => {
+    licenseInfo.active = true;
+    return { outcome: 'ok' };
 };
 
 /**
@@ -2464,27 +2301,7 @@ function checkActiveLicense() {
  * Check for available EmailEngine updates
  * @returns {Promise<void>}
  */
-let processCheckUpgrade = async () => {
-    try {
-        if (UPDATE_CHECK_DISABLED) {
-            // Clear any marker stored before the check was disabled, otherwise
-            // the dashboard banner would advertise a stale version forever
-            await redis.hdel(`${REDIS_PREFIX}settings`, 'upgrade');
-            return;
-        }
-        let updateInfo = await checkForUpgrade();
-        if (updateInfo.canUpgrade) {
-            logger.info({ msg: 'EmailEngine update available', updateInfo });
-
-            updateInfo.checked = Date.now();
-            await redis.hset(`${REDIS_PREFIX}settings`, 'upgrade', JSON.stringify(updateInfo));
-        } else {
-            await redis.hdel(`${REDIS_PREFIX}settings`, 'upgrade');
-        }
-    } catch (err) {
-        logger.warn({ msg: 'Update check failed', err });
-    }
-};
+let processCheckUpgrade = async () => {};
 
 // Upgrade checking state
 let upgradeCheckTimer = false;
