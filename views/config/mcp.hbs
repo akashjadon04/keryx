@@ -2,7 +2,7 @@
 
 <p class="mb-6">
     Connect AI agents through the Model Context Protocol (MCP). Choose whether each agent can manage this
-    EmailEngine instance, work with email, or both. Access tokens control which tools and accounts it can use.
+    Keryx instance, work with email, or both. Access tokens control which tools and accounts it can use.
 </p>
 
 <div class="mb-6 alert alert-soft alert-info">
@@ -15,7 +15,7 @@
 <div class="mb-6 alert alert-soft alert-warning">
     <span class="icon-[tabler--alert-triangle] size-5 shrink-0"></span>
     <span>The MCP endpoint is disabled for this deployment (<code>EENGINE_MCP_ENABLED</code> or <code>[mcp]
-            enabled</code> in the configuration file), so the settings below take effect only after MCP is enabled at startup and EmailEngine is restarted.</span>
+            enabled</code> in the configuration file), so the settings below take effect only after MCP is enabled at startup and Keryx is restarted.</span>
 </div>
 {{/unless}}
 
@@ -88,7 +88,7 @@
 
 {{!-- The two connection methods are mutually exclusive per client, so they are a segmented
      switch (labeled by client type - "which one am I connecting" is the question the operator
-     arrives with), not stacked cards to scroll past. Deliberately vendor-neutral: EmailEngine
+     arrives with), not stacked cards to scroll past. Deliberately vendor-neutral: Keryx
      is a generic MCP server, so specific clients appear only as examples inside the panels.
      The badge and the OAuth panel's warnings all key on the one route-supplied
      oauthMethodBlocker, which also owns the rationale for keeping a blocked method's tab
@@ -241,7 +241,7 @@
 <div>
     <span class="label-text">Name</span>
     <p class="text-base-content/60 text-sm">Anything that identifies this instance in the client, for example
-        "EmailEngine".</p>
+        "Keryx".</p>
 </div>
 
 <div>
@@ -252,7 +252,7 @@
 
 <div>
     <span class="label-text">OAuth Client ID and Client Secret</span>
-    <p class="text-base-content/60 text-sm">Leave both empty - there is no pre-made client ID to copy. EmailEngine
+    <p class="text-base-content/60 text-sm">Leave both empty - there is no pre-made client ID to copy. Keryx
         supports automatic client registration, so the connector creates its own credentials when it first connects.
         Some clients, claude.ai among them, keep these fields behind an "Advanced settings" toggle.</p>
 </div>

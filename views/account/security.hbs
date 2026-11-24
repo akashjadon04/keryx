@@ -234,16 +234,16 @@ dialogClass="max-w-5xl"}}
 
     <div id="sso-oidc" role="tabpanel" aria-labelledby="sso-oidc-tab">
 
-        <p class="mb-4">EmailEngine works with any standards-compliant OpenID Connect provider - Keycloak, Authentik,
+        <p class="mb-4">Keryx works with any standards-compliant OpenID Connect provider - Keycloak, Authentik,
             Azure AD/Entra, Google Workspace, and others. The provider's endpoints are read automatically from
             its discovery document (<code>{{oidc.OIDC_ISSUER}}/.well-known/openid-configuration</code>)
-            when EmailEngine starts.</p>
+            when Keryx starts.</p>
 
         <ol class="list-decimal ps-6 mb-4 space-y-1">
             <li>Register a confidential OIDC client (authorization code flow) in your identity provider using the
                 Redirect URI below</li>
-            <li>Configure the required environment variables for EmailEngine</li>
-            <li>Restart EmailEngine to apply the changes</li>
+            <li>Configure the required environment variables for Keryx</li>
+            <li>Restart Keryx to apply the changes</li>
         </ol>
 
         <p class="mb-4"><strong>Redirect URI for your OIDC client:</strong><br>
@@ -344,7 +344,7 @@ dialogClass="max-w-5xl"}}
                             <code class="inline-block overflow-hidden">{{oidc.OIDC_FORCED}}</code>
                             <br><small class="text-base-content/60">When true, the login page redirects straight to the
                                 identity provider and local password/passkey sign-in is disabled. If discovery fails at
-                                startup the local form is shown as a fallback, and EmailEngine keeps retrying the
+                                startup the local form is shown as a fallback, and Keryx keeps retrying the
                                 provider in the background until it answers.</small>
                         </td>
                     </tr>
@@ -392,7 +392,7 @@ dialogClass="max-w-5xl"}}
 
         <p class="text-base-content/60 text-sm mb-0">Note: signing in via SSO is a standalone factor - TOTP is not
             prompted, and local password/passkey management is disabled for SSO sessions. With
-            <code>OIDC_LOGOUT</code> off, signing out clears only the local EmailEngine
+            <code>OIDC_LOGOUT</code> off, signing out clears only the local Keryx
             session, not the identity-provider session.</p>
 
     </div>
@@ -402,8 +402,8 @@ dialogClass="max-w-5xl"}}
         <p class="mb-2">Follow these steps to configure Single Sign-On with Okta:</p>
         <ol class="list-decimal ps-6 mb-4 space-y-1">
             <li>Create a new web application in your Okta dashboard using the Redirect URI below</li>
-            <li>Configure the required environment variables for EmailEngine</li>
-            <li>Restart EmailEngine to apply the changes</li>
+            <li>Configure the required environment variables for Keryx</li>
+            <li>Restart Keryx to apply the changes</li>
         </ol>
 
         <p class="mb-4"><strong>Redirect URI for your Okta application:</strong><br>

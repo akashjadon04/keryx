@@ -27,7 +27,7 @@ disables it while that panel is hidden, so a hidden selection is never submitted
     {{#if errors.pubSubApp}}
     <span class="helper-text text-error">{{errors.pubSubApp}}</span>
     {{/if}}
-    <span class="helper-text">Without one, EmailEngine polls each account about every 10 minutes, so webhooks
+    <span class="helper-text">Without one, Keryx polls each account about every 10 minutes, so webhooks
         still fire, only later. The Pub/Sub app must belong to the same Google Cloud project. No Pub/Sub app yet?
         <a href="/admin/config/oauth/new?provider=gmailService&amp;baseScopes=pubsub" target="_blank"
             rel="noopener" class="link link-animated">Register one</a> in a new tab, then reload this page.</span>

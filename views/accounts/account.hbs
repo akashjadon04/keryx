@@ -488,7 +488,7 @@
             {{/if}}
 
             {{!-- The special-use folder overrides, from the same list the edit form renders, and each
-            shown only where one is set: EmailEngine detects these folders from the server's own flags,
+            shown only where one is set: Keryx detects these folders from the server's own flags,
             so an absent row means it detected the folder rather than that there is none. --}}
             {{#each specialUsePathFields}}
             {{#with (lookup ../account.imap this.key)}}
@@ -500,7 +500,7 @@
             {{#if account.path}}
             <dt>Syncing paths
 
-                {{#> ui/tooltip text="EmailEngine only checks for new or updated emails from the selected paths"}}<span
+                {{#> ui/tooltip text="Keryx only checks for new or updated emails from the selected paths"}}<span
                     class="icon-[tabler--info-circle] text-base-content/50 size-4 align-text-bottom"></span>{{/ui/tooltip}}
 
             </dt>
@@ -838,7 +838,7 @@
     <p>
         When renewing the OAuth2 grant, ensure you are not logged in to another account for the same
         provider in this browser. Otherwise, that account might override the settings and messages for
-        <em>{{account.name}}</em> in EmailEngine.
+        <em>{{account.name}}</em> in Keryx.
     </p>
 </div>
 <div class="modal-footer">
@@ -859,13 +859,13 @@
 
 {{#> ui/confirm-modal id="deleteModal" title="Delete account" action=(concat "/admin/accounts/" (urlpart account.account) "/delete")
 submitLabel="Delete account"}}
-<p>Delete <strong>{{account.name}}</strong> from EmailEngine? This removes its synced data, account-specific templates, access tokens, and queued emails. Emails on the mail server are not deleted. This action cannot be undone.</p>
+<p>Delete <strong>{{account.name}}</strong> from Keryx? This removes its synced data, account-specific templates, access tokens, and queued emails. Emails on the mail server are not deleted. This action cannot be undone.</p>
 {{/ui/confirm-modal}}
 
 {{#> ui/modal id="testSendModal" title="Email delivery test" dialogClass="max-w-3xl"}}
 <div class="modal-body">
-    <p><small class="text-base-content/60">EmailEngine sends a test email from the selected account to EmailEngine's
-            remote testing server. Once the test email has been processed, EmailEngine displays the
+    <p><small class="text-base-content/60">Keryx sends a test email from the selected account to Keryx's
+            remote testing server. Once the test email has been processed, Keryx displays the
             SPF, DKIM, and DMARC authentication results below.</small>
     </p>
     <div id="test-send-pending-message">

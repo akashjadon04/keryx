@@ -6,7 +6,7 @@
 
 {{#unless webhooksEnabled}}
 <div class="alert alert-soft alert-warning mb-6"><span><strong>Note:</strong> Webhooks are disabled
-        for EmailEngine.
+        for Keryx.
         <a href="/admin/config/webhooks" class="link link-animated">Enable webhooks in configuration
             settings</a>.</span></div>
 {{/unless}}
@@ -76,7 +76,7 @@
 <div>
     <p class="mb-2">
         Each enabled route evaluates events with its filter function. When the filter returns <code>true</code>,
-            EmailEngine sends the event to the route's target URL. Add a map function to change the payload format.
+            Keryx sends the event to the route's target URL. Add a map function to change the payload format.
             Routes run independently of the default webhook target and its event selection.
     </p>
     <p class="mb-0"><a href="https://learn.emailengine.app/docs/integrations/low-code" target="_blank"

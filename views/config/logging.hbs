@@ -43,7 +43,7 @@
 
             {{#if sentryTrialManaged}}
             <div class="alert alert-soft alert-info">Error reporting was enabled automatically when the trial license
-                was activated, so that problems with evaluation instances reach the EmailEngine developers. It turns
+                was activated, so that problems with evaluation instances reach the Keryx developers. It turns
                 itself off when a full license is activated. Saving this page stores your own choice instead.</div>
             {{/if}}
 
@@ -61,7 +61,7 @@
                 <input type="text" class="input{{#if errors.sentryDsn}} is-invalid{{/if}}" id="settingsSentryDsn"
                     name="sentryDsn" placeholder="https://public-key@sentry.example.com/1" value="{{values.sentryDsn}}"
                     {{#if sentryEnvManaged}}disabled{{/if}} />
-                <span class="helper-text">Leave empty to send reports to the Sentry instance run by the EmailEngine
+                <span class="helper-text">Leave empty to send reports to the Sentry instance run by the Keryx
                     developers (sentry.emailengine.dev). Enabling this temporarily during a support case helps to debug
                     problems with your installation. Set your own DSN to keep reports in-house.</span>
                 {{/ui/form-field}}

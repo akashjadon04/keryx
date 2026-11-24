@@ -1,11 +1,11 @@
-{{> ui/page-header title="Workers" icon="icon-[tabler--cpu]" subtitle="Live status of the worker threads EmailEngine uses to sync accounts, deliver mail, and serve the API." badgeLabel=threadCount badgeVariant="neutral" class="mb-6"}}
+{{> ui/page-header title="Workers" icon="icon-[tabler--cpu]" subtitle="Live status of the worker threads Keryx uses to sync accounts, deliver mail, and serve the API." badgeLabel=threadCount badgeVariant="neutral" class="mb-6"}}
 
 {{#if apiWorkerWarning}}
 <div class="alert alert-soft alert-warning mb-6 block" role="alert">
     <span class="icon-[tabler--alert-triangle] size-4 align-text-bottom"></span>
     <strong>Multiple API workers are not active.</strong>
     {{#equals apiWorkerWarning.reason "port"}}
-    <code>EENGINE_WORKERS_API</code> is set to {{apiWorkerWarning.requested}}, but EmailEngine could not verify
+    <code>EENGINE_WORKERS_API</code> is set to {{apiWorkerWarning.requested}}, but Keryx could not verify
     <code>SO_REUSEPORT</code> support because the API port was unavailable while probing at startup, so only a single
     API worker was started. This is usually a transient conflict and may clear on the next restart.
     {{else}}
@@ -145,13 +145,13 @@
 
 {{#> ui/details summary="About workers" class="card bg-base-100 shadow-md mb-6"}}
 <div>
-    <p class="mb-4">EmailEngine spreads its work across worker threads - account sync, the API and web server, webhook
+    <p class="mb-4">Keryx spreads its work across worker threads - account sync, the API and web server, webhook
         delivery, message submission, and exports. Their counts are set at startup with environment variables such as
         <code>EENGINE_WORKERS</code> (account sync), <code>EENGINE_WORKERS_API</code>, <code>EENGINE_WORKERS_WEBHOOKS</code>,
         <code>EENGINE_WORKERS_SUBMIT</code> and <code>EENGINE_WORKERS_EXPORT</code>.</p>
     <p class="mb-4">Most worker types can be scaled to several threads with those variables. The HTTP and API server is
         the exception: running more than one API worker requires <code>SO_REUSEPORT</code>, which is available only on
-        Linux with Node.js 23.1 or newer. On macOS, Windows, or older Node.js versions EmailEngine falls back to a
+        Linux with Node.js 23.1 or newer. On macOS, Windows, or older Node.js versions Keryx falls back to a
         single API worker even when <code>EENGINE_WORKERS_API</code> is higher, so its count may read lower than
         configured.</p>
     <p class="mb-4">Use the row actions to restart an individual thread or download a memory snapshot for debugging; a

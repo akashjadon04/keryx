@@ -11,18 +11,18 @@ sections apply), how it signs in (Credentials) and, optionally, which scopes to 
         URL below to it.
         {{/if}}
         {{#if activeGmailService}}
-        <strong>Service accounts</strong> let EmailEngine reach Google without an interactive user login. An
+        <strong>Service accounts</strong> let Keryx reach Google without an interactive user login. An
         <strong>IMAP and SMTP</strong> or <strong>Gmail API</strong> app accesses any mailbox in your Google
         Workspace organization through domain-wide delegation, which must be enabled for the service account in
         Workspace. A <strong>Cloud Pub/Sub</strong> app accesses no mailboxes: it sets up the real-time change
         notifications your Gmail API apps use.
         {{/if}}
         {{#if activeOutlook}}
-        <strong>Delegated</strong> access: EmailEngine acts on behalf of a signed-in user, so each mailbox owner
+        <strong>Delegated</strong> access: Keryx acts on behalf of a signed-in user, so each mailbox owner
         completes an interactive OAuth2 login. Use it when users connect their own accounts.
         {{/if}}
         {{#if activeOutlookService}}
-        <strong>Application</strong> access: EmailEngine authenticates as the app itself with client credentials,
+        <strong>Application</strong> access: Keryx authenticates as the app itself with client credentials,
         and no user signs in. The Entra app registration needs <strong>application</strong> permissions (not
         delegated) with admin consent. Use it for service integrations and shared mailboxes.
         {{/if}}
@@ -255,7 +255,7 @@ loses its content inside a partial block (see .claude/rules/admin-ui.md) --}}
 
         <div class="auth-method-section auth-method-section-externalAccount space-y-3{{#unless authMethodIsExternalAccount}} hidden{{/unless}}">
             {{#unless authMethodLocked}}
-            <p class="text-sm">No long-lived key: EmailEngine exchanges a credential issued by its runtime (GKE,
+            <p class="text-sm">No long-lived key: Keryx exchanges a credential issued by its runtime (GKE,
                 EKS, AKS or any OIDC-emitting workload) for Google access tokens.</p>
             {{/unless}}
             <div>
@@ -268,7 +268,7 @@ loses its content inside a partial block (see .claude/rules/admin-ui.md) --}}
 
         <div class="auth-method-section auth-method-section-metadataServer{{#unless authMethodIsMetadataServer}} hidden{{/unless}}">
             <div class="space-y-2">
-                <p class="text-sm">Uses the service account of the VM, GKE workload or Cloud Run service EmailEngine
+                <p class="text-sm">Uses the service account of the VM, GKE workload or Cloud Run service Keryx
                     runs on, so there is nothing to store. Available for Cloud Pub/Sub apps only. Grant that service
                     account the <code>Pub/Sub Admin</code> role, and on Compute Engine give the VM the
                     <code>cloud-platform</code> access scope.</p>
@@ -466,7 +466,7 @@ loses its content inside a partial block (see .claude/rules/admin-ui.md) --}}
                 {{#if activeGmail}}Add it to the authorized redirect URIs of the OAuth client.{{/if}}
                 {{#if activeOutlook}}Add it as a Web redirect URI under Authentication in the app registration.{{/if}}
                 {{#if activeMailRu}}Add it to the redirect URIs of your Mail.ru application.{{/if}}
-                Change it only if you run your own OAuth2 flow; EmailEngine's own is
+                Change it only if you run your own OAuth2 flow; Keryx's own is
                 <code>{{defaultRedirectUrl}}</code>.
             </span>
             {{/ui/form-field}}

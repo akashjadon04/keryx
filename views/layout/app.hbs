@@ -36,7 +36,7 @@
             <!-- Brand -->
             <div class="border-base-content/20 flex items-center justify-center border-b px-6 py-5">
                 <a href="/" class="flex items-center">
-                    <img src="/static/logo/keryx_logo_horiz.svg" alt="Keryx" class="block max-h-9 max-w-full">
+                    <img src="/static/logo/keryx_logo_horiz.svg" alt="Keryx" class="block h-9 w-auto max-w-full">
                 </a>
             </div>
 
@@ -117,7 +117,7 @@
                 <div class="ms-auto flex items-center gap-1">
 
                     {{#if licenseInfo.suspended}}
-                    {{#> ui/tooltip text="EmailEngine is currently not running and does not process any email accounts"
+                    {{#> ui/tooltip text="Keryx is currently not running and does not process any email accounts"
                     placement="left" class="me-2"}}
                     <span class="text-error flex items-center gap-1">
                         <span class="icon-[tabler--heartbeat] size-5"></span>
@@ -260,12 +260,12 @@
 
                 {{#if licenseInfo.suspended}}
                 <div class="alert alert-soft alert-error mb-6" role="alert">
-                    EmailEngine is currently not syncing any accounts. Please restart the application or
+                    Keryx is currently not syncing any accounts. Please restart the application or
                     register a valid license key to enable syncing.
                 </div>
                 {{/if}}
 
-                <p class="mb-4">To use all the features of EmailEngine, you need to provide a valid license key.</p>
+                <p class="mb-4">To use all the features of Keryx, you need to provide a valid license key.</p>
                 <div class="flex flex-wrap gap-2">
 
                     {{#if trialPossible}}
@@ -284,7 +284,7 @@
                 {{#unless disableAuthWarning}}
                 {{#> ui/stat-card variant="error" title="Authentication not enabled" icon="icon-[tabler--shield-lock]" class="mb-6"}}
 
-                <p class="mb-4">To enable authentication for EmailEngine, please set a password for the admin
+                <p class="mb-4">To enable authentication for Keryx, please set a password for the admin
                     user account.</p>
                 <div>
                     {{> ui/btn href="/admin/account/password" variant="primary" icon="icon-[tabler--arrow-right]" label="Enable authentication"}}

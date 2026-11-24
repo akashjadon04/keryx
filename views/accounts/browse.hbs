@@ -32,12 +32,12 @@ escaping, and an account ID is free text (a quote, a backslash or an entity brok
 <input type="hidden" id="browse-session-token" value="{{sessionToken}}">
 
 <script data-cfasync="false" type="module" nonce="{{cspNonce}}">
-    import { EmailEngineClient } from '/static/js/ee-client.js';
+    import { KeryxClient } from '/static/js/ee-client.js';
 
     // Create client with UI container. The embed follows the admin theme -
     // its own dark mode toggle stays hidden and the mode tracks the topbar
     // theme switch (data-theme on the root element) and the system scheme.
-    const client = new EmailEngineClient({
+    const client = new KeryxClient({
         apiUrl: window.location.origin,
         account: document.getElementById('browse-account').value,
         accessToken: document.getElementById('browse-session-token').value,

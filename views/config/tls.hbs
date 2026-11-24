@@ -18,7 +18,7 @@ badgeVariant=pageLabel.type class="mb-1"}}
 {{#> ui/alert-banner variant="warning" icon="icon-[tabler--flask]" title="Staging certificate authority"}}
 <div>This instance is pointed at the Let's Encrypt staging directory (<code>{{acme.directoryUrl}}</code>). Certificates
     it issues are for testing and are not trusted by standard clients. To restore the production defaults, clear
-    both <code>EENGINE_ACME_DIRECTORY_URL</code> and <code>EENGINE_ACME_ENVIRONMENT</code>, then restart EmailEngine.</div>
+    both <code>EENGINE_ACME_DIRECTORY_URL</code> and <code>EENGINE_ACME_ENVIRONMENT</code>, then restart Keryx.</div>
 {{/ui/alert-banner}}
 {{/if}}
 
@@ -90,7 +90,7 @@ badgeVariant=pageLabel.type class="mb-1"}}
                                 yet.
                                 {{else}}
                                 Serving plain HTTP, the default. Put a reverse proxy in front for HTTPS, or set
-                                <code>EENGINE_API_TLS=true</code> to have EmailEngine serve it with the certificates on this
+                                <code>EENGINE_API_TLS=true</code> to have Keryx serve it with the certificates on this
                                 page.
                                 {{/if}}
                             </div>
@@ -326,7 +326,7 @@ badgeVariant=pageLabel.type class="mb-1"}}
                                     id="tls-regenerate-self-signed">{{#if this.certificate}}Regenerate{{else}}Generate now{{/if}}</button></li>
                             {{/equals}}
                             {{#equals this.source "env"}}
-                            <li><span class="dropdown-item text-base-content/60">Managed outside EmailEngine</span></li>
+                            <li><span class="dropdown-item text-base-content/60">Managed outside Keryx</span></li>
                             {{/equals}}
                             {{/ui/row-actions}}
                         </div>
@@ -381,10 +381,10 @@ badgeVariant=pageLabel.type class="mb-1"}}
     TLS environment variables (<code>EENGINE_SMTP_TLS_CERT</code>, <code>EENGINE_IMAPPROXY_TLS_CERT</code>,
     <code>EENGINE_API_TLS_CERT</code>) when they are set, and otherwise the certificate for the Service URL hostname. A
     default chosen by hand is presented whatever the source setting says.</p>
-<p class="mb-2">EmailEngine answers the Let's Encrypt <code>http-01</code> challenge itself, at
+<p class="mb-2">Keryx answers the Let's Encrypt <code>http-01</code> challenge itself, at
     <code>/.well-known/acme-challenge/</code>. For that to work, the hostname has to resolve to this machine and a
-    request to <strong>port 80</strong> for that name has to reach EmailEngine, directly or through a reverse proxy.
-    EmailEngine renews issued certificates automatically. Use <em>Check reachability</em> in a hostname's menu
+    request to <strong>port 80</strong> for that name has to reach Keryx, directly or through a reverse proxy.
+    Keryx renews issued certificates automatically. Use <em>Check reachability</em> in a hostname's menu
     to check DNS and port 80 access before requesting a certificate.</p>
 <p>Certificate authority: <code>{{acme.directoryUrl}}</code> (account <code>{{acme.environment}}</code>).</p>
 {{/ui/details}}

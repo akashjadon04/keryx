@@ -1,6 +1,6 @@
 {{> ui/page-header title="General" icon="icon-[tabler--settings]" class="mb-1"}}
 
-<p class="mb-6">Configure core settings for your EmailEngine instance.</p>
+<p class="mb-6">Configure core settings for your Keryx instance.</p>
 
 {{> ui/env-managed-alert}}
 
@@ -15,7 +15,7 @@
                 {{#> ui/form-field id="settingsServiceUrl" label="Service URL" error=errors.serviceUrl}}
                 <input type="url" class="input{{#if errors.serviceUrl}} is-invalid{{/if}}" id="settingsServiceUrl"
                     name="serviceUrl" value="{{values.serviceUrl}}" data-lpignore="true" autocomplete="off" />
-                <span class="helper-text">URL used to reach this EmailEngine instance, including http:// or https:// and no path.</span>
+                <span class="helper-text">URL used to reach this Keryx instance, including http:// or https:// and no path.</span>
                 {{/ui/form-field}}
             </div>
 
@@ -91,7 +91,7 @@
                 <a href="https://github.com/postalsys/emailengine/blob/master/translations/README.md" target="_blank"
                     rel="noopener noreferrer" referrerpolicy="no-referrer" class="link link-animated">
                     <span class="icon-[tabler--external-link] size-4 align-text-bottom"></span> Help us translate
-                    EmailEngine
+                    Keryx
                 </a>
             </p>
 

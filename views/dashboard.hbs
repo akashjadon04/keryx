@@ -5,7 +5,7 @@
 <div class="relative">
     {{#if queue.isPaused}}
     <div class="absolute end-4 top-2 z-[1]">
-        {{#> ui/tooltip text="EmailEngine is not processing entries in this queue"}}
+        {{#> ui/tooltip text="Keryx is not processing entries in this queue"}}
         {{> ui/badge label="paused" variant="warning"}}
         {{/ui/tooltip}}
     </div>
@@ -60,7 +60,7 @@
     {{#> ui/clear-alert alert="document-store" class="mt-6"}}
     <h4 class="text-lg font-bold mb-2">The Document Store is no longer available</h4>
     <p class="mb-2">This instance still has the <strong>Document Store</strong> enabled in its settings, but the
-        feature has been removed from EmailEngine. Emails are no longer indexed into Elasticsearch, and the
+        feature has been removed from Keryx. Emails are no longer indexed into Elasticsearch, and the
         endpoints that depended on it (chat with emails, unified search, the <code>documentStore</code>
         request options) are gone.</p>
     <p class="mb-2">If you still need the Document Store, downgrade this instance to
@@ -73,7 +73,7 @@
     {{/if}}
 
     {{#unless hasAccounts}}
-    {{#> ui/stat-card variant="success" title="Welcome to EmailEngine!" icon="icon-[tabler--info-circle]" class="mt-6"}}
+    {{#> ui/stat-card variant="success" title="Welcome to Keryx!" icon="icon-[tabler--info-circle]" class="mt-6"}}
     <p class="mb-2">Connect your first email account to send email and access mailbox data through the <a href="/admin/reference" class="link link-animated">API</a>.
     </p>
     <p class="mb-4 text-sm text-base-content/60">You can also add accounts programmatically via the <a
@@ -92,7 +92,7 @@
 
         {{#> ui/stat-card variant="primary" icon="icon-[tabler--users]"}}
         <div class="text-sm font-medium text-base-content/60 mb-1">
-            {{#> ui/tooltip text="The number of accounts registered with EmailEngine"}}
+            {{#> ui/tooltip text="The number of accounts registered with Keryx"}}
             <a href="/admin/accounts" class="link link-animated">Total accounts</a>
             {{/ui/tooltip}}
         </div>
@@ -180,7 +180,7 @@
     <div>
             <ul class="divide-y divide-base-content/10">
                 <li class="py-2"><a href="https://emailengine.app/" target="_blank" rel="noopener noreferrer"
-                        referrerpolicy="no-referrer" class="link link-animated">EmailEngine</a>
+                        referrerpolicy="no-referrer" class="link link-animated">Keryx</a>
                     v{{packageData.version}}</li>
                 <li class="py-2"><a href="https://nodejs.org/en/" target="_blank" rel="noopener noreferrer"
                         referrerpolicy="no-referrer" class="link link-animated">Node.js</a> v{{stats.node}}

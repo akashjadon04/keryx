@@ -13,7 +13,7 @@
 
         <div class="card-body space-y-4">
 
-            {{> ui/form-field id="name" label="Full name" value=values.name error=errors.name hint="Name shown for this account in EmailEngine."}}
+            {{> ui/form-field id="name" label="Full name" value=values.name error=errors.name hint="Name shown for this account in Keryx."}}
             {{> ui/form-field id="email" type="email" label="Email address" value=values.email error=errors.email hint="Email address associated with this account."}}
             {{> ui/form-field id="expectedEmail" type="email" label="Restrict sign-in to email (optional)" value=values.expectedEmail error=errors.expectedEmail hint="The hosted authentication form only accepts sign-ins that match this address. Leave blank to remove this restriction."}}
 
@@ -43,25 +43,25 @@
             {{> ui/form-field id="imap_host" label="Hostname" value=values.imap_host error=errors.imap_host lpignore=true required=true}}
             {{> ui/form-field id="imap_port" type="number" label="Port" value=values.imap_port error=errors.imap_port lpignore=true required=true}}
 
-            {{> ui/checkbox id="imap_secure" label="Use direct TLS" checked=values.imap_secure error=errors.imap_secure tooltip="Usually enabled for port 993. When disabled, EmailEngine upgrades the connection with STARTTLS."}}
+            {{> ui/checkbox id="imap_secure" label="Use direct TLS" checked=values.imap_secure error=errors.imap_secure tooltip="Usually enabled for port 993. When disabled, Keryx upgrades the connection with STARTTLS."}}
 
             {{> ui/checkbox id="imap_requireTLS" label="Require STARTTLS" checked=values.imap_requireTLS error=errors.imap_requireTLS tooltip="When direct TLS is off, fail the connection instead of continuing in cleartext if the server does not offer STARTTLS or the upgrade fails. Disable only for a server on a trusted network that has no TLS at all."}}
 
             {{> ui/checkbox id="imap_tls_ignoreCertErrors" label="Allow invalid certificates" checked=values.imap_tls_ignoreCertErrors error=errors.imap_tls_ignoreCertErrors tooltip="Accept self-signed or otherwise invalid TLS certificates when connecting to the IMAP server of this account. The Allow Insecure Email Certificates option on the Security configuration page applies the same override to all accounts."}}
 
-            {{> ui/checkbox id="imap_disableIMAP4rev2" label="Disable IMAP4rev2" checked=values.imap_disableIMAP4rev2 error=errors.imap_disableIMAP4rev2 tooltip="Do not use the IMAP4rev2 protocol revision even if the server supports it. Enable this option if the server advertises IMAP4rev2 but fails when EmailEngine uses it."}}
+            {{> ui/checkbox id="imap_disableIMAP4rev2" label="Disable IMAP4rev2" checked=values.imap_disableIMAP4rev2 error=errors.imap_disableIMAP4rev2 tooltip="Do not use the IMAP4rev2 protocol revision even if the server supports it. Enable this option if the server advertises IMAP4rev2 but fails when Keryx uses it."}}
 
             {{/unless}}
 
             {{!-- The special-use folder overrides, rendered from the one list that also drives their
             schema and the update loop (SPECIAL_USE_PATH_FIELDS in lib/ui-routes/special-use-paths.js,
-            derived from SPECIAL_USE_PATH_TYPES in lib/consts.js). EmailEngine detects these folders
+            derived from SPECIAL_USE_PATH_TYPES in lib/consts.js). Keryx detects these folders
             from the server's own flags; an override is for a server that flags none, or flags the
             wrong one. Written out five times before, which is how four of them came to be missing. --}}
             {{#each specialUsePathFields}}
             {{> ui/form-field id=this.inputId label=(concat this.label " folder") value=(lookup ../values this.inputId)
             error=(lookup ../errors this.inputId) lpignore=true placeholder=(concat "Folder path like \"" this.label "\"")
-            list="available-paths-list" hint=(concat this.description " Leave blank to use the folder EmailEngine detects for this account.")}}
+            list="available-paths-list" hint=(concat this.description " Leave blank to use the folder Keryx detects for this account.")}}
             {{/each}}
 
             {{> ui/form-field id="imap_resyncDelay" type="number" label="Resync interval (seconds)" value=values.imap_resyncDelay error=errors.imap_resyncDelay lpignore=true hint="Time between full mailbox syncs. Leave blank to keep the current interval."}}
@@ -94,7 +94,7 @@
             {{> ui/form-field id="smtp_host" label="Hostname" value=values.smtp_host error=errors.smtp_host lpignore=true required=true}}
             {{> ui/form-field id="smtp_port" type="number" label="Port" value=values.smtp_port error=errors.smtp_port lpignore=true required=true}}
 
-            {{> ui/checkbox id="smtp_secure" label="Use direct TLS" checked=values.smtp_secure error=errors.smtp_secure tooltip="Usually enabled for port 465. When disabled, EmailEngine upgrades the connection with STARTTLS."}}
+            {{> ui/checkbox id="smtp_secure" label="Use direct TLS" checked=values.smtp_secure error=errors.smtp_secure tooltip="Usually enabled for port 465. When disabled, Keryx upgrades the connection with STARTTLS."}}
 
             {{> ui/checkbox id="smtp_requireTLS" label="Require STARTTLS" checked=values.smtp_requireTLS error=errors.smtp_requireTLS tooltip="When direct TLS is off, fail the connection instead of continuing in cleartext if the server does not offer STARTTLS or the upgrade fails. Disable only for a server on a trusted network that has no TLS at all."}}
 
@@ -133,7 +133,7 @@
             <input type="text" class="input{{#if errors.webhooks}} is-invalid{{/if}}" id="webhooks" name="webhooks"
                 {{#if values.webhooks}}value="{{values.webhooks}}" {{/if}}placeholder='URL like "https://myservice.com/imap/webhooks"'>
             <span class="helper-text">Account-specific webhook URL. If set and <a href="/admin/config/webhooks"
-                    class="link link-animated">webhooks</a> are enabled, EmailEngine will send webhook requests for
+                    class="link link-animated">webhooks</a> are enabled, Keryx will send webhook requests for
                 events related to this account to this URL instead of the default webhook URL. Leave empty to
                 clear.</span>
             {{/ui/form-field}}

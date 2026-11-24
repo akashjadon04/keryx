@@ -1,6 +1,6 @@
 {{> ui/page-header title="Network" icon="icon-[tabler--network]" class="mb-1"}}
 
-<p class="mb-6">Control how EmailEngine connects to email servers and routes traffic.</p>
+<p class="mb-6">Control how Keryx connects to email servers and routes traffic.</p>
 
 {{> ui/env-managed-alert}}
 
@@ -10,7 +10,7 @@
 
     {{#> ui/card title="Proxy Settings" bodyClass="space-y-4"}}
             <p>Route all outbound connections through a proxy: IMAP and SMTP sessions, Gmail API and Microsoft
-                Graph requests, OAuth2 token exchange, webhook delivery, and EmailEngine's own requests such as
+                Graph requests, OAuth2 token exchange, webhook delivery, and Keryx's own requests such as
                 license validation. Supports HTTP CONNECT, SOCKS4, and SOCKS5.</p>
 
             <div>
@@ -74,7 +74,7 @@
             <h6 class="card-title text-primary">IP Address Strategy</h6>
         </div>
         <div class="card-body">
-            <p class="mb-2">Choose how EmailEngine selects IP addresses when your server has multiple IPs:</p>
+            <p class="mb-2">Choose how Keryx selects IP addresses when your server has multiple IPs:</p>
             <ul class="list-disc ps-6 space-y-1">
                 <li><strong>Dedicated</strong> - Each account always uses the same IP from your pool</li>
                 <li><strong>Random</strong> - Each connection uses a randomly selected IP</li>
@@ -142,8 +142,8 @@
 
         <div class="card-body">
             {{> ui/setting-ref name="localAddresses"}}
-            Select which IP addresses EmailEngine can use with the Dedicated or Random strategies. If selected IPs
-            become unavailable, EmailEngine falls back to server defaults.
+            Select which IP addresses Keryx can use with the Dedicated or Random strategies. If selected IPs
+            become unavailable, Keryx falls back to server defaults.
         </div>
         <div class="overflow-x-auto">
             <table class="table ee-table-stack">

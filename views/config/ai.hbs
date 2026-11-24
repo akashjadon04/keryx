@@ -1,7 +1,7 @@
 {{> ui/page-header title="AI Processing" icon="icon-[tabler--robot]" class="mb-1"}}
 
 <p class="mb-6">Analyze new Inbox emails with AI and include the model's answer as <code>summary</code> in
-    <code>messageNew</code> webhooks. EmailEngine sends email content to the AI provider configured below.
+    <code>messageNew</code> webhooks. Keryx sends email content to the AI provider configured below.
 </p>
 
 {{> ui/env-managed-alert}}
@@ -278,7 +278,7 @@
                     id="settingsOpenAiMaxTokens" step="1" min="0" name="openAiMaxTokens"
                     value="{{values.openAiMaxTokens}}" />
                 <span class="helper-text">Maximum tokens in the input prompt: the instructions and the email together.
-                    EmailEngine shortens the email text to fit this limit. Leave blank for the default of
+                    Keryx shortens the email text to fit this limit. Leave blank for the default of
                     {{aiDefaults.maxTokens}}.</span>
                 {{/ui/form-field}}
             </div>
