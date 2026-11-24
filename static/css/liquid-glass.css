@@ -1,131 +1,185 @@
-/* KERYX LIQUID GLASS DESIGN SYSTEM */
-:root {
+/* KERYX LIQUID GLASS DESIGN SYSTEM - HIGH CONTRAST & ACCESSIBILITY */
+:root,
+html,
+html[data-theme="dark"],
+html[data-theme="light"],
+body {
   --lg-bg: #030712;
-  --lg-glass-surface: rgba(15, 23, 42, 0.55);
-  --lg-glass-card: rgba(30, 41, 59, 0.4);
-  --lg-glass-border: rgba(255, 255, 255, 0.12);
-  --lg-glass-specular: rgba(255, 255, 255, 0.25);
-  --lg-cyan-glow: rgba(6, 182, 212, 0.25);
-  --lg-blur: 20px;
+  --lg-glass-surface: rgba(15, 23, 42, 0.7);
+  --lg-glass-card: rgba(17, 24, 39, 0.85);
+  --lg-glass-border: rgba(255, 255, 255, 0.14);
+  --lg-cyan: #06b6d4;
+  --lg-blue: #3b82f6;
+
+  /* Force FlyonUI dark theme tokens regardless of stored local preference */
+  --color-base-100: #0f172a !important;
+  --color-base-200: #080d1a !important;
+  --color-base-300: #030712 !important;
+  --color-base-content: #f8fafc !important;
 }
 
+/* Force dark liquid glass canvas */
+html,
+html[data-theme="dark"],
+html[data-theme="light"],
+html[data-theme="dark"] body,
+html[data-theme="light"] body,
 body.ee-app-chrome,
+body.bg-base-100,
 body.bg-base-200,
 body {
   background: 
-    radial-gradient(circle at 10% 10%, rgba(6, 182, 212, 0.1) 0%, transparent 45%),
-    radial-gradient(circle at 90% 90%, rgba(99, 102, 241, 0.1) 0%, transparent 45%),
-    #030712 !important;
+    radial-gradient(circle at 10% 10%, rgba(6, 182, 212, 0.12) 0%, transparent 45%),
+    radial-gradient(circle at 90% 90%, rgba(99, 102, 241, 0.12) 0%, transparent 45%),
+    #050814 !important;
   color: #f1f5f9 !important;
   min-height: 100vh;
 }
 
 /* Frosted Liquid Glass Sidebar */
 #layout-sidebar .drawer-body {
-  background: rgba(10, 15, 30, 0.65) !important;
-  backdrop-filter: blur(24px) saturate(190%) !important;
-  -webkit-backdrop-filter: blur(24px) saturate(190%) !important;
-  border-right: 1px solid rgba(255, 255, 255, 0.1) !important;
-  box-shadow: 4px 0 32px rgba(0, 0, 0, 0.5), inset -1px 0 1px rgba(255, 255, 255, 0.05) !important;
+  background: rgba(10, 15, 30, 0.85) !important;
+  backdrop-filter: blur(28px) saturate(200%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(200%) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.12) !important;
+  box-shadow: 4px 0 32px rgba(0, 0, 0, 0.5) !important;
 }
 
 /* Frosted Liquid Glass Topbar Header */
 header.sticky.top-0,
 header.navbar,
 header.bg-base-100 {
-  background: rgba(10, 15, 30, 0.6) !important;
-  backdrop-filter: blur(20px) saturate(180%) !important;
-  -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3) !important;
+  background: rgba(10, 15, 30, 0.85) !important;
+  backdrop-filter: blur(24px) saturate(190%) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(190%) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12) !important;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4) !important;
 }
 
-/* Liquid Glass Cards */
+/* High Contrast Liquid Glass Cards */
 .card,
-.bg-base-100,
-.rounded-box:not(.dropdown-menu),
-.border-base-content\/20 {
-  border-color: rgba(255, 255, 255, 0.1) !important;
-}
-
-.card.bg-base-100,
-.card-body,
-div.card {
-  background: rgba(15, 23, 42, 0.45) !important;
-  backdrop-filter: blur(16px) !important;
-  -webkit-backdrop-filter: blur(16px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+div.card,
+.bg-base-100 {
+  background: rgba(15, 23, 42, 0.85) !important;
+  backdrop-filter: blur(20px) !important;
+  -webkit-backdrop-filter: blur(20px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
   border-radius: 1.25rem !important;
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37), inset 0 1px 1px 0 rgba(255, 255, 255, 0.15) !important;
-  transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4), inset 0 1px 1px 0 rgba(255, 255, 255, 0.15) !important;
+  color: #f8fafc !important;
 }
 
-.card.bg-base-100:hover {
-  border-color: rgba(255, 255, 255, 0.25) !important;
-  box-shadow: 0 12px 40px 0 rgba(6, 182, 212, 0.12), inset 0 1px 2px 0 rgba(255, 255, 255, 0.25) !important;
+.card-body {
+  background: transparent !important;
+  color: #f8fafc !important;
+}
+
+/* High Contrast Typography */
+h1, h2, h3, h4, h5, h6 {
+  color: #ffffff !important;
+}
+
+.card p,
+.card div,
+.card span,
+.card-body p,
+.card-body div,
+.card-body span,
+#content p,
+#content span,
+#content div,
+.text-base-content {
+  color: #f1f5f9 !important;
+}
+
+.text-base-content\/60,
+.text-base-content\/70 {
+  color: #94a3b8 !important;
+}
+
+.text-base-content\/50,
+.menu-title {
+  color: #64748b !important;
+}
+
+/* Table High-Contrast Readability */
+.table {
+  color: #f8fafc !important;
+  background: transparent !important;
+}
+
+.table th {
+  background: rgba(15, 23, 42, 0.85) !important;
+  color: #cbd5e1 !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15) !important;
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+}
+
+.table td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+  color: #f1f5f9 !important;
+}
+
+.table tbody tr {
+  background: rgba(15, 23, 42, 0.5) !important;
+}
+
+.table tbody tr:hover {
+  background: rgba(30, 41, 59, 0.75) !important;
+}
+
+/* Form Inputs & Selects Contrast */
+input.input,
+textarea.textarea,
+select.select,
+.input {
+  background: rgba(15, 23, 42, 0.9) !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  border-radius: 0.75rem !important;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #94a3b8 !important;
+}
+
+/* Menu items */
+.menu li a {
+  color: #cbd5e1 !important;
+  border-radius: 0.5rem;
+}
+
+.menu li a:hover,
+.menu-active {
+  background: rgba(255, 255, 255, 0.1) !important;
+  color: #ffffff !important;
 }
 
 /* Liquid Glass Buttons */
 .btn-primary {
-  background: linear-gradient(135deg, rgba(6, 182, 212, 0.85), rgba(59, 130, 246, 0.85)) !important;
+  background: linear-gradient(135deg, rgba(6, 182, 212, 0.9), rgba(59, 130, 246, 0.9)) !important;
   backdrop-filter: blur(12px) !important;
   border: 1px solid rgba(255, 255, 255, 0.3) !important;
-  box-shadow: 0 4px 20px rgba(6, 182, 212, 0.35), inset 0 1px 1px rgba(255, 255, 255, 0.4) !important;
+  box-shadow: 0 4px 20px rgba(6, 182, 212, 0.4), inset 0 1px 1px rgba(255, 255, 255, 0.5) !important;
   color: #ffffff !important;
   font-weight: 600;
   border-radius: 9999px !important;
-  transition: all 0.2s ease-in-out;
 }
 
 .btn-primary:hover {
   transform: translateY(-1px) scale(1.02);
-  box-shadow: 0 6px 24px rgba(6, 182, 212, 0.5), inset 0 1px 2px rgba(255, 255, 255, 0.6) !important;
+  box-shadow: 0 6px 24px rgba(6, 182, 212, 0.6), inset 0 1px 2px rgba(255, 255, 255, 0.7) !important;
 }
 
-/* Liquid Glass Dropdowns & Menus */
-.dropdown-menu {
-  background: rgba(15, 23, 42, 0.85) !important;
-  backdrop-filter: blur(24px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.15) !important;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6), inset 0 1px 1px rgba(255, 255, 255, 0.2) !important;
-  border-radius: 1rem !important;
-}
-
-/* Liquid Glass Tables */
-.table {
-  color: #e2e8f0 !important;
-}
-
-.table th {
-  background: rgba(15, 23, 42, 0.6) !important;
+/* Footer Liquid Glass */
+footer.bg-base-100,
+footer {
+  background: rgba(10, 15, 30, 0.75) !important;
+  backdrop-filter: blur(20px) !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
   color: #94a3b8 !important;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
-  text-transform: uppercase;
-  font-size: 0.75rem;
-  letter-spacing: 0.05em;
-}
-
-.table td {
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
-}
-
-.table tr:hover td {
-  background: rgba(255, 255, 255, 0.04) !important;
-}
-
-/* Liquid Glass Modals */
-.modal-content,
-.modal-box {
-  background: rgba(10, 15, 30, 0.85) !important;
-  backdrop-filter: blur(28px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.15) !important;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.7), inset 0 1px 2px rgba(255, 255, 255, 0.25) !important;
-  border-radius: 1.5rem !important;
-}
-
-/* Liquid Glass Footer */
-footer.bg-base-100 {
-  background: rgba(10, 15, 30, 0.6) !important;
-  backdrop-filter: blur(16px) !important;
-  border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
 }
